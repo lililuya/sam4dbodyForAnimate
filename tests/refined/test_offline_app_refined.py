@@ -1,9 +1,27 @@
 import os
+import shutil
 import unittest
+import uuid
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 from omegaconf import OmegaConf
+from PIL import Image
+
+
+@contextmanager
+def make_workspace_tempdir():
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    base_dir = os.path.join(repo_root, ".tmp_refined_tests")
+    os.makedirs(base_dir, exist_ok=True)
+    temp_dir = os.path.join(base_dir, f"run_{uuid.uuid4().hex}")
+    os.makedirs(temp_dir, exist_ok=True)
+    try:
+        yield temp_dir
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 class RefinedCliTests(unittest.TestCase):
@@ -275,35 +293,160 @@ class RefinedCliTests(unittest.TestCase):
 
         mock_run_refined_pipeline.assert_called_once_with(args)
 
-    def test_refined_placeholder_methods_raise_clear_messages(self):
+    def test_prepare_input_collects_frame_stems_for_image_directory(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        config = OmegaConf.create(
+            {"runtime": {"output_dir": "./outputs_refined"}, "debug": {"save_metrics": False}}
+        )
+        app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+
+        with make_workspace_tempdir() as tmpdir:
+            Image.fromarray(np.zeros((4, 4, 3), dtype=np.uint8)).save(
+                os.path.join(tmpdir, "frame_a.jpg")
+            )
+            Image.fromarray(np.zeros((4, 4, 3), dtype=np.uint8)).save(
+                os.path.join(tmpdir, "frame_b.png")
+            )
+
+            sample = app.prepare_input(tmpdir, None, False)
+
+        self.assertEqual(sample["input_type"], "images")
+        self.assertEqual(sample["frame_count"], 2)
+        self.assertEqual(sample["frames"], ["00000000", "00000001"])
+        self.assertEqual(len(sample["source_frames"]), 2)
+        self.assertTrue(sample["output_dir"].endswith("outputs_refined"))
+
+    def test_iter_chunks_yields_stable_chunk_metadata(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        config = OmegaConf.create({"runtime": {"output_dir": "./outputs_refined"}, "debug": {"save_metrics": False}})
+        app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+
+        chunks = list(app.iter_chunks(["00000000", "00000001", "00000002"], 2))
+
+        self.assertEqual(
+            chunks,
+            [
+                {
+                    "chunk_id": 0,
+                    "start_frame": 0,
+                    "end_frame": 1,
+                    "frame_indices": [0, 1],
+                    "frames": ["00000000", "00000001"],
+                },
+                {
+                    "chunk_id": 1,
+                    "start_frame": 2,
+                    "end_frame": 2,
+                    "frame_indices": [2],
+                    "frames": ["00000002"],
+                },
+            ],
+        )
+
+    def test_detect_initial_targets_initializes_tracker_from_first_detected_frame(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        config = OmegaConf.create(
+            {
+                "runtime": {"output_dir": "./outputs_refined"},
+                "detector": {"bbox_thresh": 0.35, "iou_thresh": 0.5},
+                "batch": {"initial_search_frames": 3},
+                "debug": {"save_metrics": False},
+            }
+        )
+        app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+        app.sample_state = {
+            "input_video": "sample.mp4",
+            "input_type": "video",
+            "source_frames": None,
+            "frames": ["00000000", "00000001", "00000002"],
+            "frame_count": 3,
+            "output_dir": "./outputs_refined",
+        }
+        app._load_source_frame = unittest.mock.MagicMock(
+            side_effect=[np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(3)]
+        )
+
+        predictor = unittest.mock.MagicMock()
+        predictor.init_state.return_value = {"video_height": 8, "video_width": 8}
+        predictor.add_new_points_or_box.return_value = (None, [1], None, None)
+        runtime_app = unittest.mock.MagicMock()
+        runtime_app.predictor = predictor
+        runtime_app.RUNTIME = {}
+        runtime_app.sam3_3d_body_model = unittest.mock.MagicMock()
+        runtime_app.sam3_3d_body_model.process_one_image.side_effect = [
+            [],
+            [{"bbox": [1.0, 2.0, 5.0, 6.0]}],
+        ]
+
+        with patch.object(app, "_ensure_base_app", return_value=runtime_app, create=True):
+            targets = app.detect_initial_targets(app.sample_state)
+
+        self.assertEqual(targets["obj_ids"], [1])
+        self.assertEqual(targets["start_frame_idx"], 1)
+        predictor.clear_all_points_in_video.assert_called_once_with(
+            {"video_height": 8, "video_width": 8}
+        )
+        predictor.add_new_points_or_box.assert_called_once()
+
+    def test_write_chunk_outputs_persists_refined_masks_and_chunk_record(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        config = OmegaConf.create({"debug": {"save_metrics": True}})
+        app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+
+        with make_workspace_tempdir() as tmpdir:
+            app.OUTPUT_DIR = tmpdir
+            app.prepare_sample_output(tmpdir, [1])
+            chunk = {
+                "chunk_id": 0,
+                "start_frame": 0,
+                "end_frame": 0,
+                "frame_indices": [0],
+                "frames": ["00000000"],
+            }
+            final_chunk = {
+                "frame_stems": ["00000000"],
+                "refined_masks": [np.array([[0, 1], [1, 0]], dtype=np.uint8)],
+                "frame_metrics": [{"frame_idx": 0, "triggered_reprompt": False}],
+                "reprompt_events": [],
+            }
+
+            app.write_chunk_outputs(chunk, {"frame_stems": ["00000000"]}, final_chunk)
+
+            refined_path = os.path.join(tmpdir, "masks_refined", "00000000.png")
+            working_path = os.path.join(tmpdir, "masks", "00000000.png")
+            self.assertTrue(os.path.isfile(refined_path))
+            self.assertTrue(os.path.isfile(working_path))
+            self.assertEqual(len(app.chunk_records), 1)
+            self.assertEqual(app.chunk_records[0]["chunk_id"], 0)
+            self.assertEqual(app.chunk_records[0]["frame_count"], 1)
+
+    def test_run_refined_4d_generation_uses_lazy_runtime_app(self):
         from scripts.offline_app_refined import RefinedOfflineApp
 
         config = OmegaConf.create({"debug": {"save_metrics": False}})
         app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+        app.sample_state = {"input_video": "sample.mp4"}
 
-        expected = [
-            ("prepare_input", ("sample.mp4", "./out", False), "prepare_input must collect frames and choose the sample output directory"),
-            ("detect_initial_targets", ({"frames": []},), "detect_initial_targets must run detector-driven initial prompting"),
-            ("iter_chunks", (["f0.png"], 8), "iter_chunks must yield bounded tracking windows"),
-            ("track_chunk", ({"chunk_id": 0}, {"obj_ids": [1]}), "track_chunk must write raw masks and images for the current chunk"),
-            ("refine_chunk_masks", ({"chunk_id": 0},), "refine_chunk_masks must run the two-stage occlusion refinement flow"),
-            (
-                "maybe_reprompt_chunk",
-                ({"chunk_id": 0}, {"chunk_id": 0}, {"obj_ids": [1]}),
-                "maybe_reprompt_chunk must apply drift checks and re-prompt when needed",
-            ),
-            (
-                "write_chunk_outputs",
-                ({"chunk_id": 0}, {"raw": True}, {"final": True}),
-                "write_chunk_outputs must persist masks, metrics, and per-chunk diagnostics",
-            ),
-            ("run_refined_4d_generation", tuple(), "run_refined_4d_generation must run mesh reconstruction from refined masks"),
-        ]
+        with make_workspace_tempdir() as tmpdir:
+            app.OUTPUT_DIR = tmpdir
+            os.makedirs(os.path.join(tmpdir, "masks_refined"), exist_ok=True)
+            Image.fromarray(np.array([[0, 1], [1, 0]], dtype=np.uint8)).save(
+                os.path.join(tmpdir, "masks_refined", "00000000.png")
+            )
 
-        for method_name, call_args, message in expected:
-            with self.subTest(method=method_name):
-                with self.assertRaisesRegex(NotImplementedError, message):
-                    getattr(app, method_name)(*call_args)
+            runtime_app = unittest.mock.MagicMock()
+            runtime_app.OUTPUT_DIR = tmpdir
+            runtime_app.on_4d_generation.return_value = os.path.join(tmpdir, "rendered.mp4")
+
+            with patch.object(app, "_ensure_base_app", return_value=runtime_app, create=True):
+                out_path = app.run_refined_4d_generation()
+
+        runtime_app.on_4d_generation.assert_called_once_with(video_path="sample.mp4")
+        self.assertTrue(out_path.endswith("rendered.mp4"))
 
     def test_reset_sample_state_clears_sample_local_fields(self):
         from scripts.offline_app_refined import RefinedOfflineApp
