@@ -1,0 +1,53 @@
+paths:
+  ckpt_root: "path to global checkpoint root"
+
+sam3:
+  ckpt_path: ${paths.ckpt_root}/sam3/sam3.pt
+
+sam_3d_body:
+  ckpt_path: ${paths.ckpt_root}/sam-3d-body-dinov3/model.ckpt
+  mhr_path: ${paths.ckpt_root}/sam-3d-body-dinov3/assets/mhr_model.pt
+  fov_path: ${paths.ckpt_root}/moge-2-vitl-normal/model.pt
+  batch_size: 32
+  detector_path: ""
+  segmentor_path: ""
+
+runtime:
+  output_dir: ./outputs_refined
+  continue_on_error: false
+
+completion:
+  enable: true
+  detection_resolution: [256, 512]
+  completion_resolution: [512, 1024]
+  model_path_mask: ${paths.ckpt_root}/diffusion-vas-amodal-segmentation
+  model_path_rgb: ${paths.ckpt_root}/diffusion-vas-content-completion
+  model_path_depth: ${paths.ckpt_root}/depth_anything_v2_vitl.pth
+  depth_encoder: vitl
+  max_occ_len: 25
+
+detector:
+  backend: yolo
+  weights_path: ""
+  bbox_thresh: 0.35
+  iou_thresh: 0.50
+  max_det: 20
+
+tracking:
+  chunk_size: 180
+
+batch:
+  initial_search_frames: 24
+  retry_mode: quality_safe
+  retry_chunk_sizes: [120, 96]
+  retry_batch_sizes: [24, 16]
+
+reprompt:
+  enable: true
+  empty_mask_patience: 3
+  area_drop_ratio: 0.35
+  edge_touch_ratio: 0.40
+  iou_low_threshold: 0.55
+
+debug:
+  save_metrics: true
