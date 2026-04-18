@@ -1,5 +1,6 @@
 import unittest
 from unittest import mock
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -106,13 +107,36 @@ class YoloDetectorTests(unittest.TestCase):
             sys.modules.pop(module_name, None)
         self.assertNotIn(module_name, sys.modules)
 
-    def test_load_ultralytics_yolo_error_mentions_both_path_names(self):
+    def test_load_ultralytics_yolo_prefers_explicit_weights_path(self):
         from models.sam_3d_body.tools.build_detector_yolo import load_ultralytics_yolo
 
-        with self.assertRaises(FileNotFoundError) as cm:
-            load_ultralytics_yolo()
-        message = str(cm.exception)
-        self.assertIn("path or weights_path", message)
+        yolo_mock = mock.Mock(return_value="fake-detector")
+        with mock.patch.dict("sys.modules", {"ultralytics": SimpleNamespace(YOLO=yolo_mock)}):
+            detector = load_ultralytics_yolo(path="weights.pt", weights_path="weights.pt")
+
+        self.assertEqual(detector, "fake-detector")
+        yolo_mock.assert_called_once_with("weights.pt")
+
+    def test_load_ultralytics_yolo_defaults_to_auto_downloadable_model(self):
+        from models.sam_3d_body.tools.build_detector_yolo import (
+            DEFAULT_YOLO_WEIGHTS,
+            load_ultralytics_yolo,
+        )
+
+        yolo_mock = mock.Mock(return_value="fake-detector")
+        with mock.patch.dict("sys.modules", {"ultralytics": SimpleNamespace(YOLO=yolo_mock)}):
+            detector = load_ultralytics_yolo()
+
+        self.assertEqual(detector, "fake-detector")
+        yolo_mock.assert_called_once_with(DEFAULT_YOLO_WEIGHTS)
+
+    def test_load_ultralytics_yolo_rejects_conflicting_explicit_paths(self):
+        from models.sam_3d_body.tools.build_detector_yolo import load_ultralytics_yolo
+
+        with self.assertRaises(ValueError) as cm:
+            load_ultralytics_yolo(path="legacy.pt", weights_path="weights.pt")
+
+        self.assertIn("Conflicting YOLO paths", str(cm.exception))
 
 
 if __name__ == "__main__":

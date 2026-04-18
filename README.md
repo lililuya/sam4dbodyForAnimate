@@ -144,7 +144,11 @@ Key differences from the baseline script:
 - adds a stronger two-stage occlusion-aware mask refinement path
 - saves raw masks, refined masks, chunk manifests, and re-prompt diagnostics for offline debugging
 
-For fully offline execution, set `detector.weights_path` in `configs/body4d_refined.yaml` to a local YOLO weights file before running the refined script.
+Detector switching notes:
+- use `--detector_backend yolo` or set `detector.backend: yolo` to enable YOLO prompts
+- use `--detector_backend vitdet` or set `detector.backend: vitdet` to stay on the original ViTDet detector path while still using the SAM-3 tracking pipeline
+- `detector.weights_path` accepts either a local `.pt` file or an Ultralytics model identifier such as `yolo11m.pt`
+- if `detector.backend` is `yolo` and `detector.weights_path` is empty, the refined runner now falls back to `yolo11n.pt` and lets Ultralytics auto-download it on first run
 
 ## Refined Batch Run
 
@@ -161,3 +165,18 @@ Key properties of this batch runner:
 - writes `batch_manifest.json`, per-sample entries in `batch_results.jsonl`, and per-sample debug summaries when debug metrics are enabled (the default refined config)
 
 For resumable runs, use `--skip_existing`; it relies on `debug_metrics/sample_summary.json` from runs where debug metrics are enabled. For large batches where you want failure isolation, add `--continue_on_error`.
+
+## Offline Export Run
+
+Run the export-focused offline pipeline:
+
+```bash
+python scripts/offline_app_export.py --input_video <path> --output_dir <export-output>
+```
+
+This script keeps `scripts/offline_app.py` unchanged and adds:
+- `openpose_json/*.json` with per-frame `pose_keypoints_2d` and `pose_keypoints_3d`
+- `mask_videos/mask_binary_all.mp4` for combined foreground masks
+- `mask_videos/mask_binary_person_{track_id}.mp4` for per-person binary masks
+
+Use `--mask_video_fps` if you want to override the default export FPS.

@@ -1,5 +1,7 @@
 import numpy as np
 
+DEFAULT_YOLO_WEIGHTS = "yolo11n.pt"
+
 
 def _to_numpy_float32(values) -> np.ndarray:
     if isinstance(values, np.ndarray):
@@ -29,16 +31,34 @@ def extract_person_boxes(boxes, bbox_thr: float, det_cat_id: int = 0) -> np.ndar
     return sort_boxes_xyxy(filtered)
 
 
-def load_ultralytics_yolo(path: str = "", weights_path: str = ""):
+def resolve_yolo_weights_path(
+    path: str = "",
+    weights_path: str = "",
+    default_weights: str = DEFAULT_YOLO_WEIGHTS,
+) -> str:
     if path and weights_path and path != weights_path:
         raise ValueError("Conflicting YOLO paths: provide either path or weights_path")
-    selected_path = weights_path or path
+    selected_path = weights_path or path or default_weights
     if not selected_path:
         raise FileNotFoundError(
-            "YOLO path or weights_path must be set for offline refined runs"
+            "YOLO path, weights_path, or default_weights must be set for offline refined runs"
         )
+    return selected_path
+
+
+def load_ultralytics_yolo(
+    path: str = "",
+    weights_path: str = "",
+    default_weights: str = DEFAULT_YOLO_WEIGHTS,
+):
+    selected_path = resolve_yolo_weights_path(
+        path=path,
+        weights_path=weights_path,
+        default_weights=default_weights,
+    )
     from ultralytics import YOLO
 
+    print(f"########### Loading YOLO weights: {selected_path}")
     return YOLO(selected_path)
 
 
