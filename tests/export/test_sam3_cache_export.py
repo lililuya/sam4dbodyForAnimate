@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import shutil
@@ -51,7 +52,10 @@ class Sam3CacheExportTests(unittest.TestCase):
                 "prompt_log": {
                     "1": {
                         "name": "Target 1",
-                        "frames": {"0": {"points": [[12, 18]], "labels": [1]}},
+                        "frames": {
+                            "0": {"points": [[12, 18], [8, 6]], "labels": [1, 0]},
+                            "1": {"points": [[4, 5]], "labels": [1]},
+                        },
                     }
                 },
                 "frame_metrics": [
@@ -62,9 +66,18 @@ class Sam3CacheExportTests(unittest.TestCase):
                         },
                     }
                 ],
-                "events": [{"type": "mask_generation_completed", "frame_count": 1}],
+                "events": [
+                    {
+                        "type": "mask_generation_completed",
+                        "frame_count": 1,
+                        "task_id": "task-1",
+                    }
+                ],
                 "session_debug": {"token": "secret"},
             }
+            expected_prompts = {"targets": copy.deepcopy(runtime["prompt_log"])}
+            expected_frame_metrics = copy.deepcopy(runtime["frame_metrics"])
+            expected_events = copy.deepcopy(runtime["events"])
 
             cache_dir = export_sam3_cache(
                 working_dir=working_dir,
@@ -89,10 +102,7 @@ class Sam3CacheExportTests(unittest.TestCase):
 
             with open(prompts_path, "r", encoding="utf-8") as handle:
                 prompts_data = json.load(handle)
-            self.assertEqual(
-                prompts_data["targets"]["1"]["frames"]["0"]["labels"],
-                [1],
-            )
+            self.assertEqual(prompts_data, expected_prompts)
 
             with open(meta_path, "r", encoding="utf-8") as handle:
                 meta_data = json.load(handle)
@@ -105,8 +115,8 @@ class Sam3CacheExportTests(unittest.TestCase):
             self.assertEqual(meta_data["fps"], 24.0)
             self.assertEqual(meta_data["config_path"], "configs/body4d.yaml")
             self.assertNotIn("session_debug", meta_data)
-            self.assertEqual(frame_metrics_data[0]["track_metrics"]["1"]["mask_area"], 4)
-            self.assertEqual(events_data[0]["type"], "mask_generation_completed")
+            self.assertEqual(frame_metrics_data, expected_frame_metrics)
+            self.assertEqual(events_data, expected_events)
 
     def test_validate_cache_dir_rejects_missing_traceability_payloads(self):
         from scripts.sam3_cache_contract import validate_cache_dir
@@ -281,6 +291,70 @@ class Sam3CacheExportTests(unittest.TestCase):
                     },
                     config_path="configs/body4d.yaml",
                 )
+
+    def test_export_sam3_cache_keeps_last_valid_cache_when_rerun_fails(self):
+        from scripts.sam3_cache_export import export_sam3_cache
+
+        with make_workspace_tempdir() as tmpdir:
+            cache_root = os.path.join(tmpdir, "cache")
+            valid_working_dir = os.path.join(tmpdir, "working_valid")
+            invalid_working_dir = os.path.join(tmpdir, "working_invalid")
+            for base_dir in (valid_working_dir, invalid_working_dir):
+                os.makedirs(os.path.join(base_dir, "images"), exist_ok=True)
+                os.makedirs(os.path.join(base_dir, "masks"), exist_ok=True)
+            os.makedirs(cache_root, exist_ok=True)
+
+            Image.new("RGB", (4, 4), color=(255, 0, 0)).save(
+                os.path.join(valid_working_dir, "images", "00000000.jpg")
+            )
+            Image.new("L", (4, 4), color=255).save(
+                os.path.join(valid_working_dir, "masks", "00000000.png")
+            )
+            cache_dir = export_sam3_cache(
+                working_dir=valid_working_dir,
+                cache_root=cache_root,
+                sample_id="sample_001",
+                source_video="inputs/source.mp4",
+                runtime={
+                    "out_obj_ids": [1],
+                    "batch_size": 8,
+                    "detection_resolution": [256, 512],
+                    "completion_resolution": [512, 1024],
+                    "smpl_export": False,
+                    "video_fps": 24.0,
+                },
+                config_path="configs/body4d.yaml",
+            )
+
+            Image.new("RGB", (4, 4), color=(0, 255, 0)).save(
+                os.path.join(invalid_working_dir, "images", "00000000.jpg")
+            )
+
+            with self.assertRaisesRegex(ValueError, "exported cache is invalid"):
+                export_sam3_cache(
+                    working_dir=invalid_working_dir,
+                    cache_root=cache_root,
+                    sample_id="sample_001",
+                    source_video="inputs/source.mp4",
+                    runtime={
+                        "out_obj_ids": [1],
+                        "batch_size": 8,
+                        "detection_resolution": [256, 512],
+                        "completion_resolution": [512, 1024],
+                        "smpl_export": False,
+                        "video_fps": 24.0,
+                    },
+                    config_path="configs/body4d.yaml",
+                )
+
+            with open(os.path.join(cache_dir, "meta.json"), "r", encoding="utf-8") as handle:
+                meta_data = json.load(handle)
+            mask_still_exists = os.path.isfile(
+                os.path.join(cache_dir, "masks", "00000000.png")
+            )
+
+        self.assertEqual(meta_data["frame_stems"], ["00000000"])
+        self.assertTrue(mask_still_exists)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import tempfile
 from glob import glob
 
 from PIL import Image
@@ -44,52 +45,59 @@ def export_sam3_cache(
 ):
     cache_root, cache_dir = _resolve_safe_cache_dir(cache_root, sample_id)
     os.makedirs(cache_root, exist_ok=True)
-    if os.path.isdir(cache_dir):
-        shutil.rmtree(cache_dir)
-    cache_images_dir = os.path.join(cache_dir, "images")
-    cache_masks_dir = os.path.join(cache_dir, "masks")
+    staging_dir = tempfile.mkdtemp(prefix=f".sam3_cache_{sample_id}_", dir=cache_root)
+    cache_images_dir = os.path.join(staging_dir, "images")
+    cache_masks_dir = os.path.join(staging_dir, "masks")
     os.makedirs(cache_images_dir, exist_ok=True)
     os.makedirs(cache_masks_dir, exist_ok=True)
 
-    for image_path in sorted(glob(os.path.join(working_dir, "images", "*.jpg"))):
-        shutil.copy2(image_path, os.path.join(cache_images_dir, os.path.basename(image_path)))
-    for mask_path in sorted(glob(os.path.join(working_dir, "masks", "*.png"))):
-        shutil.copy2(mask_path, os.path.join(cache_masks_dir, os.path.basename(mask_path)))
+    try:
+        for image_path in sorted(glob(os.path.join(working_dir, "images", "*.jpg"))):
+            shutil.copy2(image_path, os.path.join(cache_images_dir, os.path.basename(image_path)))
+        for mask_path in sorted(glob(os.path.join(working_dir, "masks", "*.png"))):
+            shutil.copy2(mask_path, os.path.join(cache_masks_dir, os.path.basename(mask_path)))
 
-    frame_stems = _frame_stems_from_dir(cache_images_dir, ".jpg")
-    if not frame_stems:
-        raise ValueError(f"no exported images found under {cache_images_dir}")
+        frame_stems = _frame_stems_from_dir(cache_images_dir, ".jpg")
+        if not frame_stems:
+            raise ValueError(f"no exported images found under {cache_images_dir}")
 
-    first_image_path = os.path.join(cache_images_dir, f"{frame_stems[0]}.jpg")
-    with Image.open(first_image_path) as first_image:
-        width, height = first_image.size
+        first_image_path = os.path.join(cache_images_dir, f"{frame_stems[0]}.jpg")
+        with Image.open(first_image_path) as first_image:
+            width, height = first_image.size
 
-    meta = build_cache_meta(
-        sample_id=sample_id,
-        source_video=source_video,
-        frame_stems=frame_stems,
-        image_size={"width": width, "height": height},
-        obj_ids=runtime["out_obj_ids"],
-        runtime_profile={
-            "batch_size": runtime["batch_size"],
-            "detection_resolution": list(runtime["detection_resolution"]),
-            "completion_resolution": list(runtime["completion_resolution"]),
-            "smpl_export": bool(runtime.get("smpl_export", False)),
-            "fps": float(runtime.get("video_fps", 0.0)),
-        },
-        config_path=config_path,
-    )
+        meta = build_cache_meta(
+            sample_id=sample_id,
+            source_video=source_video,
+            frame_stems=frame_stems,
+            image_size={"width": width, "height": height},
+            obj_ids=runtime["out_obj_ids"],
+            runtime_profile={
+                "batch_size": runtime["batch_size"],
+                "detection_resolution": list(runtime["detection_resolution"]),
+                "completion_resolution": list(runtime["completion_resolution"]),
+                "smpl_export": bool(runtime.get("smpl_export", False)),
+                "fps": float(runtime.get("video_fps", 0.0)),
+            },
+            config_path=config_path,
+        )
 
-    with open(os.path.join(cache_dir, "meta.json"), "w", encoding="utf-8") as handle:
-        json.dump(meta, handle, indent=2)
-    with open(os.path.join(cache_dir, "prompts.json"), "w", encoding="utf-8") as handle:
-        json.dump({"targets": runtime.get("prompt_log", {})}, handle, indent=2)
-    with open(os.path.join(cache_dir, "frame_metrics.json"), "w", encoding="utf-8") as handle:
-        json.dump(runtime.get("frame_metrics", []), handle, indent=2)
-    with open(os.path.join(cache_dir, "events.json"), "w", encoding="utf-8") as handle:
-        json.dump(runtime.get("events", []), handle, indent=2)
+        with open(os.path.join(staging_dir, "meta.json"), "w", encoding="utf-8") as handle:
+            json.dump(meta, handle, indent=2)
+        with open(os.path.join(staging_dir, "prompts.json"), "w", encoding="utf-8") as handle:
+            json.dump({"targets": runtime.get("prompt_log", {})}, handle, indent=2)
+        with open(os.path.join(staging_dir, "frame_metrics.json"), "w", encoding="utf-8") as handle:
+            json.dump(runtime.get("frame_metrics", []), handle, indent=2)
+        with open(os.path.join(staging_dir, "events.json"), "w", encoding="utf-8") as handle:
+            json.dump(runtime.get("events", []), handle, indent=2)
 
-    ok, errors = validate_cache_dir(cache_dir)
-    if not ok:
-        raise ValueError(f"exported cache is invalid: {errors}")
+        ok, errors = validate_cache_dir(staging_dir)
+        if not ok:
+            raise ValueError(f"exported cache is invalid: {errors}")
+
+        if os.path.isdir(cache_dir):
+            shutil.rmtree(cache_dir)
+        shutil.move(staging_dir, cache_dir)
+    except Exception:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
     return cache_dir
