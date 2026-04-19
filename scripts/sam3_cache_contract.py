@@ -31,7 +31,6 @@ def build_cache_meta(
         "mask_ext": mask_ext,
         "obj_ids": list(obj_ids),
         "runtime_profile": copy.deepcopy(runtime_profile),
-        "config": {"config_path": config_path},
         "config_path": config_path,
         "exported_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
