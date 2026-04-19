@@ -103,6 +103,35 @@ class Sam3CacheExportTests(unittest.TestCase):
         self.assertEqual(frame_metrics[0]["track_metrics"]["2"]["mask_area"], 0)
         self.assertIsNone(frame_metrics[0]["track_metrics"]["2"]["bbox_xyxy"])
 
+    def test_record_prompt_update_invalidates_completed_masks_and_clears_metrics(self):
+        import numpy as np
+
+        from scripts.sam3_cache_export import record_prompt_update
+
+        runtime = {
+            "prompt_log": {},
+            "frame_metrics": [{"frame_stem": "00000000"}],
+            "events": [{"type": "mask_generation_completed", "frame_count": 1}],
+            "mask_generation_completed": True,
+        }
+
+        record_prompt_update(
+            runtime,
+            obj_id=2,
+            frame_idx=7,
+            input_point=np.array([[11, 13], [17, 19]], dtype=np.int32),
+            input_label=np.array([1, 0], dtype=np.int32),
+        )
+
+        self.assertFalse(runtime["mask_generation_completed"])
+        self.assertEqual(runtime["frame_metrics"], [])
+        self.assertEqual(
+            runtime["prompt_log"]["2"]["frames"]["7"],
+            {"points": [[11, 13], [17, 19]], "labels": [1, 0]},
+        )
+        self.assertEqual(runtime["events"][-1]["type"], "prompt_updated")
+        self.assertEqual(runtime["events"][-1]["obj_id"], 2)
+
     def test_build_runtime_export_state_preserves_prompt_log_events_and_frame_metrics(self):
         from scripts.sam3_cache_export import build_runtime_export_state
 

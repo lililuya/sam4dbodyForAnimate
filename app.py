@@ -31,6 +31,7 @@ from scripts.sam3_cache_export import (
     build_frame_metrics_from_video_segments,
     ensure_sam3_export_ready,
     export_sam3_cache,
+    record_prompt_update,
     start_sam3_export_session,
 )
 from utils import draw_point_marker, mask_painter, images_to_mp4, DAVIS_PALETTE, jpg_folder_to_mp4, is_super_long_or_wide, keep_largest_component, is_skinny_mask, bbox_from_mask, gpu_profile, resize_mask_with_unique_label
@@ -444,16 +445,12 @@ def on_click(evt: gr.SelectData, point_type: str, video_path: str, frame_idx: in
         points=points_tensor,
         labels=points_labels_tensor,
     )
-    target_entry = RUNTIME["prompt_log"].setdefault(
-        str(RUNTIME["id"]),
-        {"name": f"Target {RUNTIME['id']}", "frames": {}},
-    )
-    target_entry["frames"][str(int(frame_idx))] = {
-        "points": input_point.tolist(),
-        "labels": input_label.tolist(),
-    }
-    RUNTIME["events"].append(
-        {"type": "prompt_updated", "obj_id": int(RUNTIME["id"]), "frame_idx": int(frame_idx)}
+    record_prompt_update(
+        RUNTIME,
+        obj_id=RUNTIME["id"],
+        frame_idx=frame_idx,
+        input_point=input_point,
+        input_label=input_label,
     )
     mask_np = (video_res_masks[-1, 0].detach().cpu().numpy() > 0)
     mask = (mask_np > 0).astype(np.uint8) * 255

@@ -39,11 +39,12 @@ def start_sam3_export_session(runtime, *, output_root, source_video, id_factory=
 
 
 def ensure_sam3_export_ready(*, runtime, video_path, output_dir):
+    output_dir = os.path.abspath(output_dir)
     if video_path is None:
         raise ValueError("No video loaded.")
     if runtime.get("session_video_path") != video_path:
         raise ValueError("Export is not ready for the current video session.")
-    if runtime.get("session_output_dir") != output_dir:
+    if os.path.abspath(runtime.get("session_output_dir", "")) != output_dir:
         raise ValueError("Export is not ready for the current video session.")
     if not runtime.get("mask_generation_completed", False):
         raise ValueError("Run Mask Generation before exporting SAM3 cache.")
@@ -53,6 +54,22 @@ def ensure_sam3_export_ready(*, runtime, video_path, output_dir):
     if not os.path.isdir(images_dir) or not os.path.isdir(masks_dir):
         raise ValueError("Run Mask Generation before exporting SAM3 cache.")
     return images_dir, masks_dir
+
+
+def record_prompt_update(runtime, *, obj_id, frame_idx, input_point, input_label):
+    target_entry = runtime.setdefault("prompt_log", {}).setdefault(
+        str(obj_id),
+        {"name": f"Target {obj_id}", "frames": {}},
+    )
+    target_entry["frames"][str(int(frame_idx))] = {
+        "points": np.asarray(input_point).tolist(),
+        "labels": np.asarray(input_label).tolist(),
+    }
+    runtime.setdefault("events", []).append(
+        {"type": "prompt_updated", "obj_id": int(obj_id), "frame_idx": int(frame_idx)}
+    )
+    runtime["frame_metrics"] = []
+    runtime["mask_generation_completed"] = False
 
 
 def build_frame_metrics_from_video_segments(video_segments):
