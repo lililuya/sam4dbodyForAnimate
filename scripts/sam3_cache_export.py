@@ -5,9 +5,77 @@ import shutil
 import uuid
 from glob import glob
 
+import numpy as np
 from PIL import Image
 
 from scripts.sam3_cache_contract import build_cache_meta, validate_cache_dir
+
+
+def _bbox_xyxy_from_mask(binary_mask):
+    coords = np.argwhere(binary_mask > 0)
+    if coords.size == 0:
+        return None
+    y_min, x_min = coords.min(axis=0)
+    y_max, x_max = coords.max(axis=0)
+    return [float(x_min), float(y_min), float(x_max), float(y_max)]
+
+
+def start_sam3_export_session(runtime, *, output_root, source_video, id_factory=None):
+    if id_factory is None:
+        id_factory = lambda: uuid.uuid4().hex
+
+    output_root = os.path.abspath(output_root)
+    os.makedirs(output_root, exist_ok=True)
+    output_dir = os.path.join(output_root, id_factory())
+    os.makedirs(output_dir, exist_ok=False)
+
+    runtime["prompt_log"] = {}
+    runtime["frame_metrics"] = []
+    runtime["events"] = [{"type": "video_loaded", "source_video": source_video}]
+    runtime["session_video_path"] = source_video
+    runtime["session_output_dir"] = output_dir
+    runtime["mask_generation_completed"] = False
+    return output_dir
+
+
+def ensure_sam3_export_ready(*, runtime, video_path, output_dir):
+    if video_path is None:
+        raise ValueError("No video loaded.")
+    if runtime.get("session_video_path") != video_path:
+        raise ValueError("Export is not ready for the current video session.")
+    if runtime.get("session_output_dir") != output_dir:
+        raise ValueError("Export is not ready for the current video session.")
+    if not runtime.get("mask_generation_completed", False):
+        raise ValueError("Run Mask Generation before exporting SAM3 cache.")
+
+    images_dir = os.path.join(output_dir, "images")
+    masks_dir = os.path.join(output_dir, "masks")
+    if not os.path.isdir(images_dir) or not os.path.isdir(masks_dir):
+        raise ValueError("Run Mask Generation before exporting SAM3 cache.")
+    return images_dir, masks_dir
+
+
+def build_frame_metrics_from_video_segments(video_segments):
+    frame_metrics = []
+    for frame_idx in sorted(video_segments):
+        track_metrics = {}
+        for obj_id, out_mask in sorted(video_segments[frame_idx].items()):
+            mask_array = np.asarray(out_mask)
+            if mask_array.ndim >= 3:
+                mask_array = mask_array[0]
+            binary_mask = (mask_array > 0).astype(np.uint8)
+            track_metrics[str(int(obj_id))] = {
+                "mask_area": int(binary_mask.sum()),
+                "bbox_xyxy": _bbox_xyxy_from_mask(binary_mask),
+            }
+        frame_metrics.append(
+            {
+                "frame_idx": int(frame_idx),
+                "frame_stem": f"{int(frame_idx):08d}",
+                "track_metrics": track_metrics,
+            }
+        )
+    return frame_metrics
 
 
 def build_runtime_export_state(runtime):

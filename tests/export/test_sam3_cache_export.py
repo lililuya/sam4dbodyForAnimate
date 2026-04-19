@@ -23,6 +23,86 @@ def make_workspace_tempdir():
 
 
 class Sam3CacheExportTests(unittest.TestCase):
+    def test_start_sam3_export_session_resets_tracking_and_rotates_output_dir(self):
+        from scripts.sam3_cache_export import start_sam3_export_session
+
+        with make_workspace_tempdir() as tmpdir:
+            runtime = {
+                "batch_size": 8,
+                "detection_resolution": [256, 512],
+                "completion_resolution": [512, 1024],
+                "video_fps": 24.0,
+                "prompt_log": {"old": "value"},
+                "frame_metrics": [{"frame_stem": "00000000"}],
+                "events": [{"type": "old_event"}],
+                "session_output_dir": "stale",
+                "mask_generation_completed": True,
+            }
+
+            output_dir = start_sam3_export_session(
+                runtime=runtime,
+                output_root=tmpdir,
+                source_video="video_b.mp4",
+                id_factory=lambda: "session_b",
+            )
+
+        self.assertEqual(output_dir, os.path.join(tmpdir, "session_b"))
+        self.assertEqual(runtime["prompt_log"], {})
+        self.assertEqual(runtime["frame_metrics"], [])
+        self.assertEqual(runtime["events"], [{"type": "video_loaded", "source_video": "video_b.mp4"}])
+        self.assertEqual(runtime["session_video_path"], "video_b.mp4")
+        self.assertEqual(runtime["session_output_dir"], output_dir)
+        self.assertFalse(runtime["mask_generation_completed"])
+
+    def test_ensure_sam3_export_ready_rejects_stale_or_incomplete_session(self):
+        from scripts.sam3_cache_export import ensure_sam3_export_ready
+
+        with make_workspace_tempdir() as tmpdir:
+            output_dir = os.path.join(tmpdir, "session_a")
+            os.makedirs(os.path.join(output_dir, "images"), exist_ok=True)
+            os.makedirs(os.path.join(output_dir, "masks"), exist_ok=True)
+            runtime = {
+                "session_video_path": "video_a.mp4",
+                "session_output_dir": output_dir,
+                "mask_generation_completed": False,
+            }
+
+            with self.assertRaisesRegex(ValueError, "Run Mask Generation"):
+                ensure_sam3_export_ready(
+                    runtime=runtime,
+                    video_path="video_a.mp4",
+                    output_dir=output_dir,
+                )
+
+            runtime["mask_generation_completed"] = True
+            with self.assertRaisesRegex(ValueError, "current video session"):
+                ensure_sam3_export_ready(
+                    runtime=runtime,
+                    video_path="video_b.mp4",
+                    output_dir=output_dir,
+                )
+
+    def test_build_frame_metrics_from_video_segments_reports_mask_area_and_bbox(self):
+        import numpy as np
+
+        from scripts.sam3_cache_export import build_frame_metrics_from_video_segments
+
+        video_segments = {
+            0: {
+                1: np.array([[[1, 0], [0, 1]]], dtype=np.uint8),
+                2: np.array([[[0, 0], [0, 0]]], dtype=np.uint8),
+            }
+        }
+
+        frame_metrics = build_frame_metrics_from_video_segments(video_segments)
+
+        self.assertEqual(frame_metrics[0]["frame_idx"], 0)
+        self.assertEqual(frame_metrics[0]["frame_stem"], "00000000")
+        self.assertEqual(frame_metrics[0]["track_metrics"]["1"]["mask_area"], 2)
+        self.assertEqual(frame_metrics[0]["track_metrics"]["1"]["bbox_xyxy"], [0.0, 0.0, 1.0, 1.0])
+        self.assertEqual(frame_metrics[0]["track_metrics"]["2"]["mask_area"], 0)
+        self.assertIsNone(frame_metrics[0]["track_metrics"]["2"]["bbox_xyxy"])
+
     def test_build_runtime_export_state_preserves_prompt_log_events_and_frame_metrics(self):
         from scripts.sam3_cache_export import build_runtime_export_state
 

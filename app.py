@@ -27,7 +27,12 @@ from PIL import Image
 from tqdm import tqdm
 from omegaconf import OmegaConf
 
-from scripts.sam3_cache_export import export_sam3_cache
+from scripts.sam3_cache_export import (
+    build_frame_metrics_from_video_segments,
+    ensure_sam3_export_ready,
+    export_sam3_cache,
+    start_sam3_export_session,
+)
 from utils import draw_point_marker, mask_painter, images_to_mp4, DAVIS_PALETTE, jpg_folder_to_mp4, is_super_long_or_wide, keep_largest_component, is_skinny_mask, bbox_from_mask, gpu_profile, resize_mask_with_unique_label
 
 from models.sam_3d_body.sam_3d_body import load_sam_3d_body, SAM3DBodyEstimator
@@ -238,6 +243,14 @@ def prepare_video(path: str):
     total_text = f"{int(dur // 60):02d}:{int(dur % 60):02d}"
     time_text = f"00:00 / {total_text}"
 
+    global OUTPUT_DIR
+    OUTPUT_DIR = start_sam3_export_session(
+        RUNTIME,
+        output_root=CONFIG.runtime['output_dir'],
+        source_video=path,
+        id_factory=gen_id,
+    )
+
     inference_state = predictor.init_state(video_path=path)
     predictor.clear_all_points_in_video(inference_state)
     RUNTIME['inference_state'] = inference_state
@@ -246,9 +259,6 @@ def prepare_video(path: str):
     RUNTIME['objects'] = {} # points
     RUNTIME['masks'] = {}   # masks
     RUNTIME['out_obj_ids'] = []
-    RUNTIME["prompt_log"] = {}
-    RUNTIME["frame_metrics"] = []
-    RUNTIME["events"] = [{"type": "video_loaded", "source_video": path}]
 
     return path, fps, first_frame, slider_cfg, time_text
 
@@ -423,18 +433,6 @@ def on_click(evt: gr.SelectData, point_type: str, video_path: str, frame_idx: in
     prompts = {}
     prompts[RUNTIME['id']] = input_point, input_label
 
-    target_entry = RUNTIME["prompt_log"].setdefault(
-        str(RUNTIME["id"]),
-        {"name": f"Target {RUNTIME['id']}", "frames": {}},
-    )
-    target_entry["frames"][str(int(frame_idx))] = {
-        "points": input_point.tolist(),
-        "labels": input_label.tolist(),
-    }
-    RUNTIME["events"].append(
-        {"type": "prompt_updated", "obj_id": int(RUNTIME["id"]), "frame_idx": int(frame_idx)}
-    )
-
     rel_points = [[x / width, y / height] for x, y in input_point]
     points_tensor = torch.tensor(rel_points, dtype=torch.float32)
     points_labels_tensor = torch.tensor(input_label, dtype=torch.int32)
@@ -445,6 +443,17 @@ def on_click(evt: gr.SelectData, point_type: str, video_path: str, frame_idx: in
         obj_id=RUNTIME['id'],
         points=points_tensor,
         labels=points_labels_tensor,
+    )
+    target_entry = RUNTIME["prompt_log"].setdefault(
+        str(RUNTIME["id"]),
+        {"name": f"Target {RUNTIME['id']}", "frames": {}},
+    )
+    target_entry["frames"][str(int(frame_idx))] = {
+        "points": input_point.tolist(),
+        "labels": input_label.tolist(),
+    }
+    RUNTIME["events"].append(
+        {"type": "prompt_updated", "obj_id": int(RUNTIME["id"]), "frame_idx": int(frame_idx)}
     )
     mask_np = (video_res_masks[-1, 0].detach().cpu().numpy() > 0)
     mask = (mask_np > 0).astype(np.uint8) * 255
@@ -557,6 +566,8 @@ def on_mask_generation(video_path: str):
 
     out_video_path = os.path.join(OUTPUT_DIR, f"video_mask_{time.time():.0f}.mp4")
     images_to_mp4(img_to_video, out_video_path, fps=RUNTIME['video_fps'])
+    RUNTIME["frame_metrics"] = build_frame_metrics_from_video_segments(video_segments)
+    RUNTIME["mask_generation_completed"] = True
     RUNTIME["events"].append(
         {"type": "mask_generation_completed", "frame_count": len(video_segments)}
     )
@@ -565,13 +576,10 @@ def on_mask_generation(video_path: str):
 
 
 def export_current_sam3_cache(video_path: str):
-    if video_path is None:
-        raise gr.Error("No video loaded.")
-
-    images_dir = os.path.join(OUTPUT_DIR, "images")
-    masks_dir = os.path.join(OUTPUT_DIR, "masks")
-    if not os.path.isdir(images_dir) or not os.path.isdir(masks_dir):
-        raise gr.Error("Run Mask Generation before exporting SAM3 cache.")
+    try:
+        ensure_sam3_export_ready(runtime=RUNTIME, video_path=video_path, output_dir=OUTPUT_DIR)
+    except ValueError as exc:
+        raise gr.Error(str(exc)) from exc
 
     cache_root = os.path.join(CONFIG.runtime["output_dir"], "sam3_cache")
     sample_id = os.path.basename(os.path.normpath(OUTPUT_DIR))
