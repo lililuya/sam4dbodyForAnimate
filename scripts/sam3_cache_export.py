@@ -26,6 +26,8 @@ def export_sam3_cache(
     config_path,
 ):
     cache_dir = os.path.join(cache_root, sample_id)
+    if os.path.isdir(cache_dir):
+        shutil.rmtree(cache_dir)
     cache_images_dir = os.path.join(cache_dir, "images")
     cache_masks_dir = os.path.join(cache_dir, "masks")
     os.makedirs(cache_images_dir, exist_ok=True)
