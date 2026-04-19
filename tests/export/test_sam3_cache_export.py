@@ -23,6 +23,40 @@ def make_workspace_tempdir():
 
 
 class Sam3CacheExportTests(unittest.TestCase):
+    def test_build_runtime_export_state_preserves_prompt_log_events_and_frame_metrics(self):
+        from scripts.sam3_cache_export import build_runtime_export_state
+
+        runtime = {
+            "out_obj_ids": [1],
+            "batch_size": 8,
+            "detection_resolution": [256, 512],
+            "completion_resolution": [512, 1024],
+            "smpl_export": False,
+            "video_fps": 24.0,
+            "prompt_log": {
+                "1": {
+                    "name": "Target 1",
+                    "frames": {"0": {"points": [[1, 2]], "labels": [1]}},
+                }
+            },
+            "frame_metrics": [
+                {"frame_stem": "00000000", "track_metrics": {"1": {"mask_area": 4}}}
+            ],
+            "events": [{"type": "target_added", "obj_id": 1}],
+        }
+
+        payload = build_runtime_export_state(runtime)
+
+        self.assertEqual(payload["out_obj_ids"], [1])
+        self.assertEqual(payload["runtime_profile"]["batch_size"], 8)
+        self.assertEqual(payload["runtime_profile"]["detection_resolution"], [256, 512])
+        self.assertEqual(payload["runtime_profile"]["completion_resolution"], [512, 1024])
+        self.assertEqual(payload["runtime_profile"]["smpl_export"], False)
+        self.assertEqual(payload["runtime_profile"]["fps"], 24.0)
+        self.assertEqual(payload["prompt_log"]["1"]["frames"]["0"]["labels"], [1])
+        self.assertEqual(payload["frame_metrics"][0]["track_metrics"]["1"]["mask_area"], 4)
+        self.assertEqual(payload["events"][0]["type"], "target_added")
+
     def test_export_sam3_cache_writes_contract_files_and_runtime_payloads(self):
         from scripts.sam3_cache_export import export_sam3_cache
 

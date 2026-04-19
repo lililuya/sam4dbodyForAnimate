@@ -27,6 +27,7 @@ from PIL import Image
 from tqdm import tqdm
 from omegaconf import OmegaConf
 
+from scripts.sam3_cache_export import export_sam3_cache
 from utils import draw_point_marker, mask_painter, images_to_mp4, DAVIS_PALETTE, jpg_folder_to_mp4, is_super_long_or_wide, keep_largest_component, is_skinny_mask, bbox_from_mask, gpu_profile, resize_mask_with_unique_label
 
 from models.sam_3d_body.sam_3d_body import load_sam_3d_body, SAM3DBodyEstimator
@@ -139,6 +140,7 @@ def init_runtime(config_path: str = os.path.join(ROOT, "configs", "body4d.yaml")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     RUNTIME = {}  # clear any old state
+    RUNTIME['config_path'] = os.path.abspath(config_path)
     RUNTIME['batch_size'] = CONFIG.sam_3d_body.get('batch_size', 1)
     RUNTIME['detection_resolution'] = CONFIG.completion.get('detection_resolution', [256, 512])
     RUNTIME['completion_resolution'] = CONFIG.completion.get('completion_resolution', [512, 1024])
@@ -244,6 +246,9 @@ def prepare_video(path: str):
     RUNTIME['objects'] = {} # points
     RUNTIME['masks'] = {}   # masks
     RUNTIME['out_obj_ids'] = []
+    RUNTIME["prompt_log"] = {}
+    RUNTIME["frame_metrics"] = []
+    RUNTIME["events"] = [{"type": "video_loaded", "source_video": path}]
 
     return path, fps, first_frame, slider_cfg, time_text
 
@@ -418,6 +423,18 @@ def on_click(evt: gr.SelectData, point_type: str, video_path: str, frame_idx: in
     prompts = {}
     prompts[RUNTIME['id']] = input_point, input_label
 
+    target_entry = RUNTIME["prompt_log"].setdefault(
+        str(RUNTIME["id"]),
+        {"name": f"Target {RUNTIME['id']}", "frames": {}},
+    )
+    target_entry["frames"][str(int(frame_idx))] = {
+        "points": input_point.tolist(),
+        "labels": input_label.tolist(),
+    }
+    RUNTIME["events"].append(
+        {"type": "prompt_updated", "obj_id": int(RUNTIME["id"]), "frame_idx": int(frame_idx)}
+    )
+
     rel_points = [[x / width, y / height] for x, y in input_point]
     points_tensor = torch.tensor(rel_points, dtype=torch.float32)
     points_labels_tensor = torch.tensor(input_label, dtype=torch.int32)
@@ -540,8 +557,34 @@ def on_mask_generation(video_path: str):
 
     out_video_path = os.path.join(OUTPUT_DIR, f"video_mask_{time.time():.0f}.mp4")
     images_to_mp4(img_to_video, out_video_path, fps=RUNTIME['video_fps'])
+    RUNTIME["events"].append(
+        {"type": "mask_generation_completed", "frame_count": len(video_segments)}
+    )
 
     return out_video_path
+
+
+def export_current_sam3_cache(video_path: str):
+    if video_path is None:
+        raise gr.Error("No video loaded.")
+
+    images_dir = os.path.join(OUTPUT_DIR, "images")
+    masks_dir = os.path.join(OUTPUT_DIR, "masks")
+    if not os.path.isdir(images_dir) or not os.path.isdir(masks_dir):
+        raise gr.Error("Run Mask Generation before exporting SAM3 cache.")
+
+    cache_root = os.path.join(CONFIG.runtime["output_dir"], "sam3_cache")
+    sample_id = os.path.basename(os.path.normpath(OUTPUT_DIR))
+
+    cache_dir = export_sam3_cache(
+        working_dir=OUTPUT_DIR,
+        cache_root=cache_root,
+        sample_id=sample_id,
+        source_video=video_path,
+        runtime=RUNTIME,
+        config_path=RUNTIME.get("config_path", os.path.join(ROOT, "configs", "body4d.yaml")),
+    )
+    return cache_dir
 
 def draw_keypoints_with_index(
     image: np.ndarray,
@@ -1106,7 +1149,9 @@ with gr.Blocks(title="SAM-Body4D") as demo:
             result_display = gr.Video(label="Segmentation Result")
             with gr.Row():
                 mask_gen_btn = gr.Button("Mask Generation")
+                export_cache_btn = gr.Button("Export SAM3 Cache")
                 gen4d_btn = gr.Button("4D Generation")
+            export_cache_path = gr.Textbox(label="Exported Cache Path", interactive=False)
             fourd_display = gr.Video(label="4D Result")
 
     # ===============================
@@ -1165,6 +1210,12 @@ with gr.Blocks(title="SAM-Body4D") as demo:
         fn=on_mask_generation,
         inputs=[video_state], 
         outputs=[result_display],
+    )
+
+    export_cache_btn.click(
+        fn=export_current_sam3_cache,
+        inputs=[video_state],
+        outputs=[export_cache_path],
     )
 
     gen4d_btn.click(

@@ -1,12 +1,29 @@
+import copy
 import json
 import os
 import shutil
-import tempfile
+import uuid
 from glob import glob
 
 from PIL import Image
 
 from scripts.sam3_cache_contract import build_cache_meta, validate_cache_dir
+
+
+def build_runtime_export_state(runtime):
+    return {
+        "out_obj_ids": list(runtime.get("out_obj_ids", [])),
+        "runtime_profile": {
+            "batch_size": int(runtime.get("batch_size", 1)),
+            "detection_resolution": list(runtime.get("detection_resolution", [])),
+            "completion_resolution": list(runtime.get("completion_resolution", [])),
+            "smpl_export": bool(runtime.get("smpl_export", False)),
+            "fps": float(runtime.get("video_fps", 0.0)),
+        },
+        "prompt_log": copy.deepcopy(runtime.get("prompt_log", {})),
+        "frame_metrics": copy.deepcopy(runtime.get("frame_metrics", [])),
+        "events": copy.deepcopy(runtime.get("events", [])),
+    }
 
 
 def _resolve_safe_cache_dir(cache_root, sample_id):
@@ -43,9 +60,11 @@ def export_sam3_cache(
     runtime,
     config_path,
 ):
+    runtime_export = build_runtime_export_state(runtime)
     cache_root, cache_dir = _resolve_safe_cache_dir(cache_root, sample_id)
     os.makedirs(cache_root, exist_ok=True)
-    staging_dir = tempfile.mkdtemp(prefix=f".sam3_cache_{sample_id}_", dir=cache_root)
+    staging_dir = os.path.join(cache_root, f"sam3_cache_{sample_id}_{uuid.uuid4().hex}")
+    os.makedirs(staging_dir, exist_ok=False)
     cache_images_dir = os.path.join(staging_dir, "images")
     cache_masks_dir = os.path.join(staging_dir, "masks")
     os.makedirs(cache_images_dir, exist_ok=True)
@@ -70,25 +89,19 @@ def export_sam3_cache(
             source_video=source_video,
             frame_stems=frame_stems,
             image_size={"width": width, "height": height},
-            obj_ids=runtime["out_obj_ids"],
-            runtime_profile={
-                "batch_size": runtime["batch_size"],
-                "detection_resolution": list(runtime["detection_resolution"]),
-                "completion_resolution": list(runtime["completion_resolution"]),
-                "smpl_export": bool(runtime.get("smpl_export", False)),
-                "fps": float(runtime.get("video_fps", 0.0)),
-            },
+            obj_ids=runtime_export["out_obj_ids"],
+            runtime_profile=runtime_export["runtime_profile"],
             config_path=config_path,
         )
 
         with open(os.path.join(staging_dir, "meta.json"), "w", encoding="utf-8") as handle:
             json.dump(meta, handle, indent=2)
         with open(os.path.join(staging_dir, "prompts.json"), "w", encoding="utf-8") as handle:
-            json.dump({"targets": runtime.get("prompt_log", {})}, handle, indent=2)
+            json.dump({"targets": runtime_export["prompt_log"]}, handle, indent=2)
         with open(os.path.join(staging_dir, "frame_metrics.json"), "w", encoding="utf-8") as handle:
-            json.dump(runtime.get("frame_metrics", []), handle, indent=2)
+            json.dump(runtime_export["frame_metrics"], handle, indent=2)
         with open(os.path.join(staging_dir, "events.json"), "w", encoding="utf-8") as handle:
-            json.dump(runtime.get("events", []), handle, indent=2)
+            json.dump(runtime_export["events"], handle, indent=2)
 
         ok, errors = validate_cache_dir(staging_dir)
         if not ok:
