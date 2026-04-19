@@ -9,6 +9,8 @@ from contextlib import nullcontext
 import cv2
 import numpy as np
 from PIL import Image
+
+from scripts.offline_completion_indexing import build_completion_window_from_ious
 from tqdm import tqdm
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -327,15 +329,14 @@ def build_export_app_class(base_module):
                                 )
 
                         pred_amodal_masks_dict[obj_id] = pred_amodal_masks_com
-                        occluded_indexes = [idx for idx, iou in enumerate(ious) if iou < 0.7]
-                        occ_dict[obj_id] = [1 if iou > 0.7 else 0 for iou in ious]
+                        occ_dict[obj_id], completion_window = build_completion_window_from_ious(
+                            ious,
+                            padding=2,
+                            iou_threshold=0.7,
+                        )
 
-                        if occluded_indexes:
-                            start = max(0, occluded_indexes[0] - 2)
-                            end = min(
-                                modal_pixels[:, i : i + batch_size, :, :, :].shape[1] - 1,
-                                occluded_indexes[-1] + 2,
-                            )
+                        if completion_window is not None:
+                            start, end = completion_window
                             idx_dict[obj_id] = (start, end)
                             completion_path = "".join(random.choices("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", k=4))
                             completion_image_path = f"{self.OUTPUT_DIR}/completion/{completion_path}/images"

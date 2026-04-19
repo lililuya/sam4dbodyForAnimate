@@ -29,6 +29,7 @@ from tqdm import tqdm
 from omegaconf import OmegaConf
 
 from utils import draw_point_marker, mask_painter, images_to_mp4, DAVIS_PALETTE, jpg_folder_to_mp4, is_super_long_or_wide, keep_largest_component, is_skinny_mask, bbox_from_mask, gpu_profile, resize_mask_with_unique_label
+from scripts.offline_completion_indexing import build_completion_window_from_ious
 
 from models.sam_3d_body.sam_3d_body import load_sam_3d_body, SAM3DBodyEstimator
 from models.sam_3d_body.notebook.utils import process_image_with_mask, save_mesh_results
@@ -364,13 +365,14 @@ class OfflineApp:
                     pred_amodal_masks_dict[obj_id] = pred_amodal_masks_com
 
                     # confirm occlusions & save masks (for HMR)
-                    start, end = (idxs := [ix for ix,x in enumerate(ious) if x < 0.7]) and (idxs[0], idxs[-1]) or (None, None)
+                    occ_dict[obj_id], completion_window = build_completion_window_from_ious(
+                        ious,
+                        padding=2,
+                        iou_threshold=0.7,
+                    )
 
-                    occ_dict[obj_id] = [1 if ix > 0.7 else 0 for ix in ious]
-
-                    if start is not None and end is not None:
-                        start = max(0, start-2)
-                        end = min(modal_pixels[:, i:i + batch_size, :, :, :].shape[1]-1, end+2)
+                    if completion_window is not None:
+                        start, end = completion_window
                         idx_dict[obj_id] = (start, end)
                         completion_path = ''.join(random.choices('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ', k=4))
                         completion_image_path = f'{self.OUTPUT_DIR}/completion/{completion_path}/images'
