@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 from typing import Any
@@ -28,7 +29,7 @@ def build_cache_meta(
         "image_ext": image_ext,
         "mask_ext": mask_ext,
         "obj_ids": list(obj_ids),
-        "runtime_profile": dict(runtime_profile),
+        "runtime_profile": copy.deepcopy(runtime_profile),
         "config_path": config_path,
     }
 
@@ -48,6 +49,14 @@ def validate_cache_dir(cache_dir: str) -> tuple[bool, list[str]]:
         meta = load_json(meta_path)
     except json.JSONDecodeError as exc:
         return False, [f"Invalid JSON in meta.json: {exc}"]
+    if not isinstance(meta, dict):
+        return False, ["meta.json top-level value must be an object"]
+
+    cache_version = meta.get("cache_version")
+    if cache_version != CACHE_VERSION:
+        errors.append(
+            f"meta.cache_version must be {CACHE_VERSION}, got {cache_version!r}"
+        )
 
     frame_stems = meta.get("frame_stems", [])
     image_ext = meta.get("image_ext", ".jpg")
