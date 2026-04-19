@@ -315,7 +315,48 @@ class RefinedCliTests(unittest.TestCase):
         self.assertEqual(sample["frame_count"], 2)
         self.assertEqual(sample["frames"], ["00000000", "00000001"])
         self.assertEqual(len(sample["source_frames"]), 2)
-        self.assertTrue(sample["output_dir"].endswith("outputs_refined"))
+        self.assertEqual(os.path.basename(os.path.dirname(sample["output_dir"])), "outputs_refined")
+        self.assertNotEqual(os.path.basename(sample["output_dir"]), "outputs_refined")
+
+    def test_run_refined_pipeline_passes_none_output_dir_to_preserve_default_sample_subdir_behavior(self):
+        import scripts.offline_app_refined as offline_app_refined
+
+        cfg = OmegaConf.create(
+            {
+                "runtime": {"output_dir": "./outputs_refined"},
+                "detector": {"backend": "yolo"},
+                "tracking": {"chunk_size": 16},
+                "reprompt": {
+                    "enable": True,
+                    "empty_mask_patience": 3,
+                    "area_drop_ratio": 0.35,
+                    "edge_touch_ratio": 0.4,
+                    "iou_low_threshold": 0.55,
+                },
+                "debug": {"save_metrics": False},
+            }
+        )
+        args = SimpleNamespace(
+            input_video="sample.mp4",
+            output_dir=None,
+            config="configs/body4d_refined.yaml",
+            detector_backend=None,
+            track_chunk_size=None,
+            disable_auto_reprompt=False,
+            save_debug_metrics=False,
+            skip_existing=False,
+        )
+        app = unittest.mock.MagicMock()
+        app.prepare_input.return_value = {"frames": [], "output_dir": "./sample_out"}
+        app.detect_initial_targets.return_value = {"obj_ids": [1]}
+        app.iter_chunks.return_value = []
+
+        with patch.object(offline_app_refined, "load_refined_config", return_value=cfg), patch.object(
+            offline_app_refined, "RefinedOfflineApp", return_value=app
+        ):
+            offline_app_refined.run_refined_pipeline(args)
+
+        app.prepare_input.assert_called_once_with("sample.mp4", None, False)
 
     def test_iter_chunks_yields_stable_chunk_metadata(self):
         from scripts.offline_app_refined import RefinedOfflineApp
@@ -345,7 +386,7 @@ class RefinedCliTests(unittest.TestCase):
             ],
         )
 
-    def test_detect_initial_targets_initializes_tracker_from_first_detected_frame(self):
+    def test_detect_initial_targets_initializes_tracker_from_best_detected_frame(self):
         from scripts.offline_app_refined import RefinedOfflineApp
 
         config = OmegaConf.create(
@@ -379,6 +420,7 @@ class RefinedCliTests(unittest.TestCase):
         runtime_app.sam3_3d_body_model.process_one_image.side_effect = [
             [],
             [{"bbox": [1.0, 2.0, 5.0, 6.0]}],
+            [],
         ]
 
         with patch.object(app, "_ensure_base_app", return_value=runtime_app, create=True):
@@ -390,6 +432,113 @@ class RefinedCliTests(unittest.TestCase):
             {"video_height": 8, "video_width": 8}
         )
         predictor.add_new_points_or_box.assert_called_once()
+
+    def test_detect_initial_targets_selects_frame_with_most_detections(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        config = OmegaConf.create(
+            {
+                "runtime": {"output_dir": "./outputs_refined"},
+                "detector": {"bbox_thresh": 0.35, "iou_thresh": 0.5},
+                "batch": {"initial_search_frames": 4},
+                "debug": {"save_metrics": False},
+            }
+        )
+        app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+        app.sample_state = {
+            "input_video": "sample.mp4",
+            "input_type": "video",
+            "source_frames": None,
+            "frames": ["00000000", "00000001", "00000002", "00000003"],
+            "frame_count": 4,
+            "output_dir": "./outputs_refined",
+        }
+        app._load_source_frame = unittest.mock.MagicMock(
+            side_effect=[np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(4)]
+        )
+
+        predictor = unittest.mock.MagicMock()
+        predictor.init_state.return_value = {"video_height": 8, "video_width": 8}
+        predictor.add_new_points_or_box.side_effect = [
+            (None, [1], None, None),
+            (None, [1, 2], None, None),
+            (None, [1, 2, 3], None, None),
+        ]
+        runtime_app = unittest.mock.MagicMock()
+        runtime_app.predictor = predictor
+        runtime_app.RUNTIME = {}
+        runtime_app.sam3_3d_body_model = unittest.mock.MagicMock()
+        runtime_app.sam3_3d_body_model.process_one_image.side_effect = [
+            [{"bbox": [0.0, 0.0, 2.0, 2.0]}],
+            [{"bbox": [1.0, 1.0, 3.0, 3.0]}],
+            [
+                {"bbox": [1.0, 2.0, 5.0, 6.0]},
+                {"bbox": [2.0, 1.0, 6.0, 5.0]},
+                {"bbox": [0.0, 0.0, 4.0, 4.0]},
+            ],
+            [{"bbox": [0.0, 0.0, 2.0, 2.0]}, {"bbox": [4.0, 4.0, 6.0, 6.0]}],
+        ]
+
+        with patch.object(app, "_ensure_base_app", return_value=runtime_app, create=True):
+            targets = app.detect_initial_targets(app.sample_state)
+
+        self.assertEqual(targets["obj_ids"], [1, 2, 3])
+        self.assertEqual(targets["start_frame_idx"], 2)
+        self.assertEqual(
+            targets["boxes_xyxy"],
+            [
+                [1.0, 2.0, 5.0, 6.0],
+                [2.0, 1.0, 6.0, 5.0],
+                [0.0, 0.0, 4.0, 4.0],
+            ],
+        )
+        self.assertEqual(predictor.add_new_points_or_box.call_count, 3)
+        for call in predictor.add_new_points_or_box.call_args_list:
+            self.assertEqual(call.kwargs["frame_idx"], 2)
+
+    def test_configure_detector_ignores_yolo_weights_when_backend_is_vitdet(self):
+        import sys
+
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        config = OmegaConf.create(
+            {
+                "detector": {"backend": "vitdet", "weights_path": "yolo11n.pt"},
+                "sam_3d_body": {"detector_path": ""},
+                "debug": {"save_metrics": False},
+            }
+        )
+        app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+        runtime_app = unittest.mock.MagicMock()
+        runtime_app.sam3_3d_body_model = unittest.mock.MagicMock()
+        runtime_app.sam3_3d_body_model.device = "cuda"
+        runtime_app.sam3_3d_body_model.detector = None
+
+        human_detector_mock = unittest.mock.MagicMock()
+        fake_build_detector = SimpleNamespace(HumanDetector=human_detector_mock)
+        with patch.dict(sys.modules, {"models.sam_3d_body.tools.build_detector": fake_build_detector}):
+            app._configure_detector(runtime_app)
+
+        human_detector_mock.assert_called_once()
+        _, kwargs = human_detector_mock.call_args
+        self.assertEqual(kwargs["name"], "vitdet")
+        self.assertEqual(kwargs["device"], "cuda")
+        self.assertNotIn("weights_path", kwargs)
+
+    def test_save_indexed_mask_preserves_labels_and_palette(self):
+        from scripts.offline_app_refined import save_indexed_mask
+
+        mask = np.array([[0, 1], [2, 3]], dtype=np.uint8)
+
+        with make_workspace_tempdir() as tmpdir:
+            mask_path = os.path.join(tmpdir, "mask.png")
+            save_indexed_mask(mask, mask_path)
+
+            saved = Image.open(mask_path)
+
+            self.assertEqual(saved.mode, "P")
+            self.assertGreater(len(saved.getpalette() or []), 3)
+            np.testing.assert_array_equal(np.array(saved), mask)
 
     def test_write_chunk_outputs_persists_refined_masks_and_chunk_record(self):
         from scripts.offline_app_refined import RefinedOfflineApp
@@ -446,6 +595,99 @@ class RefinedCliTests(unittest.TestCase):
                 out_path = app.run_refined_4d_generation()
 
         runtime_app.on_4d_generation.assert_called_once_with(video_path="sample.mp4")
+        self.assertTrue(out_path.endswith("rendered.mp4"))
+
+    def test_run_refined_4d_generation_disables_autocast(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        config = OmegaConf.create({"debug": {"save_metrics": False}})
+        app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+        app.sample_state = {"input_video": "sample.mp4"}
+
+        state = {"entered": False}
+
+        @contextmanager
+        def fake_autocast_disabled():
+            state["entered"] = True
+            try:
+                yield
+            finally:
+                state["entered"] = False
+
+        with make_workspace_tempdir() as tmpdir:
+            app.OUTPUT_DIR = tmpdir
+            os.makedirs(os.path.join(tmpdir, "masks_refined"), exist_ok=True)
+            Image.fromarray(np.array([[0, 1], [1, 0]], dtype=np.uint8)).save(
+                os.path.join(tmpdir, "masks_refined", "00000000.png")
+            )
+
+            runtime_app = unittest.mock.MagicMock()
+            runtime_app.OUTPUT_DIR = tmpdir
+
+            def assert_autocast_disabled(*, video_path):
+                self.assertTrue(state["entered"])
+                self.assertEqual(video_path, "sample.mp4")
+                return os.path.join(tmpdir, "rendered.mp4")
+
+            runtime_app.on_4d_generation.side_effect = assert_autocast_disabled
+
+            with patch.object(app, "_ensure_base_app", return_value=runtime_app, create=True), patch(
+                "scripts.offline_app_refined._autocast_disabled",
+                side_effect=fake_autocast_disabled,
+            ) as autocast_disabled:
+                out_path = app.run_refined_4d_generation()
+
+        autocast_disabled.assert_called_once_with()
+        self.assertTrue(out_path.endswith("rendered.mp4"))
+
+    def test_run_refined_4d_generation_aligns_completion_pipeline_module_dtypes(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        class FakeModule:
+            def __init__(self, dtype):
+                self._parameter = SimpleNamespace(dtype=dtype)
+                self.to = unittest.mock.MagicMock()
+
+            def parameters(self):
+                yield self._parameter
+
+        config = OmegaConf.create({"debug": {"save_metrics": False}})
+        app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+        app.sample_state = {"input_video": "sample.mp4"}
+
+        pipeline_mask = SimpleNamespace(
+            image_encoder=FakeModule("half"),
+            unet=FakeModule("float"),
+            vae=FakeModule("float"),
+        )
+        pipeline_rgb = SimpleNamespace(
+            image_encoder=FakeModule("float16"),
+            unet=FakeModule("float32"),
+            vae=FakeModule("float32"),
+        )
+
+        with make_workspace_tempdir() as tmpdir:
+            app.OUTPUT_DIR = tmpdir
+            os.makedirs(os.path.join(tmpdir, "masks_refined"), exist_ok=True)
+            Image.fromarray(np.array([[0, 1], [1, 0]], dtype=np.uint8)).save(
+                os.path.join(tmpdir, "masks_refined", "00000000.png")
+            )
+
+            runtime_app = unittest.mock.MagicMock()
+            runtime_app.OUTPUT_DIR = tmpdir
+            runtime_app.pipeline_mask = pipeline_mask
+            runtime_app.pipeline_rgb = pipeline_rgb
+            runtime_app.on_4d_generation.return_value = os.path.join(tmpdir, "rendered.mp4")
+
+            with patch.object(app, "_ensure_base_app", return_value=runtime_app, create=True), patch(
+                "scripts.offline_app_refined._autocast_disabled"
+            ):
+                out_path = app.run_refined_4d_generation()
+
+        pipeline_mask.unet.to.assert_called_once_with(dtype="half")
+        pipeline_mask.vae.to.assert_called_once_with(dtype="half")
+        pipeline_rgb.unet.to.assert_called_once_with(dtype="float16")
+        pipeline_rgb.vae.to.assert_called_once_with(dtype="float16")
         self.assertTrue(out_path.endswith("rendered.mp4"))
 
     def test_reset_sample_state_clears_sample_local_fields(self):

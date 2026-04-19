@@ -5,12 +5,20 @@ import json
 import os
 import shutil
 import sys
+import uuid
+from datetime import datetime
+from contextlib import nullcontext
 from typing import Dict, Iterable, List, Optional
 
 import cv2
 import numpy as np
 from omegaconf import OmegaConf
 from PIL import Image
+
+try:
+    import torch
+except ModuleNotFoundError:  # pragma: no cover - optional in lightweight test envs
+    torch = None
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -20,6 +28,67 @@ from scripts.offline_reprompt import match_detection_to_track, should_trigger_re
 
 
 VALID_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff")
+
+
+def build_davis_palette() -> List[int]:
+    palette = [0] * (256 * 3)
+    for color in range(256):
+        label = color
+        bit = 0
+        while label:
+            palette[color * 3 + 0] |= ((label >> 0) & 1) << (7 - bit)
+            palette[color * 3 + 1] |= ((label >> 1) & 1) << (7 - bit)
+            palette[color * 3 + 2] |= ((label >> 2) & 1) << (7 - bit)
+            bit += 1
+            label >>= 3
+    return palette
+
+
+DAVIS_PALETTE = build_davis_palette()
+
+
+def build_run_id() -> str:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    return f"{timestamp}_{uuid.uuid4().hex[:8]}"
+
+
+def _autocast_disabled():
+    if torch is None:
+        return nullcontext()
+    return torch.autocast("cuda", enabled=False)
+
+
+def _module_parameter_dtype(module):
+    if module is None or not hasattr(module, "parameters"):
+        return None
+    try:
+        return next(module.parameters()).dtype
+    except (StopIteration, TypeError, AttributeError):
+        return None
+
+
+def _align_completion_pipeline_dtype(pipeline) -> None:
+    if pipeline is None:
+        return
+
+    target_dtype = _module_parameter_dtype(getattr(pipeline, "image_encoder", None))
+    if target_dtype is None:
+        target_dtype = _module_parameter_dtype(getattr(pipeline, "unet", None))
+    if target_dtype is None:
+        return
+
+    for module_name in ("unet", "vae"):
+        module = getattr(pipeline, module_name, None)
+        if module is None or not hasattr(module, "to"):
+            continue
+        if _module_parameter_dtype(module) == target_dtype:
+            continue
+        module.to(dtype=target_dtype)
+
+
+def _align_completion_pipeline_dtypes(runtime_app) -> None:
+    for pipeline_name in ("pipeline_mask", "pipeline_rgb"):
+        _align_completion_pipeline_dtype(getattr(runtime_app, pipeline_name, None))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -98,6 +167,14 @@ def prepare_output_dirs(output_dir: str, obj_ids: Iterable[int], save_debug_metr
     return paths
 
 
+def resolve_sample_output_dir(explicit_output_dir: Optional[str], configured_output_root: Optional[str]) -> str:
+    if explicit_output_dir:
+        return os.path.abspath(explicit_output_dir)
+
+    output_root = os.path.abspath(configured_output_root or os.path.join(ROOT, "outputs_refined"))
+    return os.path.join(output_root, build_run_id())
+
+
 def write_chunk_manifest(debug_dir: str, chunk_records: List[dict]) -> None:
     if not debug_dir:
         return
@@ -164,7 +241,9 @@ def build_frame_stems(frame_count: int) -> List[str]:
 
 def save_indexed_mask(mask: np.ndarray, path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    Image.fromarray(np.asarray(mask, dtype=np.uint8), mode="P").save(path)
+    mask_image = Image.fromarray(np.asarray(mask, dtype=np.uint8), mode="P")
+    mask_image.putpalette(DAVIS_PALETTE)
+    mask_image.save(path)
 
 
 def load_indexed_mask(path: str) -> np.ndarray:
@@ -306,15 +385,20 @@ class RefinedOfflineApp:
         detector_path = str(cfg_get(self.CONFIG, "sam_3d_body.detector_path", "") or "")
         weights_path = str(cfg_get(self.CONFIG, "detector.weights_path", "") or "")
         device = str(getattr(runtime_app.sam3_3d_body_model, "device", "cuda"))
-        signature = (backend, detector_path, weights_path, device)
+        backend_normalized = backend.lower()
+        signature_weights_path = weights_path if backend_normalized in {"yolo", "yolo11"} else ""
+        signature = (backend, detector_path, signature_weights_path, device)
         if signature == self._detector_signature and getattr(runtime_app.sam3_3d_body_model, "detector", None) is not None:
             return
 
         from models.sam_3d_body.tools.build_detector import HumanDetector
 
         detector_kwargs = {}
-        if weights_path:
-            detector_kwargs["weights_path"] = weights_path
+        if backend_normalized in {"yolo", "yolo11"}:
+            if weights_path:
+                detector_kwargs["weights_path"] = weights_path
+            elif detector_path:
+                detector_kwargs["path"] = detector_path
         elif detector_path:
             detector_kwargs["path"] = detector_path
 
@@ -439,8 +523,9 @@ class RefinedOfflineApp:
         else:
             raise ValueError(f"unsupported input path: {input_video}")
 
-        resolved_output_dir = os.path.abspath(
-            output_dir or cfg_get(self.CONFIG, "runtime.output_dir", os.path.join(ROOT, "outputs_refined"))
+        resolved_output_dir = resolve_sample_output_dir(
+            output_dir,
+            cfg_get(self.CONFIG, "runtime.output_dir", os.path.join(ROOT, "outputs_refined")),
         )
         os.makedirs(resolved_output_dir, exist_ok=True)
         sample["output_dir"] = resolved_output_dir
@@ -465,17 +550,21 @@ class RefinedOfflineApp:
         outputs = []
         start_frame_idx = None
         width = height = None
+        max_detection_count = 0
         for frame_idx in range(search_frames):
             frame_rgb = self._load_source_frame(sample, frame_idx)
-            height, width = frame_rgb.shape[:2]
-            outputs = runtime_app.sam3_3d_body_model.process_one_image(
+            frame_height, frame_width = frame_rgb.shape[:2]
+            frame_outputs = runtime_app.sam3_3d_body_model.process_one_image(
                 frame_rgb,
                 bbox_thr=bbox_thr,
                 nms_thr=nms_thr,
             )
-            if outputs:
+            detection_count = len(frame_outputs)
+            if detection_count > max_detection_count:
+                outputs = frame_outputs
                 start_frame_idx = frame_idx
-                break
+                height, width = frame_height, frame_width
+                max_detection_count = detection_count
 
         if start_frame_idx is None or not outputs:
             raise RuntimeError(
@@ -689,7 +778,9 @@ class RefinedOfflineApp:
         working_dir = os.path.join(self.OUTPUT_DIR, "masks")
         if os.path.isdir(refined_dir):
             self._copy_mask_sequence(refined_dir, working_dir)
-        return runtime_app.on_4d_generation(video_path=self.sample_state.get("input_video"))
+        _align_completion_pipeline_dtypes(runtime_app)
+        with _autocast_disabled():
+            return runtime_app.on_4d_generation(video_path=self.sample_state.get("input_video"))
 
 
 def run_refined_pipeline(args) -> None:
@@ -699,7 +790,7 @@ def run_refined_pipeline(args) -> None:
     app.reprompt_thresholds = build_reprompt_thresholds(cfg)
     app.sample_summary = {"status": "running", "runtime_profile": {}}
     try:
-        sample = app.prepare_input(args.input_video, cfg.runtime.output_dir, args.skip_existing)
+        sample = app.prepare_input(args.input_video, args.output_dir, args.skip_existing)
         initial_targets = app.detect_initial_targets(sample)
         app.prepare_sample_output(sample["output_dir"], initial_targets["obj_ids"])
 
