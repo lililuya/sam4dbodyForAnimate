@@ -8,6 +8,23 @@ from PIL import Image
 from scripts.sam3_cache_contract import build_cache_meta, validate_cache_dir
 
 
+def _resolve_safe_cache_dir(cache_root, sample_id):
+    if not isinstance(sample_id, str) or not sample_id.strip():
+        raise ValueError("unsafe sample_id")
+
+    invalid_separators = {os.sep}
+    if os.altsep:
+        invalid_separators.add(os.altsep)
+    if sample_id in {".", ".."} or any(sep in sample_id for sep in invalid_separators):
+        raise ValueError("unsafe sample_id")
+
+    cache_root_abs = os.path.abspath(cache_root)
+    cache_dir = os.path.abspath(os.path.join(cache_root_abs, sample_id))
+    if os.path.dirname(cache_dir) != cache_root_abs:
+        raise ValueError("unsafe sample_id")
+    return cache_root_abs, cache_dir
+
+
 def _frame_stems_from_dir(path, ext):
     pattern = os.path.join(path, f"*{ext}")
     return sorted(
@@ -25,7 +42,8 @@ def export_sam3_cache(
     runtime,
     config_path,
 ):
-    cache_dir = os.path.join(cache_root, sample_id)
+    cache_root, cache_dir = _resolve_safe_cache_dir(cache_root, sample_id)
+    os.makedirs(cache_root, exist_ok=True)
     if os.path.isdir(cache_dir):
         shutil.rmtree(cache_dir)
     cache_images_dir = os.path.join(cache_dir, "images")
