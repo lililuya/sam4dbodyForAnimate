@@ -98,6 +98,48 @@ class Sam3CacheExportTests(unittest.TestCase):
             self.assertEqual(meta_data["fps"], 24.0)
             self.assertEqual(meta_data["config_path"], "configs/body4d.yaml")
 
+    def test_validate_cache_dir_rejects_missing_traceability_payloads(self):
+        from scripts.sam3_cache_contract import validate_cache_dir
+        from scripts.sam3_cache_export import export_sam3_cache
+
+        with make_workspace_tempdir() as tmpdir:
+            working_dir = os.path.join(tmpdir, "working")
+            images_dir = os.path.join(working_dir, "images")
+            masks_dir = os.path.join(working_dir, "masks")
+            cache_root = os.path.join(tmpdir, "cache")
+            os.makedirs(images_dir, exist_ok=True)
+            os.makedirs(masks_dir, exist_ok=True)
+            os.makedirs(cache_root, exist_ok=True)
+
+            Image.new("RGB", (4, 4), color=(255, 0, 0)).save(
+                os.path.join(images_dir, "00000000.jpg")
+            )
+            Image.new("L", (4, 4), color=255).save(
+                os.path.join(masks_dir, "00000000.png")
+            )
+
+            cache_dir = export_sam3_cache(
+                working_dir=working_dir,
+                cache_root=cache_root,
+                sample_id="sample_001",
+                source_video="inputs/source.mp4",
+                runtime={
+                    "out_obj_ids": [1],
+                    "batch_size": 8,
+                    "detection_resolution": [256, 512],
+                    "completion_resolution": [512, 1024],
+                    "smpl_export": False,
+                    "video_fps": 24.0,
+                },
+                config_path="configs/body4d.yaml",
+            )
+
+            os.remove(os.path.join(cache_dir, "prompts.json"))
+            ok, errors = validate_cache_dir(cache_dir)
+
+        self.assertFalse(ok)
+        self.assertTrue(any("prompts.json" in error for error in errors))
+
 
 if __name__ == "__main__":
     unittest.main()

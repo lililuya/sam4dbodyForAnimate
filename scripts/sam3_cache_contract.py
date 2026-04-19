@@ -6,6 +6,11 @@ from typing import Any
 
 
 CACHE_VERSION = 1
+TRACEABILITY_FILE_TYPES = {
+    "prompts.json": dict,
+    "frame_metrics.json": list,
+    "events.json": list,
+}
 
 
 def build_cache_meta(
@@ -39,7 +44,7 @@ def build_cache_meta(
     return meta
 
 
-def load_json(path: str) -> dict[str, Any]:
+def load_json(path: str) -> Any:
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
 
@@ -74,6 +79,21 @@ def validate_cache_dir(cache_dir: str) -> tuple[bool, list[str]]:
 
     if frame_count != len(frame_stems):
         errors.append("meta.frame_count does not match len(frame_stems)")
+
+    for filename, expected_type in TRACEABILITY_FILE_TYPES.items():
+        payload_path = os.path.join(cache_dir, filename)
+        if not os.path.isfile(payload_path):
+            errors.append(f"Missing required file: {filename}")
+            continue
+        try:
+            payload = load_json(payload_path)
+        except json.JSONDecodeError as exc:
+            errors.append(f"Invalid JSON in {filename}: {exc}")
+            continue
+        if not isinstance(payload, expected_type):
+            errors.append(
+                f"{filename} top-level value must be a {expected_type.__name__}"
+            )
 
     for stem in frame_stems:
         image_rel = f"images/{stem}{image_ext}"
