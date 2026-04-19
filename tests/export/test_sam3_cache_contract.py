@@ -30,6 +30,7 @@ class Sam3CacheContractTests(unittest.TestCase):
             obj_ids=[1, 2],
             runtime_profile={
                 "batch_size": 16,
+                "fps": 24.0,
                 "detection_resolution": [256, 512],
                 "completion_resolution": [512, 1024],
                 "smpl_export": False,
@@ -42,6 +43,11 @@ class Sam3CacheContractTests(unittest.TestCase):
         self.assertEqual(meta["frame_count"], 2)
         self.assertEqual(meta["frame_stems"], ["00000000", "00000001"])
         self.assertEqual(meta["obj_ids"], [1, 2])
+        self.assertIn("exported_at", meta)
+        self.assertIsInstance(meta["exported_at"], str)
+        self.assertTrue(meta["exported_at"])
+        self.assertEqual(meta["fps"], 24.0)
+        self.assertEqual(meta["config"], {"config_path": "configs/body4d.yaml"})
         self.assertEqual(meta["runtime_profile"]["batch_size"], 16)
 
     def test_validate_cache_dir_rejects_missing_matching_mask(self):
