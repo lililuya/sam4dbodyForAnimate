@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from omegaconf import OmegaConf
 
 from scripts.app_4d_pipeline import build_4d_context, run_4d_pipeline_from_context
+from scripts.pose_json_export import write_pose_frame_exports
 from scripts.sam3_cache_contract import load_json, validate_cache_dir
 
 
@@ -75,6 +76,21 @@ def discover_cache_dirs(root_dir, require_meta=True):
     return cache_dirs
 
 
+def build_pose_frame_writer(output_dir):
+    def frame_writer(image_path, mask_output, id_current):
+        if not mask_output or not id_current:
+            return {"openpose": [], "smpl": []}
+        frame_stem = os.path.splitext(os.path.basename(image_path))[0]
+        return write_pose_frame_exports(
+            output_dir=output_dir,
+            frame_stem=frame_stem,
+            person_outputs=mask_output,
+            track_ids=id_current,
+        )
+
+    return frame_writer
+
+
 def run_cache_sample(*, cache_dir, output_root=None, overwrite=False, config_path=None):
     cache_dir = os.path.abspath(cache_dir)
     ok, errors = validate_cache_dir(cache_dir)
@@ -103,6 +119,7 @@ def run_cache_sample(*, cache_dir, output_root=None, overwrite=False, config_pat
             depth_model=getattr(runtime_app, "depth_model", None),
             predictor=getattr(runtime_app, "predictor", None),
             generator=getattr(runtime_app, "generator", None),
+            frame_writer=build_pose_frame_writer(sample_output_dir),
         )
         out_path = run_4d_pipeline_from_context(context)
         write_run_summary(

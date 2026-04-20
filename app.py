@@ -27,8 +27,7 @@ from omegaconf import OmegaConf
 
 from scripts.sam3_cache_export import (
     build_frame_metrics_from_video_segments,
-    ensure_sam3_export_ready,
-    export_sam3_cache,
+    export_session_cache,
     record_prompt_update,
     start_sam3_export_session,
 )
@@ -476,27 +475,34 @@ def on_mask_generation(video_path: str):
     RUNTIME["events"].append(
         {"type": "mask_generation_completed", "frame_count": len(video_segments)}
     )
+    try:
+        cache_dir = export_session_cache(
+            runtime=RUNTIME,
+            video_path=video_path,
+            output_dir=OUTPUT_DIR,
+            output_root=CONFIG.runtime["output_dir"],
+            config_path=RUNTIME.get("config_path", os.path.join(ROOT, "configs", "body4d.yaml")),
+        )
+    except ValueError as exc:
+        raise gr.Error(str(exc)) from exc
 
-    return out_video_path
+    RUNTIME["last_exported_cache_dir"] = cache_dir
+    return out_video_path, cache_dir
 
 
 def export_current_sam3_cache(video_path: str):
     try:
-        ensure_sam3_export_ready(runtime=RUNTIME, video_path=video_path, output_dir=OUTPUT_DIR)
+        cache_dir = export_session_cache(
+            runtime=RUNTIME,
+            video_path=video_path,
+            output_dir=OUTPUT_DIR,
+            output_root=CONFIG.runtime["output_dir"],
+            config_path=RUNTIME.get("config_path", os.path.join(ROOT, "configs", "body4d.yaml")),
+        )
     except ValueError as exc:
         raise gr.Error(str(exc)) from exc
 
-    cache_root = os.path.join(CONFIG.runtime["output_dir"], "sam3_cache")
-    sample_id = os.path.basename(os.path.normpath(OUTPUT_DIR))
-
-    cache_dir = export_sam3_cache(
-        working_dir=OUTPUT_DIR,
-        cache_root=cache_root,
-        sample_id=sample_id,
-        source_video=video_path,
-        runtime=RUNTIME,
-        config_path=RUNTIME.get("config_path", os.path.join(ROOT, "configs", "body4d.yaml")),
-    )
+    RUNTIME["last_exported_cache_dir"] = cache_dir
     return cache_dir
 
 
@@ -587,9 +593,8 @@ with gr.Blocks(title="SAM-Body4D") as demo:
             result_display = gr.Video(label="Segmentation Result")
             with gr.Row():
                 mask_gen_btn = gr.Button("Mask Generation")
-                export_cache_btn = gr.Button("Export SAM3 Cache")
             export_cache_path = gr.Textbox(label="Exported Cache Path", interactive=False)
-            gr.Markdown("4D has moved offline. Export SAM3 cache, then run `scripts/run_4d_from_cache.py`.")
+            gr.Markdown("`Mask Generation` now auto-exports the SAM3 cache. Then run `scripts/run_4d_from_cache.py` offline.")
 
     # ===============================
     # Event bindings
@@ -646,13 +651,7 @@ with gr.Blocks(title="SAM-Body4D") as demo:
     mask_gen_btn.click(
         fn=on_mask_generation,
         inputs=[video_state], 
-        outputs=[result_display],
-    )
-
-    export_cache_btn.click(
-        fn=export_current_sam3_cache,
-        inputs=[video_state],
-        outputs=[export_cache_path],
+        outputs=[result_display, export_cache_path],
     )
 
 

@@ -91,7 +91,8 @@ The web UI now focuses on interactive SAM3 prompting, mask generation, and cache
 After loading a video:
 - add or refine targets in the UI
 - click `Mask Generation`
-- click `Export SAM3 Cache`
+
+`Mask Generation` now auto-exports the SAM3 cache, so no extra export button is required.
 
 The exported cache is written under `<runtime.output_dir>/sam3_cache/<sample_id>/` and includes:
 - `images/*.jpg`
@@ -114,6 +115,11 @@ Useful options:
 - `--overwrite` replaces an existing `outputs_4d/<sample_id>/` directory
 
 By default, the offline 4D runner writes outputs to `<runtime.output_dir>/outputs_4d/<sample_id>/`.
+That output tree now includes:
+- `mesh_4d_individual/<track_id>/*.ply`
+- `focal_4d_individual/<track_id>/*.json`
+- `openpose_json/<track_id>/<frame>_keypoints.json`
+- `smpl_json/<track_id>/<frame>.json`
 
 #### Manual checkpoint setup (optional)
 

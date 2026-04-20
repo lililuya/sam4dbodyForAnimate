@@ -199,3 +199,17 @@ def export_sam3_cache(
         shutil.rmtree(staging_dir, ignore_errors=True)
         raise
     return cache_dir
+
+
+def export_session_cache(*, runtime, video_path, output_dir, output_root, config_path):
+    ensure_sam3_export_ready(runtime=runtime, video_path=video_path, output_dir=output_dir)
+    cache_root = os.path.join(output_root, "sam3_cache")
+    sample_id = os.path.basename(os.path.normpath(output_dir))
+    return export_sam3_cache(
+        working_dir=output_dir,
+        cache_root=cache_root,
+        sample_id=sample_id,
+        source_video=video_path,
+        runtime=runtime,
+        config_path=config_path,
+    )
