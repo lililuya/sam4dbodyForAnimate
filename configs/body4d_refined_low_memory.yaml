@@ -8,7 +8,7 @@ sam_3d_body:
   ckpt_path: ${paths.ckpt_root}/sam-3d-body-dinov3/model.ckpt
   mhr_path: ${paths.ckpt_root}/sam-3d-body-dinov3/assets/mhr_model.pt
   fov_path: ${paths.ckpt_root}/moge-2-vitl-normal/model.pt
-  batch_size: 32
+  batch_size: 16
   detector_path: ""
   segmentor_path: ""
 
@@ -18,13 +18,15 @@ runtime:
 
 completion:
   enable: true
-  detection_resolution: [256, 512]
-  completion_resolution: [512, 1024]
+  detection_resolution: [192, 384]
+  completion_resolution: [256, 512]
+  batch_size: 1
+  decode_chunk_size: 1
   model_path_mask: ${paths.ckpt_root}/diffusion-vas-amodal-segmentation
   model_path_rgb: ${paths.ckpt_root}/diffusion-vas-content-completion
   model_path_depth: ${paths.ckpt_root}/depth_anything_v2_vitl.pth
   depth_encoder: vitl
-  max_occ_len: 25
+  max_occ_len: 8
 
 detector:
   backend: yolo
@@ -43,7 +45,7 @@ batch:
   initial_search_frames: 24
   retry_mode: quality_safe
   retry_chunk_sizes: [120, 96]
-  retry_batch_sizes: [24, 16]
+  retry_batch_sizes: [16, 8]
 
 reprompt:
   enable: true

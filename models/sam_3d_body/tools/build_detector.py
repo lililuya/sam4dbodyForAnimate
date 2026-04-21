@@ -73,6 +73,7 @@ def run_detectron2_vitdet(
     bbox_thr: float = 0.5,
     nms_thr: float = 0.3,
     default_to_full_image: bool = True,
+    return_scores: bool = False,
 ):
     import detectron2.data.transforms as T
 
@@ -94,13 +95,24 @@ def run_detectron2_vitdet(
         det_instances.scores > bbox_thr
     )
     if valid_idx.sum() == 0 and default_to_full_image:
-        boxes = np.array([0, 0, width, height]).reshape(1, 4)
+        boxes = np.array([0, 0, width, height]).reshape(1, 4).astype(np.float32)
+        scores = np.array([np.nan], dtype=np.float32)
     else:
-        boxes = det_instances.pred_boxes.tensor[valid_idx].cpu().numpy()
+        boxes = det_instances.pred_boxes.tensor[valid_idx].cpu().numpy().astype(np.float32)
+        scores = det_instances.scores[valid_idx].cpu().numpy().astype(np.float32)
 
     # Sort boxes to keep a consistent output order
     sorted_indices = np.lexsort(
         (boxes[:, 3], boxes[:, 2], boxes[:, 1], boxes[:, 0])
     )  # shape: [len(boxes),]
     boxes = boxes[sorted_indices]
+    scores = scores[sorted_indices]
+    if return_scores:
+        return [
+            {
+                "bbox": box.astype(np.float32).tolist(),
+                "score": None if np.isnan(score) else float(score),
+            }
+            for box, score in zip(boxes, scores)
+        ]
     return boxes

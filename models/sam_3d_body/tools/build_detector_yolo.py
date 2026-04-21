@@ -22,13 +22,27 @@ def sort_boxes_xyxy(boxes: np.ndarray) -> np.ndarray:
     return boxes[sorted_indices].astype(np.float32)
 
 
-def extract_person_boxes(boxes, bbox_thr: float, det_cat_id: int = 0) -> np.ndarray:
+def _sort_boxes_and_scores_xyxy(boxes: np.ndarray, scores: np.ndarray):
+    if boxes.size == 0:
+        return boxes.reshape(0, 4).astype(np.float32), scores.reshape(0).astype(np.float32)
+    sorted_indices = np.lexsort((boxes[:, 3], boxes[:, 2], boxes[:, 1], boxes[:, 0]))
+    return boxes[sorted_indices].astype(np.float32), scores[sorted_indices].astype(np.float32)
+
+
+def extract_person_boxes(boxes, bbox_thr: float, det_cat_id: int = 0, return_scores: bool = False):
     xyxy = _to_numpy_float32(boxes.xyxy)
     conf = _to_numpy_float32(boxes.conf)
     cls = _to_numpy_float32(boxes.cls)
     keep = (cls == float(det_cat_id)) & (conf >= float(bbox_thr))
-    filtered = xyxy[keep]
-    return sort_boxes_xyxy(filtered)
+    filtered_boxes = xyxy[keep]
+    filtered_scores = conf[keep]
+    filtered_boxes, filtered_scores = _sort_boxes_and_scores_xyxy(filtered_boxes, filtered_scores)
+    if return_scores:
+        return [
+            {"bbox": box.astype(np.float32).tolist(), "score": float(score)}
+            for box, score in zip(filtered_boxes, filtered_scores)
+        ]
+    return filtered_boxes
 
 
 def resolve_yolo_weights_path(
@@ -71,6 +85,7 @@ def run_ultralytics_yolo(
     default_to_full_image: bool = False,
     device=None,
     max_det: int = 20,
+    return_scores: bool = False,
 ):
     height, width = img.shape[:2]
     predict_kwargs = {
@@ -85,7 +100,16 @@ def run_ultralytics_yolo(
     results = detector.predict(
         **predict_kwargs,
     )
-    boxes = extract_person_boxes(results[0].boxes, bbox_thr=bbox_thr, det_cat_id=det_cat_id)
+    boxes = extract_person_boxes(
+        results[0].boxes,
+        bbox_thr=bbox_thr,
+        det_cat_id=det_cat_id,
+        return_scores=return_scores,
+    )
+    if return_scores:
+        if not boxes and default_to_full_image:
+            return [{"bbox": [0.0, 0.0, float(width), float(height)], "score": None}]
+        return boxes
     if boxes.size == 0 and default_to_full_image:
         return np.array([[0, 0, width, height]], dtype=np.float32)
     return boxes

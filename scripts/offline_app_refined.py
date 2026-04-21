@@ -105,6 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--detector_backend", type=str, default=None)
     parser.add_argument("--track_chunk_size", type=int, default=None)
+    parser.add_argument("--max_targets", type=int, default=None)
     parser.add_argument("--disable_auto_reprompt", action="store_true")
     parser.add_argument("--save_debug_metrics", action="store_true")
     parser.add_argument("--skip_existing", action="store_true")
@@ -127,6 +128,8 @@ def apply_runtime_overrides(args, cfg):
         cfg.runtime.output_dir = args.output_dir
     if args.detector_backend is not None:
         cfg.detector.backend = args.detector_backend
+    if getattr(args, "max_targets", None) is not None:
+        cfg.detector.max_targets = int(args.max_targets)
     if args.track_chunk_size is not None:
         cfg.tracking.chunk_size = args.track_chunk_size
     if args.disable_auto_reprompt:
@@ -295,6 +298,72 @@ def mask_bbox_xyxy(binary_mask: np.ndarray):
     return [float(x_min), float(y_min), float(x_max), float(y_max)]
 
 
+def normalize_detection_outputs(outputs) -> Optional[List[dict]]:
+    if outputs is None:
+        return None
+
+    if isinstance(outputs, np.ndarray):
+        array = np.asarray(outputs, dtype=np.float32)
+        if array.size == 0:
+            return []
+        if array.ndim == 1:
+            array = array.reshape(1, -1)
+        if array.ndim != 2 or array.shape[1] < 4:
+            return None
+        normalized = []
+        for row in array:
+            score = float(row[4]) if row.shape[0] > 4 else None
+            normalized.append(
+                {
+                    "bbox": [float(value) for value in row[:4]],
+                    "score": score,
+                }
+            )
+        return normalized
+
+    if not isinstance(outputs, (list, tuple)):
+        return None
+
+    normalized = []
+    for output in outputs:
+        if isinstance(output, dict):
+            bbox = output.get("bbox")
+            score = output.get("score")
+        else:
+            bbox = output
+            score = None
+
+        if bbox is None:
+            return None
+
+        bbox_array = np.asarray(bbox, dtype=np.float32).reshape(-1)
+        if bbox_array.size < 4:
+            return None
+
+        normalized.append(
+            {
+                "bbox": [float(value) for value in bbox_array[:4]],
+                "score": None if score is None else float(score),
+            }
+        )
+
+    return normalized
+
+
+def limit_detection_outputs(outputs: List[dict], max_targets: int) -> List[dict]:
+    if int(max_targets) <= 0 or len(outputs) <= int(max_targets):
+        return list(outputs)
+
+    if any(output.get("score") is None for output in outputs):
+        return list(outputs[: int(max_targets)])
+
+    ranked_outputs = sorted(
+        enumerate(outputs),
+        key=lambda item: (-float(item[1]["score"]), item[0]),
+    )
+    return [output for _, output in ranked_outputs[: int(max_targets)]]
+
+
 class RefinedOfflineApp:
     def __init__(self, config_path: str, config=None):
         self.config_path = config_path
@@ -408,6 +477,49 @@ class RefinedOfflineApp:
             **detector_kwargs,
         )
         self._detector_signature = signature
+
+    def _detect_frame_candidates(self, runtime_app, frame_rgb: np.ndarray, bbox_thr: float, nms_thr: float) -> List[dict]:
+        model = getattr(runtime_app, "sam3_3d_body_model", None)
+        detector = getattr(model, "detector", None)
+        detector_outputs = None
+        backend = str(cfg_get(self.CONFIG, "detector.backend", "vitdet")).lower()
+
+        if detector is not None and hasattr(detector, "run_human_detection"):
+            detector_kwargs = {
+                "det_cat_id": 0,
+                "bbox_thr": bbox_thr,
+                "nms_thr": nms_thr,
+                "default_to_full_image": False,
+                "return_scores": True,
+            }
+            if backend in {"yolo", "yolo11"}:
+                detector_kwargs["max_det"] = int(cfg_get(self.CONFIG, "detector.max_det", 20))
+
+            try:
+                detector_outputs = detector.run_human_detection(
+                    cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR),
+                    **detector_kwargs,
+                )
+            except TypeError:
+                detector_kwargs.pop("return_scores", None)
+                detector_outputs = detector.run_human_detection(
+                    cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR),
+                    **detector_kwargs,
+                )
+
+            normalized_outputs = normalize_detection_outputs(detector_outputs)
+            if normalized_outputs is not None:
+                return normalized_outputs
+
+        frame_outputs = model.process_one_image(
+            frame_rgb,
+            bbox_thr=bbox_thr,
+            nms_thr=nms_thr,
+        )
+        normalized_outputs = normalize_detection_outputs(frame_outputs)
+        if normalized_outputs is None:
+            return []
+        return normalized_outputs
 
     def _load_source_frame(self, sample: dict, frame_idx: int) -> np.ndarray:
         if sample["input_type"] == "video":
@@ -554,11 +666,7 @@ class RefinedOfflineApp:
         for frame_idx in range(search_frames):
             frame_rgb = self._load_source_frame(sample, frame_idx)
             frame_height, frame_width = frame_rgb.shape[:2]
-            frame_outputs = runtime_app.sam3_3d_body_model.process_one_image(
-                frame_rgb,
-                bbox_thr=bbox_thr,
-                nms_thr=nms_thr,
-            )
+            frame_outputs = self._detect_frame_candidates(runtime_app, frame_rgb, bbox_thr, nms_thr)
             detection_count = len(frame_outputs)
             if detection_count > max_detection_count:
                 outputs = frame_outputs
@@ -570,6 +678,11 @@ class RefinedOfflineApp:
             raise RuntimeError(
                 f"no humans detected within the first {search_frames} frames for {sample['input_video']}"
             )
+
+        outputs = limit_detection_outputs(
+            outputs,
+            int(cfg_get(self.CONFIG, "detector.max_targets", 0)),
+        )
 
         if sample["input_type"] == "video":
             inference_state = runtime_app.predictor.init_state(video_path=sample["input_video"])
