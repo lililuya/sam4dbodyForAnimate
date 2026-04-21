@@ -29,6 +29,7 @@ from tqdm import tqdm
 from omegaconf import OmegaConf
 
 from scripts.app_4d_pipeline import build_4d_context, run_4d_pipeline_from_context
+from scripts.offline_tracking_compat import unpack_propagate_output
 from utils import draw_point_marker, mask_painter, images_to_mp4, DAVIS_PALETTE, jpg_folder_to_mp4, is_super_long_or_wide, keep_largest_component, is_skinny_mask, bbox_from_mask, gpu_profile, resize_mask_with_unique_label
 from scripts.offline_completion_indexing import build_completion_window_from_ious
 
@@ -159,13 +160,14 @@ class OfflineApp:
 
         # run propagation throughout the video and collect the results in a dict
         video_segments = {}  # video_segments contains the per-frame segmentation results
-        for frame_idx, obj_ids, low_res_masks, video_res_masks, obj_scores, iou_scores in self.predictor.propagate_in_video(
+        for propagate_output in self.predictor.propagate_in_video(
             self.RUNTIME['inference_state'],
             start_frame_idx=0,
             max_frame_num_to_track=max_frame_num_to_track,
             reverse=False,
             propagate_preflight=True,
         ):
+            frame_idx, obj_ids, low_res_masks, video_res_masks = unpack_propagate_output(propagate_output)
             video_segments[frame_idx] = {
                 out_obj_id: (video_res_masks[i] > 0.0).cpu().numpy()
                 for i, out_obj_id in enumerate(self.RUNTIME['out_obj_ids'])
