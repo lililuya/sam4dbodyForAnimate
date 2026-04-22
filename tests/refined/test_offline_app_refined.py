@@ -41,6 +41,7 @@ class RefinedCliTests(unittest.TestCase):
                 "96",
                 "--max_targets",
                 "3",
+                "--disable_mask_refine",
                 "--save_debug_metrics",
             ]
         )
@@ -50,6 +51,7 @@ class RefinedCliTests(unittest.TestCase):
         self.assertEqual(args.detector_backend, "yolo")
         self.assertEqual(args.track_chunk_size, 96)
         self.assertEqual(args.max_targets, 3)
+        self.assertTrue(args.disable_mask_refine)
         self.assertTrue(args.save_debug_metrics)
         expected_default = os.path.abspath(
             os.path.join(
@@ -99,6 +101,7 @@ class RefinedCliTests(unittest.TestCase):
         self.assertEqual(cfg.completion.batch_size, 1)
         self.assertEqual(cfg.completion.decode_chunk_size, 1)
         self.assertEqual(cfg.completion.max_occ_len, 8)
+        self.assertTrue(cfg.refine.enable)
 
     def test_main_applies_output_dir_override(self):
         import scripts.offline_app_refined as offline_app_refined
@@ -144,6 +147,7 @@ class RefinedCliTests(unittest.TestCase):
                 "runtime": {"output_dir": "./outputs_refined"},
                 "detector": {"backend": "rtmdet", "max_targets": 0},
                 "tracking": {"chunk_size": 180},
+                "refine": {"enable": True},
                 "reprompt": {
                     "enable": True,
                     "empty_mask_patience": 3,
@@ -161,6 +165,7 @@ class RefinedCliTests(unittest.TestCase):
             detector_backend="yolo",
             track_chunk_size=96,
             max_targets=2,
+            disable_mask_refine=True,
             disable_auto_reprompt=True,
             save_debug_metrics=True,
             skip_existing=True,
@@ -189,6 +194,7 @@ class RefinedCliTests(unittest.TestCase):
         self.assertEqual(cfg.detector.backend, "yolo")
         self.assertEqual(cfg.detector.max_targets, 2)
         self.assertEqual(cfg.tracking.chunk_size, 96)
+        self.assertFalse(cfg.refine.enable)
         self.assertFalse(cfg.reprompt.enable)
         self.assertTrue(cfg.debug.save_metrics)
         mock_refined_app.assert_called_once_with(args.config, config=cfg)
@@ -721,6 +727,42 @@ class RefinedCliTests(unittest.TestCase):
             self.assertEqual(len(app.chunk_records), 1)
             self.assertEqual(app.chunk_records[0]["chunk_id"], 0)
             self.assertEqual(app.chunk_records[0]["frame_count"], 1)
+
+    def test_refine_chunk_masks_can_be_disabled_to_passthrough_raw_masks(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        config = OmegaConf.create(
+            {
+                "refine": {"enable": False},
+                "debug": {"save_metrics": False},
+            }
+        )
+        app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+        app.initial_targets = {"obj_ids": [1]}
+
+        raw_mask = np.array(
+            [
+                [0, 1, 0],
+                [1, 0, 1],
+                [0, 0, 0],
+            ],
+            dtype=np.uint8,
+        )
+        empty_mask = np.zeros((3, 3), dtype=np.uint8)
+        raw_chunk = {
+            "frame_indices": [0, 1],
+            "frame_stems": ["00000000", "00000001"],
+            "raw_masks": [raw_mask, empty_mask],
+        }
+
+        refined_chunk = app.refine_chunk_masks(raw_chunk)
+
+        np.testing.assert_array_equal(refined_chunk["refined_masks"][0], raw_mask)
+        np.testing.assert_array_equal(refined_chunk["refined_masks"][1], empty_mask)
+        self.assertFalse(refined_chunk["frame_metrics"][0]["track_metrics"]["1"]["refined_from_previous"])
+        self.assertFalse(refined_chunk["frame_metrics"][1]["track_metrics"]["1"]["refined_from_previous"])
+        self.assertEqual(refined_chunk["frame_metrics"][1]["track_metrics"]["1"]["empty_mask_count"], 1)
+        self.assertEqual(app._empty_mask_counts[1], 1)
 
     def test_run_refined_4d_generation_uses_lazy_runtime_app(self):
         from scripts.offline_app_refined import RefinedOfflineApp

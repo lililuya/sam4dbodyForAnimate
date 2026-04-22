@@ -107,6 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--detector_backend", type=str, default=None)
     parser.add_argument("--track_chunk_size", type=int, default=None)
     parser.add_argument("--max_targets", type=int, default=None)
+    parser.add_argument("--disable_mask_refine", action="store_true")
     parser.add_argument("--disable_auto_reprompt", action="store_true")
     parser.add_argument("--save_debug_metrics", action="store_true")
     parser.add_argument("--skip_existing", action="store_true")
@@ -133,6 +134,10 @@ def apply_runtime_overrides(args, cfg):
         cfg.detector.max_targets = int(args.max_targets)
     if args.track_chunk_size is not None:
         cfg.tracking.chunk_size = args.track_chunk_size
+    if getattr(args, "disable_mask_refine", False):
+        if not hasattr(cfg, "refine") or cfg.refine is None:
+            cfg.refine = OmegaConf.create({})
+        cfg.refine.enable = False
     if args.disable_auto_reprompt:
         cfg.reprompt.enable = False
     if args.save_debug_metrics:
@@ -773,6 +778,9 @@ class RefinedOfflineApp:
         }
 
     def refine_chunk_masks(self, raw_chunk: dict) -> dict:
+        if not bool(cfg_get(self.CONFIG, "refine.enable", True)):
+            return self._passthrough_chunk_masks(raw_chunk)
+
         obj_ids = list(self.initial_targets.get("obj_ids", []))
         refined_masks = []
         frame_metrics = []
@@ -833,6 +841,62 @@ class RefinedOfflineApp:
         return {
             "frame_stems": list(raw_chunk["frame_stems"]),
             "refined_masks": refined_masks,
+            "frame_metrics": frame_metrics,
+        }
+
+    def _passthrough_chunk_masks(self, raw_chunk: dict) -> dict:
+        obj_ids = list(self.initial_targets.get("obj_ids", []))
+        passthrough_masks = []
+        frame_metrics = []
+
+        for frame_idx, frame_stem, raw_mask in zip(
+            raw_chunk["frame_indices"],
+            raw_chunk["frame_stems"],
+            raw_chunk["raw_masks"],
+        ):
+            passthrough_mask = np.asarray(raw_mask, dtype=np.uint8).copy()
+            track_metrics = {}
+
+            for obj_id in obj_ids:
+                binary = (passthrough_mask == int(obj_id)).astype(np.uint8)
+                previous_binary = self._last_binary_masks.get(obj_id)
+                previous_area = int(previous_binary.sum()) if previous_binary is not None else int(binary.sum())
+                current_area = int(binary.sum())
+                empty_mask_count = self._empty_mask_counts.get(obj_id, 0)
+
+                if current_area == 0:
+                    empty_mask_count += 1
+                else:
+                    empty_mask_count = 0
+                    self._last_binary_masks[obj_id] = binary.copy()
+                    bbox_xyxy = mask_bbox_xyxy(binary)
+                    if bbox_xyxy is not None:
+                        self._last_track_boxes[obj_id] = bbox_xyxy
+
+                self._empty_mask_counts[obj_id] = empty_mask_count
+                iou_value = 1.0 if previous_binary is None else mask_iou(previous_binary, binary)
+                area_ratio = 1.0 if previous_area <= 0 else float(current_area) / float(previous_area)
+                track_metrics[str(obj_id)] = {
+                    "empty_mask_count": empty_mask_count,
+                    "area_ratio": area_ratio,
+                    "edge_touch_ratio": edge_touch_ratio(binary),
+                    "mask_iou": iou_value,
+                    "refined_from_previous": False,
+                    "bbox_xyxy": self._last_track_boxes.get(obj_id),
+                }
+
+            passthrough_masks.append(passthrough_mask)
+            frame_metrics.append(
+                {
+                    "frame_idx": int(frame_idx),
+                    "frame_stem": frame_stem,
+                    "track_metrics": track_metrics,
+                }
+            )
+
+        return {
+            "frame_stems": list(raw_chunk["frame_stems"]),
+            "refined_masks": passthrough_masks,
             "frame_metrics": frame_metrics,
         }
 

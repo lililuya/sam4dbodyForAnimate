@@ -42,6 +42,9 @@ detector:
 tracking:
   chunk_size: 180
 
+refine:
+  enable: true
+
 batch:
   initial_search_frames: 24
   retry_mode: quality_safe
