@@ -29,6 +29,8 @@ from tqdm import tqdm
 from omegaconf import OmegaConf
 
 from scripts.app_4d_pipeline import build_4d_context, run_4d_pipeline_from_context
+from scripts.completion_safety import resolve_completion_batch_size, resolve_decode_chunk_size
+from scripts.offline_tracking_compat import unpack_propagate_output
 from utils import draw_point_marker, mask_painter, images_to_mp4, DAVIS_PALETTE, jpg_folder_to_mp4, is_super_long_or_wide, keep_largest_component, is_skinny_mask, bbox_from_mask, gpu_profile, resize_mask_with_unique_label
 from scripts.offline_completion_indexing import build_completion_window_from_ious
 
@@ -118,7 +120,12 @@ def build_diffusion_vas_config(cfg):
     model_path_rgb = cfg.completion['model_path_rgb']
     depth_encoder = cfg.completion['depth_encoder']
     model_path_depth = cfg.completion['model_path_depth']
-    max_occ_len = min(cfg.completion['max_occ_len'], cfg.sam_3d_body['batch_size'])
+    completion_batch_size = resolve_completion_batch_size(cfg.completion.get('batch_size', 1))
+    decode_chunk_size = resolve_decode_chunk_size(
+        cfg.completion.get('decode_chunk_size', 2),
+        num_frames=max(1, cfg.completion.get('max_occ_len', 8)),
+    )
+    max_occ_len = max(1, int(cfg.completion.get('max_occ_len', 8)))
 
     generator = torch.manual_seed(23)
 
@@ -126,7 +133,15 @@ def build_diffusion_vas_config(cfg):
     pipeline_rgb = init_rgb_model(model_path_rgb)
     depth_model = init_depth_model(model_path_depth, depth_encoder)
 
-    return pipeline_mask, pipeline_rgb, depth_model, max_occ_len, generator
+    return (
+        pipeline_mask,
+        pipeline_rgb,
+        depth_model,
+        max_occ_len,
+        generator,
+        completion_batch_size,
+        decode_chunk_size,
+    )
 
 
 class OfflineApp:
@@ -137,16 +152,28 @@ class OfflineApp:
         self.sam3_3d_body_model = build_sam3_3d_body_config(self.CONFIG)
 
         if self.CONFIG.completion.get('enable', False):
-            self.pipeline_mask, self.pipeline_rgb, self.depth_model, self.max_occ_len, self.generator = build_diffusion_vas_config(self.CONFIG)
+            (
+                self.pipeline_mask,
+                self.pipeline_rgb,
+                self.depth_model,
+                self.max_occ_len,
+                self.generator,
+                self.completion_batch_size,
+                self.completion_decode_chunk_size,
+            ) = build_diffusion_vas_config(self.CONFIG)
         else:
             self.pipeline_mask, self.pipeline_rgb, self.depth_model, self.max_occ_len, self.generator = None, None, None, None, None
+            self.completion_batch_size, self.completion_decode_chunk_size = 1, 1
         
         self.RUNTIME = {}  # clear any old state
         self.OUTPUT_DIR = os.path.join(self.CONFIG.runtime['output_dir'], gen_id())
         os.makedirs(self.OUTPUT_DIR, exist_ok=True)
         self.RUNTIME['batch_size'] = self.CONFIG.sam_3d_body.get('batch_size', 1)
-        self.RUNTIME['detection_resolution'] = self.CONFIG.completion.get('detection_resolution', [256, 512])
-        self.RUNTIME['completion_resolution'] = self.CONFIG.completion.get('completion_resolution', [512, 1024])
+        self.RUNTIME['detection_resolution'] = self.CONFIG.completion.get('detection_resolution', [192, 384])
+        self.RUNTIME['completion_resolution'] = self.CONFIG.completion.get('completion_resolution', [256, 512])
+        self.RUNTIME['completion_batch_size'] = self.completion_batch_size
+        self.RUNTIME['completion_decode_chunk_size'] = self.completion_decode_chunk_size
+        self.RUNTIME['max_occ_len'] = int(self.max_occ_len) if self.max_occ_len is not None else int(self.CONFIG.completion.get('max_occ_len', 0) or 0)
         self.RUNTIME['smpl_export'] = self.CONFIG.runtime.get('smpl_export', False)
         self.RUNTIME['bboxes'] = None
 
@@ -159,13 +186,14 @@ class OfflineApp:
 
         # run propagation throughout the video and collect the results in a dict
         video_segments = {}  # video_segments contains the per-frame segmentation results
-        for frame_idx, obj_ids, low_res_masks, video_res_masks, obj_scores, iou_scores in self.predictor.propagate_in_video(
+        for propagate_output in self.predictor.propagate_in_video(
             self.RUNTIME['inference_state'],
             start_frame_idx=0,
             max_frame_num_to_track=max_frame_num_to_track,
             reverse=False,
             propagate_preflight=True,
         ):
+            frame_idx, obj_ids, low_res_masks, video_res_masks = unpack_propagate_output(propagate_output)
             video_segments[frame_idx] = {
                 out_obj_id: (video_res_masks[i] > 0.0).cpu().numpy()
                 for i, out_obj_id in enumerate(self.RUNTIME['out_obj_ids'])

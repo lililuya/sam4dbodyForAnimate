@@ -11,6 +11,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from scripts.offline_completion_indexing import build_completion_window_from_ious
+from scripts.completion_safety import build_completion_slice, resolve_completion_batch_size, resolve_decode_chunk_size
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -149,7 +150,9 @@ def run_4d_pipeline_from_context(context):
         os.makedirs(os.path.join(output_dir, "focal_4d_individual", str(obj_id)), exist_ok=True)
         os.makedirs(os.path.join(output_dir, "rendered_frames_individual", str(obj_id)), exist_ok=True)
 
-    batch_size = context.runtime["batch_size"]
+    hmr_batch_size = context.runtime["batch_size"]
+    completion_batch_size = resolve_completion_batch_size(context.runtime.get("completion_batch_size", 1))
+    batch_size = completion_batch_size if context.pipeline_mask is not None else hmr_batch_size
     n = len(images_list)
 
     pred_res = context.runtime["detection_resolution"]
@@ -191,13 +194,17 @@ def run_4d_pipeline_from_context(context):
             print("detect occlusions ...")
             pred_amodal_masks_dict = {}
             for modal_pixels, obj_id in zip(modal_pixels_list, context.runtime["out_obj_ids"]):
+                decode_chunk_size = resolve_decode_chunk_size(
+                    context.runtime.get("completion_decode_chunk_size", 8),
+                    num_frames=modal_pixels[:, i : i + batch_size, :, :, :].shape[1],
+                )
                 pred_amodal_masks = context.pipeline_mask(
                     modal_pixels[:, i : i + batch_size, :, :, :],
                     depth_pixels[:, i : i + batch_size, :, :, :],
                     height=pred_res[0],
                     width=pred_res[1],
                     num_frames=modal_pixels[:, i : i + batch_size, :, :, :].shape[1],
-                    decode_chunk_size=8,
+                    decode_chunk_size=decode_chunk_size,
                     motion_bucket_id=127,
                     fps=8,
                     noise_aug_strength=0.02,
@@ -280,12 +287,21 @@ def run_4d_pipeline_from_context(context):
                 pred_amodal_masks_dict[obj_id] = pred_amodal_masks_com
                 occ_dict[obj_id], completion_window = build_completion_window_from_ious(
                     ious,
-                    padding=2,
+                    padding=0,
                     iou_threshold=0.7,
                 )
 
                 if completion_window is not None:
-                    start, end = completion_window
+                    start, end = build_completion_slice(
+                        first_occ_idx=completion_window[0],
+                        last_occ_idx=completion_window[1] - 1,
+                        total_frames=modal_pixels[:, i : i + batch_size, :, :, :].shape[1],
+                        pad_before=2,
+                        pad_after=2,
+                        max_occ_len=context.runtime.get("max_occ_len", 0),
+                    )
+                    if end <= start:
+                        continue
                     idx_dict[obj_id] = (start, end)
                     completion_path = "".join(random.choices("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", k=4))
                     completion_image_path = os.path.join(output_dir, "completion", completion_path, "images")
@@ -332,13 +348,17 @@ def run_4d_pipeline_from_context(context):
                 modal_rgb_pixels = modal_rgb_pixels * 2 - 1
 
                 print("content completion by diffusion-vas ...")
+                decode_chunk_size = resolve_decode_chunk_size(
+                    context.runtime.get("completion_decode_chunk_size", 8),
+                    num_frames=max(1, end - start),
+                )
                 pred_amodal_rgb = context.pipeline_rgb(
                     modal_rgb_pixels,
                     pred_amodal_masks_tensor,
                     height=pred_res_hi[0],
                     width=pred_res_hi[1],
                     num_frames=end - start,
-                    decode_chunk_size=8,
+                    decode_chunk_size=decode_chunk_size,
                     motion_bucket_id=127,
                     fps=8,
                     noise_aug_strength=0.02,

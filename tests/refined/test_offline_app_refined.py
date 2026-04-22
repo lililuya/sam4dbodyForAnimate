@@ -39,6 +39,9 @@ class RefinedCliTests(unittest.TestCase):
                 "yolo",
                 "--track_chunk_size",
                 "96",
+                "--max_targets",
+                "3",
+                "--disable_mask_refine",
                 "--save_debug_metrics",
             ]
         )
@@ -47,6 +50,8 @@ class RefinedCliTests(unittest.TestCase):
         self.assertEqual(args.config, "configs/body4d_refined.yaml")
         self.assertEqual(args.detector_backend, "yolo")
         self.assertEqual(args.track_chunk_size, 96)
+        self.assertEqual(args.max_targets, 3)
+        self.assertTrue(args.disable_mask_refine)
         self.assertTrue(args.save_debug_metrics)
         expected_default = os.path.abspath(
             os.path.join(
@@ -75,6 +80,29 @@ class RefinedCliTests(unittest.TestCase):
         self.assertTrue(hasattr(cfg, "tracking"))
         self.assertTrue(hasattr(cfg, "reprompt"))
 
+    def test_load_low_memory_refined_config_reads_completion_safety_profile(self):
+        from scripts.offline_app_refined import load_refined_config
+
+        config_path = os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "configs",
+                "body4d_refined_low_memory.yaml",
+            )
+        )
+        cfg = load_refined_config(config_path)
+
+        self.assertEqual(cfg.detector.backend, "yolo")
+        self.assertEqual(cfg.sam_3d_body.batch_size, 16)
+        self.assertEqual(cfg.completion.detection_resolution, [192, 384])
+        self.assertEqual(cfg.completion.completion_resolution, [256, 512])
+        self.assertEqual(cfg.completion.batch_size, 1)
+        self.assertEqual(cfg.completion.decode_chunk_size, 1)
+        self.assertEqual(cfg.completion.max_occ_len, 8)
+        self.assertTrue(cfg.refine.enable)
+
     def test_main_applies_output_dir_override(self):
         import scripts.offline_app_refined as offline_app_refined
 
@@ -84,6 +112,7 @@ class RefinedCliTests(unittest.TestCase):
             config="configs/body4d_refined.yaml",
             detector_backend="yolo",
             track_chunk_size=None,
+            max_targets=None,
             disable_auto_reprompt=False,
             save_debug_metrics=False,
             skip_existing=False,
@@ -116,8 +145,9 @@ class RefinedCliTests(unittest.TestCase):
         cfg = OmegaConf.create(
             {
                 "runtime": {"output_dir": "./outputs_refined"},
-                "detector": {"backend": "rtmdet"},
+                "detector": {"backend": "rtmdet", "max_targets": 0},
                 "tracking": {"chunk_size": 180},
+                "refine": {"enable": True},
                 "reprompt": {
                     "enable": True,
                     "empty_mask_patience": 3,
@@ -134,6 +164,8 @@ class RefinedCliTests(unittest.TestCase):
             config="configs/body4d_refined.yaml",
             detector_backend="yolo",
             track_chunk_size=96,
+            max_targets=2,
+            disable_mask_refine=True,
             disable_auto_reprompt=True,
             save_debug_metrics=True,
             skip_existing=True,
@@ -160,7 +192,9 @@ class RefinedCliTests(unittest.TestCase):
 
         self.assertEqual(cfg.runtime.output_dir, "./custom_out")
         self.assertEqual(cfg.detector.backend, "yolo")
+        self.assertEqual(cfg.detector.max_targets, 2)
         self.assertEqual(cfg.tracking.chunk_size, 96)
+        self.assertFalse(cfg.refine.enable)
         self.assertFalse(cfg.reprompt.enable)
         self.assertTrue(cfg.debug.save_metrics)
         mock_refined_app.assert_called_once_with(args.config, config=cfg)
@@ -217,6 +251,7 @@ class RefinedCliTests(unittest.TestCase):
             config="configs/body4d_refined.yaml",
             detector_backend=None,
             track_chunk_size=None,
+            max_targets=None,
             disable_auto_reprompt=False,
             save_debug_metrics=False,
             skip_existing=False,
@@ -261,6 +296,7 @@ class RefinedCliTests(unittest.TestCase):
             config="configs/body4d_refined.yaml",
             detector_backend=None,
             track_chunk_size=None,
+            max_targets=None,
             disable_auto_reprompt=False,
             save_debug_metrics=False,
             skip_existing=False,
@@ -342,6 +378,7 @@ class RefinedCliTests(unittest.TestCase):
             config="configs/body4d_refined.yaml",
             detector_backend=None,
             track_chunk_size=None,
+            max_targets=None,
             disable_auto_reprompt=False,
             save_debug_metrics=False,
             skip_existing=False,
@@ -496,6 +533,124 @@ class RefinedCliTests(unittest.TestCase):
         for call in predictor.add_new_points_or_box.call_args_list:
             self.assertEqual(call.kwargs["frame_idx"], 2)
 
+    def test_detect_initial_targets_limits_to_max_targets_by_score(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        config = OmegaConf.create(
+            {
+                "runtime": {"output_dir": "./outputs_refined"},
+                "detector": {
+                    "bbox_thresh": 0.35,
+                    "iou_thresh": 0.5,
+                    "max_targets": 2,
+                },
+                "batch": {"initial_search_frames": 1},
+                "debug": {"save_metrics": False},
+            }
+        )
+        app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+        app.sample_state = {
+            "input_video": "sample.mp4",
+            "input_type": "video",
+            "source_frames": None,
+            "frames": ["00000000"],
+            "frame_count": 1,
+            "output_dir": "./outputs_refined",
+        }
+        app._load_source_frame = unittest.mock.MagicMock(
+            return_value=np.zeros((8, 8, 3), dtype=np.uint8)
+        )
+
+        predictor = unittest.mock.MagicMock()
+        predictor.init_state.return_value = {"video_height": 8, "video_width": 8}
+        predictor.add_new_points_or_box.side_effect = [
+            (None, [1], None, None),
+            (None, [1, 2], None, None),
+        ]
+        detector = unittest.mock.MagicMock()
+        detector.run_human_detection.return_value = [
+            {"bbox": [0.0, 0.0, 2.0, 2.0], "score": 0.55},
+            {"bbox": [1.0, 1.0, 3.0, 3.0], "score": 0.95},
+            {"bbox": [2.0, 2.0, 4.0, 4.0], "score": 0.80},
+        ]
+        runtime_app = unittest.mock.MagicMock()
+        runtime_app.predictor = predictor
+        runtime_app.RUNTIME = {}
+        runtime_app.sam3_3d_body_model = unittest.mock.MagicMock()
+        runtime_app.sam3_3d_body_model.detector = detector
+
+        with patch.object(app, "_ensure_base_app", return_value=runtime_app, create=True):
+            targets = app.detect_initial_targets(app.sample_state)
+
+        self.assertEqual(targets["obj_ids"], [1, 2])
+        self.assertEqual(
+            targets["boxes_xyxy"],
+            [
+                [1.0, 1.0, 3.0, 3.0],
+                [2.0, 2.0, 4.0, 4.0],
+            ],
+        )
+        self.assertEqual(predictor.add_new_points_or_box.call_count, 2)
+
+    def test_detect_initial_targets_limits_to_max_targets_by_original_order_when_scores_missing(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        config = OmegaConf.create(
+            {
+                "runtime": {"output_dir": "./outputs_refined"},
+                "detector": {
+                    "bbox_thresh": 0.35,
+                    "iou_thresh": 0.5,
+                    "max_targets": 2,
+                },
+                "batch": {"initial_search_frames": 1},
+                "debug": {"save_metrics": False},
+            }
+        )
+        app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+        app.sample_state = {
+            "input_video": "sample.mp4",
+            "input_type": "video",
+            "source_frames": None,
+            "frames": ["00000000"],
+            "frame_count": 1,
+            "output_dir": "./outputs_refined",
+        }
+        app._load_source_frame = unittest.mock.MagicMock(
+            return_value=np.zeros((8, 8, 3), dtype=np.uint8)
+        )
+
+        predictor = unittest.mock.MagicMock()
+        predictor.init_state.return_value = {"video_height": 8, "video_width": 8}
+        predictor.add_new_points_or_box.side_effect = [
+            (None, [1], None, None),
+            (None, [1, 2], None, None),
+        ]
+        detector = unittest.mock.MagicMock()
+        detector.run_human_detection.return_value = [
+            {"bbox": [0.0, 0.0, 2.0, 2.0]},
+            {"bbox": [1.0, 1.0, 3.0, 3.0]},
+            {"bbox": [2.0, 2.0, 4.0, 4.0]},
+        ]
+        runtime_app = unittest.mock.MagicMock()
+        runtime_app.predictor = predictor
+        runtime_app.RUNTIME = {}
+        runtime_app.sam3_3d_body_model = unittest.mock.MagicMock()
+        runtime_app.sam3_3d_body_model.detector = detector
+
+        with patch.object(app, "_ensure_base_app", return_value=runtime_app, create=True):
+            targets = app.detect_initial_targets(app.sample_state)
+
+        self.assertEqual(targets["obj_ids"], [1, 2])
+        self.assertEqual(
+            targets["boxes_xyxy"],
+            [
+                [0.0, 0.0, 2.0, 2.0],
+                [1.0, 1.0, 3.0, 3.0],
+            ],
+        )
+        self.assertEqual(predictor.add_new_points_or_box.call_count, 2)
+
     def test_configure_detector_ignores_yolo_weights_when_backend_is_vitdet(self):
         import sys
 
@@ -572,6 +727,42 @@ class RefinedCliTests(unittest.TestCase):
             self.assertEqual(len(app.chunk_records), 1)
             self.assertEqual(app.chunk_records[0]["chunk_id"], 0)
             self.assertEqual(app.chunk_records[0]["frame_count"], 1)
+
+    def test_refine_chunk_masks_can_be_disabled_to_passthrough_raw_masks(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        config = OmegaConf.create(
+            {
+                "refine": {"enable": False},
+                "debug": {"save_metrics": False},
+            }
+        )
+        app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+        app.initial_targets = {"obj_ids": [1]}
+
+        raw_mask = np.array(
+            [
+                [0, 1, 0],
+                [1, 0, 1],
+                [0, 0, 0],
+            ],
+            dtype=np.uint8,
+        )
+        empty_mask = np.zeros((3, 3), dtype=np.uint8)
+        raw_chunk = {
+            "frame_indices": [0, 1],
+            "frame_stems": ["00000000", "00000001"],
+            "raw_masks": [raw_mask, empty_mask],
+        }
+
+        refined_chunk = app.refine_chunk_masks(raw_chunk)
+
+        np.testing.assert_array_equal(refined_chunk["refined_masks"][0], raw_mask)
+        np.testing.assert_array_equal(refined_chunk["refined_masks"][1], empty_mask)
+        self.assertFalse(refined_chunk["frame_metrics"][0]["track_metrics"]["1"]["refined_from_previous"])
+        self.assertFalse(refined_chunk["frame_metrics"][1]["track_metrics"]["1"]["refined_from_previous"])
+        self.assertEqual(refined_chunk["frame_metrics"][1]["track_metrics"]["1"]["empty_mask_count"], 1)
+        self.assertEqual(app._empty_mask_counts[1], 1)
 
     def test_run_refined_4d_generation_uses_lazy_runtime_app(self):
         from scripts.offline_app_refined import RefinedOfflineApp

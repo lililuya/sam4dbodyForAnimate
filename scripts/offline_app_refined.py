@@ -24,6 +24,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.append(ROOT)
 
+from scripts.detector_defaults import resolve_detector_runtime_options
 from scripts.offline_reprompt import match_detection_to_track, should_trigger_reprompt
 
 
@@ -105,6 +106,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--detector_backend", type=str, default=None)
     parser.add_argument("--track_chunk_size", type=int, default=None)
+    parser.add_argument("--max_targets", type=int, default=None)
+    parser.add_argument("--disable_mask_refine", action="store_true")
     parser.add_argument("--disable_auto_reprompt", action="store_true")
     parser.add_argument("--save_debug_metrics", action="store_true")
     parser.add_argument("--skip_existing", action="store_true")
@@ -127,8 +130,14 @@ def apply_runtime_overrides(args, cfg):
         cfg.runtime.output_dir = args.output_dir
     if args.detector_backend is not None:
         cfg.detector.backend = args.detector_backend
+    if getattr(args, "max_targets", None) is not None:
+        cfg.detector.max_targets = int(args.max_targets)
     if args.track_chunk_size is not None:
         cfg.tracking.chunk_size = args.track_chunk_size
+    if getattr(args, "disable_mask_refine", False):
+        if not hasattr(cfg, "refine") or cfg.refine is None:
+            cfg.refine = OmegaConf.create({})
+        cfg.refine.enable = False
     if args.disable_auto_reprompt:
         cfg.reprompt.enable = False
     if args.save_debug_metrics:
@@ -295,6 +304,72 @@ def mask_bbox_xyxy(binary_mask: np.ndarray):
     return [float(x_min), float(y_min), float(x_max), float(y_max)]
 
 
+def normalize_detection_outputs(outputs) -> Optional[List[dict]]:
+    if outputs is None:
+        return None
+
+    if isinstance(outputs, np.ndarray):
+        array = np.asarray(outputs, dtype=np.float32)
+        if array.size == 0:
+            return []
+        if array.ndim == 1:
+            array = array.reshape(1, -1)
+        if array.ndim != 2 or array.shape[1] < 4:
+            return None
+        normalized = []
+        for row in array:
+            score = float(row[4]) if row.shape[0] > 4 else None
+            normalized.append(
+                {
+                    "bbox": [float(value) for value in row[:4]],
+                    "score": score,
+                }
+            )
+        return normalized
+
+    if not isinstance(outputs, (list, tuple)):
+        return None
+
+    normalized = []
+    for output in outputs:
+        if isinstance(output, dict):
+            bbox = output.get("bbox")
+            score = output.get("score")
+        else:
+            bbox = output
+            score = None
+
+        if bbox is None:
+            return None
+
+        bbox_array = np.asarray(bbox, dtype=np.float32).reshape(-1)
+        if bbox_array.size < 4:
+            return None
+
+        normalized.append(
+            {
+                "bbox": [float(value) for value in bbox_array[:4]],
+                "score": None if score is None else float(score),
+            }
+        )
+
+    return normalized
+
+
+def limit_detection_outputs(outputs: List[dict], max_targets: int) -> List[dict]:
+    if int(max_targets) <= 0 or len(outputs) <= int(max_targets):
+        return list(outputs)
+
+    if any(output.get("score") is None for output in outputs):
+        return list(outputs[: int(max_targets)])
+
+    ranked_outputs = sorted(
+        enumerate(outputs),
+        key=lambda item: (-float(item[1]["score"]), item[0]),
+    )
+    return [output for _, output in ranked_outputs[: int(max_targets)]]
+
+
 class RefinedOfflineApp:
     def __init__(self, config_path: str, config=None):
         self.config_path = config_path
@@ -408,6 +483,55 @@ class RefinedOfflineApp:
             **detector_kwargs,
         )
         self._detector_signature = signature
+
+    def _detect_frame_candidates(self, runtime_app, frame_rgb: np.ndarray, bbox_thr: float, nms_thr: float) -> List[dict]:
+        model = getattr(runtime_app, "sam3_3d_body_model", None)
+        detector = getattr(model, "detector", None)
+        detector_outputs = None
+        backend = str(cfg_get(self.CONFIG, "detector.backend", "vitdet")).lower()
+        resolved = resolve_detector_runtime_options(
+            backend,
+            bbox_thresh=bbox_thr,
+            iou_thresh=nms_thr,
+            max_det=cfg_get(self.CONFIG, "detector.max_det", None),
+        )
+
+        if detector is not None and hasattr(detector, "run_human_detection"):
+            detector_kwargs = {
+                "det_cat_id": 0,
+                "bbox_thr": resolved["bbox_thresh"],
+                "nms_thr": resolved["iou_thresh"],
+                "default_to_full_image": False,
+                "return_scores": True,
+            }
+            if resolved["max_det"] is not None:
+                detector_kwargs["max_det"] = int(resolved["max_det"])
+
+            try:
+                detector_outputs = detector.run_human_detection(
+                    cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR),
+                    **detector_kwargs,
+                )
+            except TypeError:
+                detector_kwargs.pop("return_scores", None)
+                detector_outputs = detector.run_human_detection(
+                    cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR),
+                    **detector_kwargs,
+                )
+
+            normalized_outputs = normalize_detection_outputs(detector_outputs)
+            if normalized_outputs is not None:
+                return normalized_outputs
+
+        frame_outputs = model.process_one_image(
+            frame_rgb,
+            bbox_thr=bbox_thr,
+            nms_thr=nms_thr,
+        )
+        normalized_outputs = normalize_detection_outputs(frame_outputs)
+        if normalized_outputs is None:
+            return []
+        return normalized_outputs
 
     def _load_source_frame(self, sample: dict, frame_idx: int) -> np.ndarray:
         if sample["input_type"] == "video":
@@ -544,8 +668,14 @@ class RefinedOfflineApp:
             int(cfg_get(self.CONFIG, "batch.initial_search_frames", 24)),
             int(sample["frame_count"]),
         )
-        bbox_thr = float(cfg_get(self.CONFIG, "detector.bbox_thresh", 0.35))
-        nms_thr = float(cfg_get(self.CONFIG, "detector.iou_thresh", 0.50))
+        resolved_detector = resolve_detector_runtime_options(
+            cfg_get(self.CONFIG, "detector.backend", "vitdet"),
+            bbox_thresh=cfg_get(self.CONFIG, "detector.bbox_thresh", None),
+            iou_thresh=cfg_get(self.CONFIG, "detector.iou_thresh", None),
+            max_det=cfg_get(self.CONFIG, "detector.max_det", None),
+        )
+        bbox_thr = resolved_detector["bbox_thresh"]
+        nms_thr = resolved_detector["iou_thresh"]
 
         outputs = []
         start_frame_idx = None
@@ -554,11 +684,7 @@ class RefinedOfflineApp:
         for frame_idx in range(search_frames):
             frame_rgb = self._load_source_frame(sample, frame_idx)
             frame_height, frame_width = frame_rgb.shape[:2]
-            frame_outputs = runtime_app.sam3_3d_body_model.process_one_image(
-                frame_rgb,
-                bbox_thr=bbox_thr,
-                nms_thr=nms_thr,
-            )
+            frame_outputs = self._detect_frame_candidates(runtime_app, frame_rgb, bbox_thr, nms_thr)
             detection_count = len(frame_outputs)
             if detection_count > max_detection_count:
                 outputs = frame_outputs
@@ -570,6 +696,11 @@ class RefinedOfflineApp:
             raise RuntimeError(
                 f"no humans detected within the first {search_frames} frames for {sample['input_video']}"
             )
+
+        outputs = limit_detection_outputs(
+            outputs,
+            int(cfg_get(self.CONFIG, "detector.max_targets", 0)),
+        )
 
         if sample["input_type"] == "video":
             inference_state = runtime_app.predictor.init_state(video_path=sample["input_video"])
@@ -647,6 +778,9 @@ class RefinedOfflineApp:
         }
 
     def refine_chunk_masks(self, raw_chunk: dict) -> dict:
+        if not bool(cfg_get(self.CONFIG, "refine.enable", True)):
+            return self._passthrough_chunk_masks(raw_chunk)
+
         obj_ids = list(self.initial_targets.get("obj_ids", []))
         refined_masks = []
         frame_metrics = []
@@ -707,6 +841,62 @@ class RefinedOfflineApp:
         return {
             "frame_stems": list(raw_chunk["frame_stems"]),
             "refined_masks": refined_masks,
+            "frame_metrics": frame_metrics,
+        }
+
+    def _passthrough_chunk_masks(self, raw_chunk: dict) -> dict:
+        obj_ids = list(self.initial_targets.get("obj_ids", []))
+        passthrough_masks = []
+        frame_metrics = []
+
+        for frame_idx, frame_stem, raw_mask in zip(
+            raw_chunk["frame_indices"],
+            raw_chunk["frame_stems"],
+            raw_chunk["raw_masks"],
+        ):
+            passthrough_mask = np.asarray(raw_mask, dtype=np.uint8).copy()
+            track_metrics = {}
+
+            for obj_id in obj_ids:
+                binary = (passthrough_mask == int(obj_id)).astype(np.uint8)
+                previous_binary = self._last_binary_masks.get(obj_id)
+                previous_area = int(previous_binary.sum()) if previous_binary is not None else int(binary.sum())
+                current_area = int(binary.sum())
+                empty_mask_count = self._empty_mask_counts.get(obj_id, 0)
+
+                if current_area == 0:
+                    empty_mask_count += 1
+                else:
+                    empty_mask_count = 0
+                    self._last_binary_masks[obj_id] = binary.copy()
+                    bbox_xyxy = mask_bbox_xyxy(binary)
+                    if bbox_xyxy is not None:
+                        self._last_track_boxes[obj_id] = bbox_xyxy
+
+                self._empty_mask_counts[obj_id] = empty_mask_count
+                iou_value = 1.0 if previous_binary is None else mask_iou(previous_binary, binary)
+                area_ratio = 1.0 if previous_area <= 0 else float(current_area) / float(previous_area)
+                track_metrics[str(obj_id)] = {
+                    "empty_mask_count": empty_mask_count,
+                    "area_ratio": area_ratio,
+                    "edge_touch_ratio": edge_touch_ratio(binary),
+                    "mask_iou": iou_value,
+                    "refined_from_previous": False,
+                    "bbox_xyxy": self._last_track_boxes.get(obj_id),
+                }
+
+            passthrough_masks.append(passthrough_mask)
+            frame_metrics.append(
+                {
+                    "frame_idx": int(frame_idx),
+                    "frame_stem": frame_stem,
+                    "track_metrics": track_metrics,
+                }
+            )
+
+        return {
+            "frame_stems": list(raw_chunk["frame_stems"]),
+            "refined_masks": passthrough_masks,
             "frame_metrics": frame_metrics,
         }
 

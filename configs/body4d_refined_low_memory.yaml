@@ -8,7 +8,7 @@ sam_3d_body:
   ckpt_path: ${paths.ckpt_root}/sam-3d-body-dinov3/model.ckpt
   mhr_path: ${paths.ckpt_root}/sam-3d-body-dinov3/assets/mhr_model.pt
   fov_path: ${paths.ckpt_root}/moge-2-vitl-normal/model.pt
-  batch_size: 32
+  batch_size: 16
   detector_path: ""
   segmentor_path: ""
 
@@ -18,25 +18,27 @@ runtime:
 
 completion:
   enable: true
-  detection_resolution: [256, 512]
-  completion_resolution: [512, 1024]
+  detection_resolution: [192, 384]
+  completion_resolution: [256, 512]
+  batch_size: 1
+  decode_chunk_size: 1
   model_path_mask: ${paths.ckpt_root}/diffusion-vas-amodal-segmentation
   model_path_rgb: ${paths.ckpt_root}/diffusion-vas-content-completion
   model_path_depth: ${paths.ckpt_root}/depth_anything_v2_vitl.pth
   depth_encoder: vitl
-  max_occ_len: 25
+  max_occ_len: 8
 
 detector:
   backend: yolo
   # For YOLO, weights_path can be a local .pt file or a model name like yolo11m.pt.
   # Leave it empty to auto-download the default yolo11n.pt on first use.
   weights_path: ""
-  # Leave these as null to use official backend defaults:
-  # yolo/yolo11 -> bbox_thresh 0.25, iou_thresh 0.70, max_det 300
-  # vitdet -> bbox_thresh 0.05, iou_thresh 0.50
-  bbox_thresh: null
-  iou_thresh: null
-  max_det: null
+  # Tuned for close and overlapping people:
+  # lower bbox threshold keeps partially occluded people,
+  # while capped max_det avoids exploding false positives in crowded frames.
+  bbox_thresh: 0.20
+  iou_thresh: 0.70
+  max_det: 20
   max_targets: 0
 
 tracking:
@@ -49,7 +51,7 @@ batch:
   initial_search_frames: 24
   retry_mode: quality_safe
   retry_chunk_sizes: [120, 96]
-  retry_batch_sizes: [24, 16]
+  retry_batch_sizes: [16, 8]
 
 reprompt:
   enable: true

@@ -422,6 +422,7 @@ class BatchRunnerTests(unittest.TestCase):
                 "configs/body4d_refined.yaml",
                 "--retry_mode",
                 "quality_safe",
+                "--disable_mask_refine",
                 "--skip_existing",
             ]
         )
@@ -430,6 +431,7 @@ class BatchRunnerTests(unittest.TestCase):
         self.assertEqual(args.output_dir, "./outputs_batch")
         self.assertEqual(args.config, "configs/body4d_refined.yaml")
         self.assertEqual(args.retry_mode, "quality_safe")
+        self.assertTrue(args.disable_mask_refine)
         self.assertTrue(args.skip_existing)
 
     def test_run_batch_calls_refined_app_once_per_sample(self):

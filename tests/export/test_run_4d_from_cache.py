@@ -6,6 +6,8 @@ import uuid
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+
 
 @contextmanager
 def make_workspace_tempdir():
@@ -21,6 +23,56 @@ def make_workspace_tempdir():
 
 
 class Run4DFromCacheTests(unittest.TestCase):
+    def test_parser_accepts_cache_root_mode(self):
+        from scripts.run_4d_from_cache import build_parser
+
+        parser = build_parser()
+        args = parser.parse_args(["--cache_root", "/tmp/sam3_cache"])
+
+        self.assertIsNone(args.cache_dir)
+        self.assertEqual(args.cache_root, "/tmp/sam3_cache")
+        self.assertIsNone(args.output_root)
+        self.assertFalse(args.overwrite)
+
+    def test_build_cache_runtime_restores_completion_safety_profile(self):
+        from scripts.run_4d_from_cache import build_cache_runtime
+
+        runtime = build_cache_runtime(
+            {
+                "obj_ids": [1, 2],
+                "fps": 30.0,
+                "runtime_profile": {
+                    "batch_size": 8,
+                    "detection_resolution": [192, 384],
+                    "completion_resolution": [256, 512],
+                    "completion_batch_size": 1,
+                    "completion_decode_chunk_size": 2,
+                    "max_occ_len": 8,
+                    "smpl_export": True,
+                },
+            },
+            runtime_defaults={
+                "batch_size": 64,
+                "detection_resolution": [256, 512],
+                "completion_resolution": [512, 1024],
+                "completion_batch_size": 3,
+                "completion_decode_chunk_size": 5,
+                "max_occ_len": 25,
+                "smpl_export": False,
+                "video_fps": 24.0,
+            },
+        )
+
+        self.assertEqual(runtime["out_obj_ids"], [1, 2])
+        self.assertEqual(runtime["batch_size"], 8)
+        self.assertEqual(runtime["detection_resolution"], [192, 384])
+        self.assertEqual(runtime["completion_resolution"], [256, 512])
+        self.assertEqual(runtime["completion_batch_size"], 1)
+        self.assertEqual(runtime["completion_decode_chunk_size"], 2)
+        self.assertEqual(runtime["max_occ_len"], 8)
+        self.assertTrue(runtime["smpl_export"])
+        self.assertEqual(runtime["video_fps"], 30.0)
+
     def test_run_cache_sample_restores_runtime_profile_and_writes_to_outputs_root(self):
         from scripts.run_4d_from_cache import run_cache_sample
 
@@ -44,8 +96,11 @@ class Run4DFromCacheTests(unittest.TestCase):
                         "obj_ids": [1],
                         "runtime_profile": {
                             "batch_size": 8,
-                            "detection_resolution": [256, 512],
-                            "completion_resolution": [512, 1024],
+                            "detection_resolution": [192, 384],
+                            "completion_resolution": [256, 512],
+                            "completion_batch_size": 1,
+                            "completion_decode_chunk_size": 2,
+                            "max_occ_len": 8,
                             "smpl_export": False,
                         },
                         "config_path": "configs/body4d.yaml",
@@ -83,7 +138,109 @@ class Run4DFromCacheTests(unittest.TestCase):
             self.assertEqual(context.input_dir, cache_dir)
             self.assertEqual(context.output_dir, os.path.join(output_root, "demo"))
             self.assertEqual(context.runtime["batch_size"], 8)
-            self.assertEqual(context.runtime["completion_resolution"], [512, 1024])
+            self.assertEqual(context.runtime["detection_resolution"], [192, 384])
+            self.assertEqual(context.runtime["completion_resolution"], [256, 512])
+            self.assertEqual(context.runtime["completion_batch_size"], 1)
+            self.assertEqual(context.runtime["completion_decode_chunk_size"], 2)
+            self.assertEqual(context.runtime["max_occ_len"], 8)
+
+    def test_run_cache_sample_provides_frame_writer_for_pose_exports(self):
+        from scripts.run_4d_from_cache import run_cache_sample
+
+        with make_workspace_tempdir() as tmpdir:
+            cache_dir = os.path.join(tmpdir, "sam3_cache", "demo")
+            output_root = os.path.join(tmpdir, "outputs_4d")
+            os.makedirs(os.path.join(cache_dir, "images"), exist_ok=True)
+            os.makedirs(os.path.join(cache_dir, "masks"), exist_ok=True)
+            with open(os.path.join(cache_dir, "meta.json"), "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "cache_version": 1,
+                        "sample_id": "demo",
+                        "source_video": "input.mp4",
+                        "frame_count": 1,
+                        "fps": 24.0,
+                        "image_ext": ".jpg",
+                        "mask_ext": ".png",
+                        "frame_stems": ["00000000"],
+                        "image_size": {"width": 4, "height": 4},
+                        "obj_ids": [1],
+                        "runtime_profile": {
+                            "batch_size": 1,
+                            "detection_resolution": [256, 512],
+                            "completion_resolution": [512, 1024],
+                            "smpl_export": True,
+                        },
+                        "config_path": "configs/body4d.yaml",
+                        "exported_at": "2026-04-19T12:00:00Z",
+                    },
+                    handle,
+                )
+            with open(os.path.join(cache_dir, "prompts.json"), "w", encoding="utf-8") as handle:
+                json.dump({"targets": {}}, handle)
+            with open(os.path.join(cache_dir, "frame_metrics.json"), "w", encoding="utf-8") as handle:
+                json.dump([], handle)
+            with open(os.path.join(cache_dir, "events.json"), "w", encoding="utf-8") as handle:
+                json.dump([], handle)
+            with open(os.path.join(cache_dir, "images", "00000000.jpg"), "wb") as handle:
+                handle.write(b"x")
+            with open(os.path.join(cache_dir, "masks", "00000000.png"), "wb") as handle:
+                handle.write(b"x")
+
+            runtime_app = MagicMock()
+            runtime_app.sam3_3d_body_model = MagicMock()
+            runtime_app.pipeline_mask = None
+            runtime_app.pipeline_rgb = None
+            runtime_app.depth_model = None
+            runtime_app.predictor = MagicMock()
+            runtime_app.generator = None
+
+            with patch("scripts.run_4d_from_cache.build_runtime_app", return_value=runtime_app), patch(
+                "scripts.run_4d_from_cache.run_4d_pipeline_from_context",
+                return_value=os.path.join(output_root, "demo", "4d.mp4"),
+            ) as mock_run:
+                run_cache_sample(cache_dir=cache_dir, output_root=output_root, overwrite=False)
+
+            context = mock_run.call_args.args[0]
+            self.assertTrue(callable(context.frame_writer))
+
+            context.frame_writer(
+                os.path.join(cache_dir, "images", "00000000.jpg"),
+                [
+                    {
+                        "bbox": np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float32),
+                        "focal_length": np.float32(500.0),
+                        "pred_keypoints_3d": np.zeros((70, 3), dtype=np.float32),
+                        "pred_keypoints_2d": np.zeros((70, 2), dtype=np.float32),
+                        "pred_vertices": np.zeros((1, 3), dtype=np.float32),
+                        "pred_cam_t": np.array([1.0, 2.0, 3.0], dtype=np.float32),
+                        "pred_pose_raw": np.zeros((66,), dtype=np.float32),
+                        "global_rot": np.zeros((3,), dtype=np.float32),
+                        "body_pose_params": np.zeros((133,), dtype=np.float32),
+                        "hand_pose_params": np.zeros((90,), dtype=np.float32),
+                        "scale_params": np.array([1.0], dtype=np.float32),
+                        "shape_params": np.zeros((10,), dtype=np.float32),
+                        "expr_params": np.zeros((10,), dtype=np.float32),
+                        "pred_joint_coords": np.zeros((70, 3), dtype=np.float32),
+                        "pred_global_rots": np.zeros((55, 3, 3), dtype=np.float32),
+                        "mhr_model_params": np.zeros((159,), dtype=np.float32),
+                    }
+                ],
+                [1],
+            )
+
+            self.assertTrue(
+                os.path.isfile(
+                    os.path.join(
+                        output_root, "demo", "openpose_json", "1", "00000000_keypoints.json"
+                    )
+                )
+            )
+            self.assertTrue(
+                os.path.isfile(
+                    os.path.join(output_root, "demo", "smpl_json", "1", "00000000.json")
+                )
+            )
 
     def test_prepare_output_dir_refuses_to_overwrite_without_flag(self):
         from scripts.run_4d_from_cache import prepare_output_dir
@@ -153,6 +310,32 @@ class Run4DFromCacheTests(unittest.TestCase):
         self.assertEqual(results[0]["output"], "/tmp/out_a.mp4")
         self.assertEqual(results[1]["status"], "failed")
         self.assertIn("boom", results[1]["error"])
+
+    def test_main_uses_run_cache_batch_for_cache_root(self):
+        from scripts import run_4d_from_cache
+
+        with patch(
+            "scripts.run_4d_from_cache.run_cache_batch",
+            return_value=[{"cache_dir": "/tmp/sam3_cache/demo", "status": "completed"}],
+        ) as mock_batch, patch(
+            "sys.argv",
+            [
+                "run_4d_from_cache.py",
+                "--cache_root",
+                "/tmp/sam3_cache",
+                "--output_root",
+                "/tmp/outputs_4d",
+                "--overwrite",
+            ],
+        ):
+            run_4d_from_cache.main()
+
+        mock_batch.assert_called_once_with(
+            "/tmp/sam3_cache",
+            output_root="/tmp/outputs_4d",
+            overwrite=True,
+            config_path=None,
+        )
 
 
 if __name__ == "__main__":

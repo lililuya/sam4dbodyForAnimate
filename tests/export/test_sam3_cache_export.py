@@ -140,6 +140,9 @@ class Sam3CacheExportTests(unittest.TestCase):
             "batch_size": 8,
             "detection_resolution": [256, 512],
             "completion_resolution": [512, 1024],
+            "completion_batch_size": 1,
+            "completion_decode_chunk_size": 2,
+            "max_occ_len": 8,
             "smpl_export": False,
             "video_fps": 24.0,
             "prompt_log": {
@@ -160,6 +163,9 @@ class Sam3CacheExportTests(unittest.TestCase):
         self.assertEqual(payload["runtime_profile"]["batch_size"], 8)
         self.assertEqual(payload["runtime_profile"]["detection_resolution"], [256, 512])
         self.assertEqual(payload["runtime_profile"]["completion_resolution"], [512, 1024])
+        self.assertEqual(payload["runtime_profile"]["completion_batch_size"], 1)
+        self.assertEqual(payload["runtime_profile"]["completion_decode_chunk_size"], 2)
+        self.assertEqual(payload["runtime_profile"]["max_occ_len"], 8)
         self.assertEqual(payload["runtime_profile"]["smpl_export"], False)
         self.assertEqual(payload["runtime_profile"]["fps"], 24.0)
         self.assertEqual(payload["prompt_log"]["1"]["frames"]["0"]["labels"], [1])
@@ -260,6 +266,53 @@ class Sam3CacheExportTests(unittest.TestCase):
             self.assertNotIn("session_debug", meta_data)
             self.assertEqual(frame_metrics_data, expected_frame_metrics)
             self.assertEqual(events_data, expected_events)
+
+    def test_export_session_cache_writes_cache_for_completed_mask_generation_session(self):
+        from scripts.sam3_cache_export import export_session_cache
+
+        with make_workspace_tempdir() as tmpdir:
+            output_root = os.path.join(tmpdir, "outputs")
+            output_dir = os.path.join(output_root, "session_001")
+            images_dir = os.path.join(output_dir, "images")
+            masks_dir = os.path.join(output_dir, "masks")
+            os.makedirs(images_dir, exist_ok=True)
+            os.makedirs(masks_dir, exist_ok=True)
+
+            Image.new("RGB", (4, 4), color=(255, 0, 0)).save(
+                os.path.join(images_dir, "00000000.jpg")
+            )
+            Image.new("L", (4, 4), color=255).save(
+                os.path.join(masks_dir, "00000000.png")
+            )
+
+            runtime = {
+                "session_video_path": "inputs/source.mp4",
+                "session_output_dir": output_dir,
+                "mask_generation_completed": True,
+                "out_obj_ids": [1],
+                "batch_size": 8,
+                "detection_resolution": [256, 512],
+                "completion_resolution": [512, 1024],
+                "smpl_export": False,
+                "video_fps": 24.0,
+                "prompt_log": {},
+                "frame_metrics": [],
+                "events": [{"type": "mask_generation_completed", "frame_count": 1}],
+            }
+
+            cache_dir = export_session_cache(
+                runtime=runtime,
+                video_path="inputs/source.mp4",
+                output_dir=output_dir,
+                output_root=output_root,
+                config_path="configs/body4d.yaml",
+            )
+
+            self.assertEqual(cache_dir, os.path.join(output_root, "sam3_cache", "session_001"))
+            self.assertTrue(os.path.isfile(os.path.join(cache_dir, "meta.json")))
+            self.assertTrue(os.path.isfile(os.path.join(cache_dir, "prompts.json")))
+            self.assertTrue(os.path.isfile(os.path.join(cache_dir, "frame_metrics.json")))
+            self.assertTrue(os.path.isfile(os.path.join(cache_dir, "events.json")))
 
     def test_validate_cache_dir_rejects_missing_traceability_payloads(self):
         from scripts.sam3_cache_contract import validate_cache_dir

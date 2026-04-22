@@ -23,6 +23,7 @@ def build_batch_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=str, default=os.path.join(ROOT, "configs", "body4d_refined.yaml"))
     parser.add_argument("--detector_backend", type=str, default=None)
     parser.add_argument("--track_chunk_size", type=int, default=None)
+    parser.add_argument("--disable_mask_refine", action="store_true")
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument("--continue_on_error", action="store_true")
     parser.add_argument("--save_debug_metrics", action="store_true")
@@ -150,6 +151,7 @@ def run_batch(args):
         output_dir=args.output_dir,
         detector_backend=args.detector_backend,
         track_chunk_size=args.track_chunk_size,
+        disable_mask_refine=getattr(args, "disable_mask_refine", False),
         disable_auto_reprompt=False,
         save_debug_metrics=args.save_debug_metrics,
     )
