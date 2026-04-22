@@ -104,6 +104,106 @@ The exported cache is written under `<runtime.output_dir>/sam3_cache/<sample_id>
 
 `app.py` no longer runs 4D directly. This keeps the interactive SAM3 stage traceable and lets 4D run later in batch or on a different machine.
 
+## Recommended Commands
+
+If you mainly work from the terminal, these are the most practical entry points.
+All four flows are also wrapped by the repository-root `run.sh` helper, so you can use either the direct Python command or the wrapper form.
+
+#### 1. Debug human detector outputs before a full run
+
+Use `scripts/debug_human_detection.py` to draw detector boxes on an image or video:
+
+```bash
+python scripts/debug_human_detection.py \
+  --input_path data/demo.mp4 \
+  --detector_backend yolo \
+  --output_path outputs/debug/demo_detected.mp4
+```
+
+Wrapper form:
+
+```bash
+./run.sh detect-debug \
+  --input_path data/demo.mp4 \
+  --detector_backend yolo \
+  --output_path outputs/debug/demo_detected.mp4
+```
+
+#### 2. Run the refined offline pipeline on one sample
+
+```bash
+python scripts/offline_app_refined.py \
+  --input_video data/demo.mp4 \
+  --config configs/body4d_refined.yaml \
+  --max_targets 2
+```
+
+Low-memory example:
+
+```bash
+python scripts/offline_app_refined.py \
+  --input_video data/demo.mp4 \
+  --config configs/body4d_refined_low_memory.yaml \
+  --max_targets 2
+```
+
+Wrapper form:
+
+```bash
+./run.sh offline-refined \
+  --input_video data/demo.mp4 \
+  --config configs/body4d_refined_low_memory.yaml \
+  --max_targets 2
+```
+
+#### 3. Run the refined batch pipeline
+
+```bash
+python scripts/offline_batch_refined.py \
+  --input_root /path/to/batch_videos \
+  --output_dir /path/to/outputs_refined \
+  --config configs/body4d_refined_low_memory.yaml \
+  --skip_existing \
+  --continue_on_error
+```
+
+Wrapper form:
+
+```bash
+./run.sh offline-refined-batch \
+  --input_root /path/to/batch_videos \
+  --output_dir /path/to/outputs_refined \
+  --config configs/body4d_refined_low_memory.yaml \
+  --skip_existing \
+  --continue_on_error
+```
+
+#### 4. Run offline 4D from exported SAM3 cache
+
+Run one sample:
+
+```bash
+python scripts/run_4d_from_cache.py --cache_dir /path/to/sam3_cache/sample_id
+```
+
+Run every sample under one cache root:
+
+```bash
+python scripts/run_4d_from_cache.py \
+  --cache_root /path/to/sam3_cache \
+  --output_root /path/to/outputs_4d \
+  --overwrite
+```
+
+Wrapper form:
+
+```bash
+./run.sh cache-4d \
+  --cache_root /path/to/sam3_cache \
+  --output_root /path/to/outputs_4d \
+  --overwrite
+```
+
 #### 3. Run 4D offline from an exported cache
 ```bash
 python scripts/run_4d_from_cache.py --cache_dir <path/to/sam3_cache/sample_id>
