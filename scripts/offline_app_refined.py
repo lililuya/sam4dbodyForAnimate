@@ -24,6 +24,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.append(ROOT)
 
+from scripts.detector_defaults import resolve_detector_runtime_options
 from scripts.offline_reprompt import match_detection_to_track, should_trigger_reprompt
 
 
@@ -483,17 +484,23 @@ class RefinedOfflineApp:
         detector = getattr(model, "detector", None)
         detector_outputs = None
         backend = str(cfg_get(self.CONFIG, "detector.backend", "vitdet")).lower()
+        resolved = resolve_detector_runtime_options(
+            backend,
+            bbox_thresh=bbox_thr,
+            iou_thresh=nms_thr,
+            max_det=cfg_get(self.CONFIG, "detector.max_det", None),
+        )
 
         if detector is not None and hasattr(detector, "run_human_detection"):
             detector_kwargs = {
                 "det_cat_id": 0,
-                "bbox_thr": bbox_thr,
-                "nms_thr": nms_thr,
+                "bbox_thr": resolved["bbox_thresh"],
+                "nms_thr": resolved["iou_thresh"],
                 "default_to_full_image": False,
                 "return_scores": True,
             }
-            if backend in {"yolo", "yolo11"}:
-                detector_kwargs["max_det"] = int(cfg_get(self.CONFIG, "detector.max_det", 20))
+            if resolved["max_det"] is not None:
+                detector_kwargs["max_det"] = int(resolved["max_det"])
 
             try:
                 detector_outputs = detector.run_human_detection(
@@ -656,8 +663,14 @@ class RefinedOfflineApp:
             int(cfg_get(self.CONFIG, "batch.initial_search_frames", 24)),
             int(sample["frame_count"]),
         )
-        bbox_thr = float(cfg_get(self.CONFIG, "detector.bbox_thresh", 0.35))
-        nms_thr = float(cfg_get(self.CONFIG, "detector.iou_thresh", 0.50))
+        resolved_detector = resolve_detector_runtime_options(
+            cfg_get(self.CONFIG, "detector.backend", "vitdet"),
+            bbox_thresh=cfg_get(self.CONFIG, "detector.bbox_thresh", None),
+            iou_thresh=cfg_get(self.CONFIG, "detector.iou_thresh", None),
+            max_det=cfg_get(self.CONFIG, "detector.max_det", None),
+        )
+        bbox_thr = resolved_detector["bbox_thresh"]
+        nms_thr = resolved_detector["iou_thresh"]
 
         outputs = []
         start_frame_idx = None

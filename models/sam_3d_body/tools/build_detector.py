@@ -6,6 +6,79 @@ from pathlib import Path
 import numpy as np
 import torch
 
+DEFAULT_VITDET_SCORE_THRESH = 0.05
+DEFAULT_VITDET_NMS_THRESH = 0.50
+
+
+def _to_numpy_float32(values) -> np.ndarray:
+    if isinstance(values, np.ndarray):
+        return values.astype(np.float32)
+    if hasattr(values, "detach") and callable(values.detach):
+        values = values.detach()
+    if hasattr(values, "cpu") and callable(values.cpu):
+        values = values.cpu()
+    if hasattr(values, "numpy") and callable(values.numpy):
+        values = values.numpy()
+    return np.asarray(values, dtype=np.float32)
+
+
+def nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> np.ndarray:
+    if boxes.size == 0:
+        return np.zeros((0,), dtype=np.int64)
+
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+    areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+    order = scores.argsort()[::-1]
+    keep = []
+
+    while order.size > 0:
+        current = int(order[0])
+        keep.append(current)
+        if order.size == 1:
+            break
+
+        remaining = order[1:]
+        xx1 = np.maximum(x1[current], x1[remaining])
+        yy1 = np.maximum(y1[current], y1[remaining])
+        xx2 = np.minimum(x2[current], x2[remaining])
+        yy2 = np.minimum(y2[current], y2[remaining])
+
+        inter_w = np.maximum(0.0, xx2 - xx1)
+        inter_h = np.maximum(0.0, yy2 - yy1)
+        inter = inter_w * inter_h
+        union = areas[current] + areas[remaining] - inter
+        iou = np.divide(inter, union, out=np.zeros_like(inter), where=union > 0)
+        order = remaining[iou <= float(iou_threshold)]
+
+    return np.asarray(keep, dtype=np.int64)
+
+
+def select_detectron2_person_detections(
+    instances,
+    det_cat_id: int = 0,
+    bbox_thr: float = DEFAULT_VITDET_SCORE_THRESH,
+    nms_thr: float = DEFAULT_VITDET_NMS_THRESH,
+):
+    boxes = _to_numpy_float32(instances.pred_boxes.tensor).reshape(-1, 4)
+    scores = _to_numpy_float32(instances.scores).reshape(-1)
+    classes = _to_numpy_float32(instances.pred_classes).reshape(-1)
+
+    valid_idx = (classes == float(det_cat_id)) & (scores > float(bbox_thr))
+    boxes = boxes[valid_idx]
+    scores = scores[valid_idx]
+    if boxes.size == 0:
+        return boxes.reshape(0, 4).astype(np.float32), scores.reshape(0).astype(np.float32)
+
+    keep = nms_xyxy(boxes, scores, float(nms_thr))
+    boxes = boxes[keep]
+    scores = scores[keep]
+
+    sorted_indices = np.lexsort((boxes[:, 3], boxes[:, 2], boxes[:, 1], boxes[:, 0]))
+    return boxes[sorted_indices].astype(np.float32), scores[sorted_indices].astype(np.float32)
+
 
 class HumanDetector:
     def __init__(self, name="vitdet", device="cuda", **kwargs):
@@ -57,7 +130,7 @@ def load_detectron2_vitdet(path=""):
         else os.path.join(path, "model_final_f05665.pkl")
     )
     for i in range(3):
-        detectron2_cfg.model.roi_heads.box_predictors[i].test_score_thresh = 0.25
+        detectron2_cfg.model.roi_heads.box_predictors[i].test_score_thresh = DEFAULT_VITDET_SCORE_THRESH
     detector = instantiate(detectron2_cfg.model)
     checkpointer = DetectionCheckpointer(detector)
     checkpointer.load(detectron2_cfg.train.init_checkpoint)
@@ -70,8 +143,8 @@ def run_detectron2_vitdet(
     detector,
     img,
     det_cat_id: int = 0,
-    bbox_thr: float = 0.5,
-    nms_thr: float = 0.3,
+    bbox_thr: float = DEFAULT_VITDET_SCORE_THRESH,
+    nms_thr: float = DEFAULT_VITDET_NMS_THRESH,
     default_to_full_image: bool = True,
     return_scores: bool = False,
 ):
@@ -91,22 +164,15 @@ def run_detectron2_vitdet(
         det_out = detector([inputs])
 
     det_instances = det_out[0]["instances"]
-    valid_idx = (det_instances.pred_classes == det_cat_id) & (
-        det_instances.scores > bbox_thr
+    boxes, scores = select_detectron2_person_detections(
+        det_instances,
+        det_cat_id=det_cat_id,
+        bbox_thr=bbox_thr,
+        nms_thr=nms_thr,
     )
-    if valid_idx.sum() == 0 and default_to_full_image:
+    if boxes.size == 0 and default_to_full_image:
         boxes = np.array([0, 0, width, height]).reshape(1, 4).astype(np.float32)
         scores = np.array([np.nan], dtype=np.float32)
-    else:
-        boxes = det_instances.pred_boxes.tensor[valid_idx].cpu().numpy().astype(np.float32)
-        scores = det_instances.scores[valid_idx].cpu().numpy().astype(np.float32)
-
-    # Sort boxes to keep a consistent output order
-    sorted_indices = np.lexsort(
-        (boxes[:, 3], boxes[:, 2], boxes[:, 1], boxes[:, 0])
-    )  # shape: [len(boxes),]
-    boxes = boxes[sorted_indices]
-    scores = scores[sorted_indices]
     if return_scores:
         return [
             {

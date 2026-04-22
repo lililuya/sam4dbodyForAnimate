@@ -1,6 +1,9 @@
 import numpy as np
 
 DEFAULT_YOLO_WEIGHTS = "yolo11n.pt"
+DEFAULT_YOLO_BBOX_THRESH = 0.25
+DEFAULT_YOLO_NMS_THRESH = 0.70
+DEFAULT_YOLO_MAX_DET = 300
 
 
 def _to_numpy_float32(values) -> np.ndarray:
@@ -80,11 +83,11 @@ def run_ultralytics_yolo(
     detector,
     img,
     det_cat_id: int = 0,
-    bbox_thr: float = 0.35,
-    nms_thr: float = 0.50,
+    bbox_thr: float = DEFAULT_YOLO_BBOX_THRESH,
+    nms_thr: float = DEFAULT_YOLO_NMS_THRESH,
     default_to_full_image: bool = False,
     device=None,
-    max_det: int = 20,
+    max_det: int = DEFAULT_YOLO_MAX_DET,
     return_scores: bool = False,
 ):
     height, width = img.shape[:2]
