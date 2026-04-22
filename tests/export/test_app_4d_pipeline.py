@@ -333,6 +333,81 @@ class App4DPipelineTests(unittest.TestCase):
         self.assertEqual(mock_save_mesh.call_args.kwargs["save_mesh"], False)
         self.assertEqual(mock_save_mesh.call_args.kwargs["save_focal"], True)
 
+    def test_run_4d_pipeline_prints_cam_int_cache_summary_when_stats_exist(self):
+        from scripts.app_4d_pipeline import build_4d_context, run_4d_pipeline_from_context
+
+        with make_workspace_tempdir() as tmpdir:
+            input_dir = os.path.join(tmpdir, "cache")
+            output_dir = os.path.join(tmpdir, "outputs_4d", "demo")
+            os.makedirs(os.path.join(input_dir, "images"), exist_ok=True)
+            os.makedirs(os.path.join(input_dir, "masks"), exist_ok=True)
+            Image.fromarray(np.zeros((4, 4, 3), dtype=np.uint8)).save(
+                os.path.join(input_dir, "images", "00000000.jpg")
+            )
+            Image.fromarray(np.ones((4, 4), dtype=np.uint8)).save(
+                os.path.join(input_dir, "masks", "00000000.png")
+            )
+
+            runtime = {
+                "out_obj_ids": [1],
+                "batch_size": 1,
+                "detection_resolution": [256, 512],
+                "completion_resolution": [512, 1024],
+                "smpl_export": False,
+                "video_fps": 24.0,
+                "save_rendered_frames": False,
+                "save_rendered_frames_individual": False,
+                "save_mesh_4d_individual": False,
+                "save_focal_4d_individual": False,
+            }
+            context = build_4d_context(
+                input_dir=input_dir,
+                output_dir=output_dir,
+                runtime=runtime,
+                sam3_3d_body_model=MagicMock(faces=np.array([[0, 1, 2]], dtype=np.int32)),
+                pipeline_mask=None,
+                pipeline_rgb=None,
+                depth_model=None,
+                predictor=MagicMock(),
+                generator=None,
+            )
+
+            def fake_process_image_with_mask(*args, **kwargs):
+                kwargs["cam_int_cache_stats"]["misses"] = 1
+                kwargs["cam_int_cache_stats"]["hits"] = 2
+                return ([[{"bbox": np.zeros((4,), dtype=np.float32)}]], [[1]], [])
+
+            with patch(
+                "scripts.app_4d_pipeline.process_image_with_mask",
+                side_effect=fake_process_image_with_mask,
+            ), patch(
+                "scripts.app_4d_pipeline.visualize_sample_together",
+                return_value=np.zeros((4, 4, 3), dtype=np.uint8),
+            ), patch(
+                "scripts.app_4d_pipeline.visualize_sample",
+                return_value=[],
+            ), patch(
+                "scripts.app_4d_pipeline.save_mesh_results",
+            ), patch(
+                "scripts.app_4d_pipeline.jpg_folder_to_mp4",
+            ), patch(
+                "scripts.app_4d_pipeline.cv2.imread",
+                return_value=np.zeros((4, 4, 3), dtype=np.uint8),
+            ), patch(
+                "scripts.app_4d_pipeline.cv2.imwrite",
+                return_value=True,
+            ), patch(
+                "builtins.print",
+            ) as mock_print:
+                run_4d_pipeline_from_context(context)
+
+        self.assertTrue(
+            any(
+                call.args and call.args[0] == "cam_int cache: 1 misses, 2 hits"
+                for call in mock_print.call_args_list
+            )
+        )
+
     @unittest.skipUnless(HAS_TORCH, "torch is required for completion caching test")
     def test_run_4d_pipeline_caches_transforms_and_keeps_completion_artifacts_in_memory(self):
         from scripts.app_4d_pipeline import build_4d_context, run_4d_pipeline_from_context

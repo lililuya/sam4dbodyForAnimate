@@ -208,6 +208,7 @@ def run_4d_pipeline_from_context(context):
         "mask_frames": {},
         "image_frames": {},
         "cam_int": {},
+        "cam_int_stats": {"hits": 0, "misses": 0},
     }
 
     pred_res = context.runtime["detection_resolution"]
@@ -469,6 +470,7 @@ def run_4d_pipeline_from_context(context):
             mask_frames=batch_mask_frames,
             image_cache=runtime_cache["image_frames"],
             cam_int_cache=runtime_cache["cam_int"],
+            cam_int_cache_stats=runtime_cache["cam_int_stats"],
         )
 
         num_empty_ids = 0
@@ -531,6 +533,11 @@ def run_4d_pipeline_from_context(context):
                     save_mesh=save_mesh,
                     save_focal=save_focal,
                 )
+
+    cam_int_hits = int(runtime_cache["cam_int_stats"].get("hits", 0))
+    cam_int_misses = int(runtime_cache["cam_int_stats"].get("misses", 0))
+    if cam_int_hits > 0 or cam_int_misses > 0:
+        print(f"cam_int cache: {cam_int_misses} misses, {cam_int_hits} hits")
 
     if not save_rendered_frames:
         return None

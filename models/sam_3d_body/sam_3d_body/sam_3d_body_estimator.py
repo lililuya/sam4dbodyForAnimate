@@ -45,6 +45,12 @@ def _ensure_cam_int_tensor(cam_int):
     return tensor.float()
 
 
+def _record_cam_int_cache_stat(stats, field):
+    if stats is None:
+        return
+    stats[field] = int(stats.get(field, 0)) + 1
+
+
 class SAM3DBodyEstimator:
     def __init__(
         self,
@@ -109,6 +115,7 @@ class SAM3DBodyEstimator:
         _occ_image_batch_ori=None,
         image_cache=None,
         cam_int_cache=None,
+        cam_int_cache_stats=None,
     ):
         """
         Perform model prediction in top-down format: assuming input is a full image.
@@ -287,10 +294,17 @@ class SAM3DBodyEstimator:
 
                 cached_cam_int = None
                 if cam_int_cache is not None and cam_int_cache_key is not None:
-                    cached_cam_int = cam_int_cache.get(cam_int_cache_key)
+                    if cam_int_cache_key in cam_int_cache:
+                        cached_cam_int = cam_int_cache[cam_int_cache_key]
+                        _record_cam_int_cache_stat(cam_int_cache_stats, "hits")
+                    else:
+                        _record_cam_int_cache_stat(cam_int_cache_stats, "misses")
 
                 if cached_cam_int is None:
-                    print("Running FOV estimator ...")
+                    if cam_int_cache_key is not None:
+                        print(f"Running FOV estimator (cache miss): {os.path.basename(cam_int_cache_key)}")
+                    else:
+                        print("Running FOV estimator (cache miss)")
                     if _occ_image_batch_ori is not None:
                         input_image = np.array(Image.open(_occ_image_batch_ori[i])).astype('uint8')
                     else:

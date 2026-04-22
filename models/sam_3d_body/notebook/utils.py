@@ -313,6 +313,7 @@ def process_image_with_mask(
     mask_frames=None,
     image_cache=None,
     cam_int_cache=None,
+    cam_int_cache_stats=None,
 ):
     """
     Process image with external mask input.
@@ -492,6 +493,7 @@ def process_image_with_mask(
                 cam_int=cam_int,
                 image_cache=image_cache,
                 cam_int_cache=cam_int_cache,
+                cam_int_cache_stats=cam_int_cache_stats,
             )
         if len(_occ_image_batch) > 0:
             _occ_outputs = estimator.process_frames(
@@ -510,6 +512,7 @@ def process_image_with_mask(
                 cam_int=cam_int,
                 image_cache=image_cache,
                 cam_int_cache=cam_int_cache,
+                cam_int_cache_stats=cam_int_cache_stats,
             )
         
         oid_outputs = []
