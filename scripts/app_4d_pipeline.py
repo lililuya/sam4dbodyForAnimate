@@ -142,6 +142,19 @@ def _load_bgr_image_cached(cache, image_path):
     return cache[cache_key].copy()
 
 
+def _format_cam_int_progress_postfix(stats):
+    misses = int(stats.get("misses", 0))
+    hits = int(stats.get("hits", 0))
+    if misses <= 0 and hits <= 0:
+        return None
+
+    postfix = f"cam_int={misses}m/{hits}h"
+    last_miss_frame = stats.get("last_miss_frame")
+    if last_miss_frame:
+        postfix = f"{postfix} miss={last_miss_frame}"
+    return postfix
+
+
 def build_4d_context(
     *,
     input_dir,
@@ -241,7 +254,8 @@ def run_4d_pipeline_from_context(context):
     mhr_shape_scale_dict = {}
     obj_ratio_dict = {}
 
-    for i in tqdm(range(0, n, batch_size)):
+    progress = tqdm(range(0, n, batch_size))
+    for i in progress:
         batch_images = images_list[i : i + batch_size]
         batch_masks = masks_list[i : i + batch_size]
         batch_mask_frames = [
@@ -472,6 +486,9 @@ def run_4d_pipeline_from_context(context):
             cam_int_cache=runtime_cache["cam_int"],
             cam_int_cache_stats=runtime_cache["cam_int_stats"],
         )
+        progress_postfix = _format_cam_int_progress_postfix(runtime_cache["cam_int_stats"])
+        if progress_postfix:
+            progress.set_postfix_str(progress_postfix)
 
         num_empty_ids = 0
         for frame_id in range(len(batch_images)):

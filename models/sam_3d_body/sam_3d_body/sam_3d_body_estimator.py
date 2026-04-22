@@ -51,6 +51,12 @@ def _record_cam_int_cache_stat(stats, field):
     stats[field] = int(stats.get(field, 0)) + 1
 
 
+def _record_cam_int_cache_miss_frame(stats, cache_key):
+    if stats is None:
+        return
+    stats["last_miss_frame"] = os.path.basename(cache_key) if cache_key is not None else "<unknown>"
+
+
 class SAM3DBodyEstimator:
     def __init__(
         self,
@@ -299,12 +305,11 @@ class SAM3DBodyEstimator:
                         _record_cam_int_cache_stat(cam_int_cache_stats, "hits")
                     else:
                         _record_cam_int_cache_stat(cam_int_cache_stats, "misses")
+                        _record_cam_int_cache_miss_frame(cam_int_cache_stats, cam_int_cache_key)
 
                 if cached_cam_int is None:
-                    if cam_int_cache_key is not None:
-                        print(f"Running FOV estimator (cache miss): {os.path.basename(cam_int_cache_key)}")
-                    else:
-                        print("Running FOV estimator (cache miss)")
+                    if cam_int_cache_key is None:
+                        _record_cam_int_cache_miss_frame(cam_int_cache_stats, cam_int_cache_key)
                     if _occ_image_batch_ori is not None:
                         input_image = np.array(Image.open(_occ_image_batch_ori[i])).astype('uint8')
                     else:

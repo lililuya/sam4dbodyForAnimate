@@ -96,10 +96,13 @@ class Sam3DBodyEstimatorCacheTests(unittest.TestCase):
         self.assertEqual(len(outputs), 2)
         self.assertEqual(estimator.fov_estimator.get_cam_intrinsics.call_count, 1)
         self.assertEqual(len(cam_int_cache), 1)
-        self.assertEqual(cam_int_cache_stats, {"hits": 1, "misses": 1})
+        self.assertEqual(
+            cam_int_cache_stats,
+            {"hits": 1, "misses": 1, "last_miss_frame": "sample_frame.jpg"},
+        )
 
     @unittest.skipUnless(HAS_TORCH, "torch is required for estimator cache test")
-    def test_process_frames_logs_cache_miss_with_frame_stem(self):
+    def test_process_frames_records_cache_miss_frame_stem_without_print_spam(self):
         from models.sam_3d_body.sam_3d_body.sam_3d_body_estimator import SAM3DBodyEstimator
         import torch
 
@@ -144,6 +147,8 @@ class Sam3DBodyEstimatorCacheTests(unittest.TestCase):
             }
         }
 
+        cam_int_cache_stats = {}
+
         with patch(
             "models.sam_3d_body.sam_3d_body.sam_3d_body_estimator.load_image",
             return_value=np.zeros((4, 4, 3), dtype=np.uint8),
@@ -168,12 +173,16 @@ class Sam3DBodyEstimatorCacheTests(unittest.TestCase):
                 use_mask=True,
                 inference_type="body",
                 cam_int_cache={},
-                cam_int_cache_stats={},
+                cam_int_cache_stats=cam_int_cache_stats,
             )
 
-        self.assertTrue(
+        self.assertEqual(
+            cam_int_cache_stats,
+            {"hits": 0, "misses": 1, "last_miss_frame": "00000123.jpg"},
+        )
+        self.assertFalse(
             any(
-                call.args and call.args[0] == "Running FOV estimator (cache miss): 00000123.jpg"
+                call.args and str(call.args[0]).startswith("Running FOV estimator")
                 for call in mock_print.call_args_list
             )
         )

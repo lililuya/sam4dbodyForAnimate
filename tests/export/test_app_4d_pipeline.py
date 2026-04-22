@@ -333,7 +333,7 @@ class App4DPipelineTests(unittest.TestCase):
         self.assertEqual(mock_save_mesh.call_args.kwargs["save_mesh"], False)
         self.assertEqual(mock_save_mesh.call_args.kwargs["save_focal"], True)
 
-    def test_run_4d_pipeline_prints_cam_int_cache_summary_when_stats_exist(self):
+    def test_run_4d_pipeline_prints_cam_int_cache_summary_and_updates_progress_postfix(self):
         from scripts.app_4d_pipeline import build_4d_context, run_4d_pipeline_from_context
 
         with make_workspace_tempdir() as tmpdir:
@@ -372,14 +372,30 @@ class App4DPipelineTests(unittest.TestCase):
                 generator=None,
             )
 
+            progress_updates = []
+
+            class FakeProgress:
+                def __init__(self, iterable):
+                    self._items = list(iterable)
+
+                def __iter__(self):
+                    return iter(self._items)
+
+                def set_postfix_str(self, value):
+                    progress_updates.append(value)
+
             def fake_process_image_with_mask(*args, **kwargs):
                 kwargs["cam_int_cache_stats"]["misses"] = 1
                 kwargs["cam_int_cache_stats"]["hits"] = 2
+                kwargs["cam_int_cache_stats"]["last_miss_frame"] = "00000000.jpg"
                 return ([[{"bbox": np.zeros((4,), dtype=np.float32)}]], [[1]], [])
 
             with patch(
                 "scripts.app_4d_pipeline.process_image_with_mask",
                 side_effect=fake_process_image_with_mask,
+            ), patch(
+                "scripts.app_4d_pipeline.tqdm",
+                side_effect=lambda iterable: FakeProgress(iterable),
             ), patch(
                 "scripts.app_4d_pipeline.visualize_sample_together",
                 return_value=np.zeros((4, 4, 3), dtype=np.uint8),
@@ -407,6 +423,7 @@ class App4DPipelineTests(unittest.TestCase):
                 for call in mock_print.call_args_list
             )
         )
+        self.assertIn("cam_int=1m/2h miss=00000000.jpg", progress_updates)
 
     @unittest.skipUnless(HAS_TORCH, "torch is required for completion caching test")
     def test_run_4d_pipeline_caches_transforms_and_keeps_completion_artifacts_in_memory(self):
