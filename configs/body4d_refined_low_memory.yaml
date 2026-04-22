@@ -19,6 +19,14 @@ runtime:
   # Refined outputs will be written under this directory.
   output_dir: ./outputs_refined
   continue_on_error: false
+  # Pose json exports written per-frame and per-person.
+  # Supported: openpose, smpl, coco17, coco_wholebody
+  pose_exports: [openpose, smpl, coco17, coco_wholebody]
+  # Optional 4D artifacts. Disable any of these to reduce disk usage and write amplification.
+  save_rendered_frames: true
+  save_rendered_frames_individual: true
+  save_mesh_4d_individual: true
+  save_focal_4d_individual: true
 
 completion:
   # Keep completion enabled, but use a small temporal footprint for VRAM safety.

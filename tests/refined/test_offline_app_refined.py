@@ -113,6 +113,7 @@ class RefinedCliTests(unittest.TestCase):
             detector_backend="yolo",
             track_chunk_size=None,
             max_targets=None,
+            disable_mask_refine=False,
             disable_auto_reprompt=False,
             save_debug_metrics=False,
             skip_existing=False,
@@ -252,6 +253,7 @@ class RefinedCliTests(unittest.TestCase):
             detector_backend=None,
             track_chunk_size=None,
             max_targets=None,
+            disable_mask_refine=False,
             disable_auto_reprompt=False,
             save_debug_metrics=False,
             skip_existing=False,
@@ -297,6 +299,7 @@ class RefinedCliTests(unittest.TestCase):
             detector_backend=None,
             track_chunk_size=None,
             max_targets=None,
+            disable_mask_refine=False,
             disable_auto_reprompt=False,
             save_debug_metrics=False,
             skip_existing=False,
@@ -379,6 +382,7 @@ class RefinedCliTests(unittest.TestCase):
             detector_backend=None,
             track_chunk_size=None,
             max_targets=None,
+            disable_mask_refine=False,
             disable_auto_reprompt=False,
             save_debug_metrics=False,
             skip_existing=False,
@@ -394,6 +398,47 @@ class RefinedCliTests(unittest.TestCase):
             offline_app_refined.run_refined_pipeline(args)
 
         app.prepare_input.assert_called_once_with("sample.mp4", None, False)
+
+    def test_sync_base_app_runtime_propagates_pose_exports_and_storage_flags(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        config = OmegaConf.create(
+            {
+                "runtime": {
+                    "output_dir": "./outputs_refined",
+                    "pose_exports": ["coco17", "coco_wholebody"],
+                    "save_rendered_frames": False,
+                    "save_rendered_frames_individual": False,
+                    "save_mesh_4d_individual": True,
+                    "save_focal_4d_individual": False,
+                },
+                "sam_3d_body": {"batch_size": 12},
+                "completion": {
+                    "detection_resolution": [192, 384],
+                    "completion_resolution": [256, 512],
+                },
+                "detector": {"backend": "yolo"},
+                "debug": {"save_metrics": False},
+            }
+        )
+        app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+        runtime_app = unittest.mock.MagicMock()
+        runtime_app.RUNTIME = {}
+        runtime_app.OUTPUT_DIR = ""
+        runtime_app.sam3_3d_body_model = unittest.mock.MagicMock()
+        runtime_app.sam3_3d_body_model.device = "cuda"
+
+        with patch.object(app, "_configure_detector"):
+            app._sync_base_app_runtime(runtime_app, output_dir="./sample_out")
+
+        self.assertEqual(runtime_app.RUNTIME["batch_size"], 12)
+        self.assertEqual(runtime_app.RUNTIME["detection_resolution"], [192, 384])
+        self.assertEqual(runtime_app.RUNTIME["completion_resolution"], [256, 512])
+        self.assertEqual(runtime_app.RUNTIME["pose_exports"], ["coco17", "coco_wholebody"])
+        self.assertFalse(runtime_app.RUNTIME["save_rendered_frames"])
+        self.assertFalse(runtime_app.RUNTIME["save_rendered_frames_individual"])
+        self.assertTrue(runtime_app.RUNTIME["save_mesh_4d_individual"])
+        self.assertFalse(runtime_app.RUNTIME["save_focal_4d_individual"])
 
     def test_iter_chunks_yields_stable_chunk_metadata(self):
         from scripts.offline_app_refined import RefinedOfflineApp

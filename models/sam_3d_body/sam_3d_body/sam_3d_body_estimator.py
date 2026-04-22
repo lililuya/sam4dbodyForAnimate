@@ -21,6 +21,30 @@ from torchvision.transforms import ToTensor
 from PIL import Image
 
 
+def _normalize_image_cache_key(image_ref):
+    if isinstance(image_ref, str):
+        return os.path.abspath(image_ref)
+    return None
+
+
+def _resolve_cam_int_item(cam_int, index):
+    if isinstance(cam_int, (list, tuple)):
+        return cam_int[index]
+    return cam_int
+
+
+def _ensure_cam_int_tensor(cam_int):
+    if cam_int is None:
+        return None
+    if torch.is_tensor(cam_int):
+        tensor = cam_int.detach().clone()
+    else:
+        tensor = torch.as_tensor(cam_int).clone()
+    if tensor.ndim == 2:
+        tensor = tensor.unsqueeze(0)
+    return tensor.float()
+
+
 class SAM3DBodyEstimator:
     def __init__(
         self,
@@ -83,6 +107,8 @@ class SAM3DBodyEstimator:
         flip=False,
         kps_id=None,
         _occ_image_batch_ori=None,
+        image_cache=None,
+        cam_int_cache=None,
     ):
         """
         Perform model prediction in top-down format: assuming input is a full image.
@@ -112,7 +138,13 @@ class SAM3DBodyEstimator:
         kps_list = []
         for i, img in enumerate(img_list):
             if type(img) == str:
-                img = load_image(img, backend="cv2", image_format="bgr")
+                image_cache_key = _normalize_image_cache_key(img)
+                if image_cache is not None and image_cache_key in image_cache:
+                    img = image_cache[image_cache_key].copy()
+                else:
+                    img = load_image(img, backend="cv2", image_format="bgr")
+                    if image_cache is not None and image_cache_key is not None:
+                        image_cache[image_cache_key] = img.copy()
                 image_format = "bgr"
             else:
                 print("####### Please make sure the input image is in RGB format")
@@ -242,23 +274,35 @@ class SAM3DBodyEstimator:
             # else:
             #     cam_int = batch["cam_int"].clone()
 
-            if cam_int is not None:
+            cam_int_current = _resolve_cam_int_item(cam_int, i)
+            if cam_int_current is not None:
                 # print("Using provided camera intrinsics...")
-                cam_int = cam_int.to(batch["img"])
-                batch["cam_int"] = cam_int.clone()
+                cam_int_tensor = _ensure_cam_int_tensor(cam_int_current).to(batch["img"])
+                batch["cam_int"] = cam_int_tensor.clone()
             elif self.fov_estimator is not None:
-                print("Running FOV estimator ...")
-                # input_image = batch["img_ori"][0].data
                 if _occ_image_batch_ori is not None:
-                    input_image = np.array(Image.open(_occ_image_batch_ori[i])).astype('uint8')
+                    cam_int_cache_key = _normalize_image_cache_key(_occ_image_batch_ori[i])
                 else:
-                    input_image = batch["img_ori"][0].data
-                cam_int = self.fov_estimator.get_cam_intrinsics(input_image).to(
-                    batch["img"]
-                )
-                batch["cam_int"] = cam_int.clone()
+                    cam_int_cache_key = _normalize_image_cache_key(img_list[i])
+
+                cached_cam_int = None
+                if cam_int_cache is not None and cam_int_cache_key is not None:
+                    cached_cam_int = cam_int_cache.get(cam_int_cache_key)
+
+                if cached_cam_int is None:
+                    print("Running FOV estimator ...")
+                    if _occ_image_batch_ori is not None:
+                        input_image = np.array(Image.open(_occ_image_batch_ori[i])).astype('uint8')
+                    else:
+                        input_image = batch["img_ori"][0].data
+                    cached_cam_int = _ensure_cam_int_tensor(self.fov_estimator.get_cam_intrinsics(input_image))
+                    if cam_int_cache is not None and cam_int_cache_key is not None:
+                        cam_int_cache[cam_int_cache_key] = cached_cam_int.detach().cpu().clone()
+
+                cam_int_tensor = _ensure_cam_int_tensor(cached_cam_int).to(batch["img"])
+                batch["cam_int"] = cam_int_tensor.clone()
             else:
-                cam_int = batch["cam_int"].clone()
+                cam_int_tensor = batch["cam_int"].clone()
 
             batch_list.append(batch)
 

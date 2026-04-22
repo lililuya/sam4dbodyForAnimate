@@ -15,6 +15,14 @@ sam_3d_body:
 runtime:
   output_dir: ./outputs_refined_fast_80g
   continue_on_error: false
+  # Pose json exports written per-frame and per-person.
+  # Supported: openpose, smpl, coco17, coco_wholebody
+  pose_exports: [openpose, smpl, coco17, coco_wholebody]
+  # Optional 4D artifacts. Keep these on for full outputs, or disable selected ones for faster IO.
+  save_rendered_frames: true
+  save_rendered_frames_individual: true
+  save_mesh_4d_individual: true
+  save_focal_4d_individual: true
 
 completion:
   # Speed-priority profile for large-memory GPUs:

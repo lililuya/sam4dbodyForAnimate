@@ -31,6 +31,7 @@ from omegaconf import OmegaConf
 from scripts.app_4d_pipeline import build_4d_context, run_4d_pipeline_from_context
 from scripts.completion_safety import resolve_completion_batch_size, resolve_decode_chunk_size
 from scripts.offline_tracking_compat import unpack_propagate_output
+from scripts.pose_json_export import build_pose_frame_writer
 from utils import draw_point_marker, mask_painter, images_to_mp4, DAVIS_PALETTE, jpg_folder_to_mp4, is_super_long_or_wide, keep_largest_component, is_skinny_mask, bbox_from_mask, gpu_profile, resize_mask_with_unique_label
 from scripts.offline_completion_indexing import build_completion_window_from_ious
 
@@ -144,6 +145,27 @@ def build_diffusion_vas_config(cfg):
     )
 
 
+def _runtime_bool(cfg, path, default):
+    try:
+        value = OmegaConf.select(cfg, path, default=default)
+    except Exception:
+        value = default
+    return bool(default if value is None else value)
+
+
+def _runtime_list(cfg, path, default=None):
+    default = list(default or [])
+    try:
+        value = OmegaConf.select(cfg, path, default=default)
+    except Exception:
+        value = default
+    if value is None:
+        return list(default)
+    if isinstance(value, str):
+        return [value]
+    return list(value)
+
+
 class OfflineApp:
     def __init__(self, config_path: str = os.path.join(ROOT, "configs", "body4d.yaml")):
         """Initialize CONFIG, SAM3_MODEL, and global RUNTIME dict."""
@@ -175,6 +197,23 @@ class OfflineApp:
         self.RUNTIME['completion_decode_chunk_size'] = self.completion_decode_chunk_size
         self.RUNTIME['max_occ_len'] = int(self.max_occ_len) if self.max_occ_len is not None else int(self.CONFIG.completion.get('max_occ_len', 0) or 0)
         self.RUNTIME['smpl_export'] = self.CONFIG.runtime.get('smpl_export', False)
+        self.RUNTIME['pose_exports'] = _runtime_list(self.CONFIG, "runtime.pose_exports", [])
+        self.RUNTIME['save_rendered_frames'] = _runtime_bool(self.CONFIG, "runtime.save_rendered_frames", True)
+        self.RUNTIME['save_rendered_frames_individual'] = _runtime_bool(
+            self.CONFIG,
+            "runtime.save_rendered_frames_individual",
+            True,
+        )
+        self.RUNTIME['save_mesh_4d_individual'] = _runtime_bool(
+            self.CONFIG,
+            "runtime.save_mesh_4d_individual",
+            True,
+        )
+        self.RUNTIME['save_focal_4d_individual'] = _runtime_bool(
+            self.CONFIG,
+            "runtime.save_focal_4d_individual",
+            True,
+        )
         self.RUNTIME['bboxes'] = None
 
     def on_mask_generation(self, video_path: str=None, start_frame_idx: int = 0, max_frame_num_to_track: int = 1800):
@@ -241,6 +280,10 @@ class OfflineApp:
         return out_video_path
 
     def on_4d_generation(self, video_path: str=None):
+        export_formats = list(self.RUNTIME.get("pose_exports", []))
+        if not export_formats and bool(self.RUNTIME.get("smpl_export", False)):
+            export_formats = ["openpose", "smpl"]
+
         context = build_4d_context(
             input_dir=self.OUTPUT_DIR,
             output_dir=self.OUTPUT_DIR,
@@ -251,6 +294,7 @@ class OfflineApp:
             depth_model=self.depth_model,
             predictor=self.predictor,
             generator=self.generator,
+            frame_writer=build_pose_frame_writer(output_dir=self.OUTPUT_DIR, export_formats=export_formats),
         )
         return run_4d_pipeline_from_context(context)
 

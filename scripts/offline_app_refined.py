@@ -154,21 +154,45 @@ def build_reprompt_thresholds(cfg) -> Dict[str, float]:
     }
 
 
-def prepare_output_dirs(output_dir: str, obj_ids: Iterable[int], save_debug_metrics: bool) -> Dict[str, str]:
+def build_runtime_storage_options(cfg) -> Dict[str, object]:
+    return {
+        "save_rendered_frames": bool(cfg_get(cfg, "runtime.save_rendered_frames", True)),
+        "save_rendered_frames_individual": bool(cfg_get(cfg, "runtime.save_rendered_frames_individual", True)),
+        "save_mesh_4d_individual": bool(cfg_get(cfg, "runtime.save_mesh_4d_individual", True)),
+        "save_focal_4d_individual": bool(cfg_get(cfg, "runtime.save_focal_4d_individual", True)),
+        "pose_exports": list(cfg_get(cfg, "runtime.pose_exports", []) or []),
+    }
+
+
+def prepare_output_dirs(
+    output_dir: str,
+    obj_ids: Iterable[int],
+    save_debug_metrics: bool,
+    storage_options: Optional[dict] = None,
+) -> Dict[str, str]:
+    storage_options = dict(storage_options or {})
+    save_rendered_frames = bool(storage_options.get("save_rendered_frames", True))
+    save_rendered_frames_individual = bool(storage_options.get("save_rendered_frames_individual", True))
+    save_mesh_4d_individual = bool(storage_options.get("save_mesh_4d_individual", True))
+    save_focal_4d_individual = bool(storage_options.get("save_focal_4d_individual", True))
     paths = {
         "images": os.path.join(output_dir, "images"),
         "masks_raw": os.path.join(output_dir, "masks_raw"),
         "masks_refined": os.path.join(output_dir, "masks_refined"),
         "completion_images": os.path.join(output_dir, "completion_refined", "images"),
         "completion_masks": os.path.join(output_dir, "completion_refined", "masks"),
-        "rendered_frames": os.path.join(output_dir, "rendered_frames"),
     }
+    if save_rendered_frames:
+        paths["rendered_frames"] = os.path.join(output_dir, "rendered_frames")
     for path in paths.values():
         os.makedirs(path, exist_ok=True)
     for obj_id in obj_ids:
-        os.makedirs(os.path.join(output_dir, "mesh_4d_individual", str(obj_id)), exist_ok=True)
-        os.makedirs(os.path.join(output_dir, "focal_4d_individual", str(obj_id)), exist_ok=True)
-        os.makedirs(os.path.join(output_dir, "rendered_frames_individual", str(obj_id)), exist_ok=True)
+        if save_mesh_4d_individual:
+            os.makedirs(os.path.join(output_dir, "mesh_4d_individual", str(obj_id)), exist_ok=True)
+        if save_focal_4d_individual:
+            os.makedirs(os.path.join(output_dir, "focal_4d_individual", str(obj_id)), exist_ok=True)
+        if save_rendered_frames_individual:
+            os.makedirs(os.path.join(output_dir, "rendered_frames_individual", str(obj_id)), exist_ok=True)
     if save_debug_metrics:
         debug_dir = os.path.join(output_dir, "debug_metrics")
         os.makedirs(debug_dir, exist_ok=True)
@@ -403,6 +427,7 @@ class RefinedOfflineApp:
             output_dir,
             obj_ids,
             save_debug_metrics=bool(self.CONFIG.debug.save_metrics),
+            storage_options=build_runtime_storage_options(self.CONFIG),
         )
         return self.output_paths
 
@@ -450,6 +475,33 @@ class RefinedOfflineApp:
         )
         runtime_app.RUNTIME["smpl_export"] = bool(
             cfg_get(self.CONFIG, "runtime.smpl_export", runtime_app.RUNTIME.get("smpl_export", False))
+        )
+        runtime_app.RUNTIME["pose_exports"] = list(
+            cfg_get(self.CONFIG, "runtime.pose_exports", runtime_app.RUNTIME.get("pose_exports", [])) or []
+        )
+        runtime_app.RUNTIME["save_rendered_frames"] = bool(
+            cfg_get(self.CONFIG, "runtime.save_rendered_frames", runtime_app.RUNTIME.get("save_rendered_frames", True))
+        )
+        runtime_app.RUNTIME["save_rendered_frames_individual"] = bool(
+            cfg_get(
+                self.CONFIG,
+                "runtime.save_rendered_frames_individual",
+                runtime_app.RUNTIME.get("save_rendered_frames_individual", True),
+            )
+        )
+        runtime_app.RUNTIME["save_mesh_4d_individual"] = bool(
+            cfg_get(
+                self.CONFIG,
+                "runtime.save_mesh_4d_individual",
+                runtime_app.RUNTIME.get("save_mesh_4d_individual", True),
+            )
+        )
+        runtime_app.RUNTIME["save_focal_4d_individual"] = bool(
+            cfg_get(
+                self.CONFIG,
+                "runtime.save_focal_4d_individual",
+                runtime_app.RUNTIME.get("save_focal_4d_individual", True),
+            )
         )
         self._configure_detector(runtime_app)
         self.OUTPUT_DIR = runtime_app.OUTPUT_DIR

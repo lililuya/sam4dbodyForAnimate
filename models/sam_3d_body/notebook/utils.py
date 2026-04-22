@@ -215,30 +215,38 @@ def save_mesh_results(
     outputs: List[Dict[str, Any]],
     faces: np.ndarray,
     save_dir: str,
-    focal_dir: str, 
+    focal_dir: str,
     image_path: str,
     id_current: List,
+    save_mesh: bool = True,
+    save_focal: bool = True,
 ):
     """Save 3D mesh results to files and return PLY file paths"""
 
-    if outputs is None:
+    if outputs is None or (not save_mesh and not save_focal):
         return
 
     for pid, person_output in enumerate(outputs):
-        # Create renderer for this person
-        renderer = Renderer(focal_length=person_output["focal_length"], faces=faces)
+        track_id = int(id_current[pid]) if id_current is not None and pid < len(id_current) else pid + 1
 
-        # Store individual mesh
-        color = tuple(c / 255.0 for c in color_list[id_current[pid]+4])
-        tmesh = renderer.vertices_to_trimesh(
-            person_output["pred_vertices"], person_output["pred_cam_t"], color
-        )
-        mesh_path = f"{save_dir}/{pid+1}/{os.path.basename(image_path)[:-4]}.ply"
-        tmesh.export(mesh_path)
+        if save_mesh:
+            os.makedirs(os.path.join(save_dir, str(track_id)), exist_ok=True)
+            renderer = Renderer(focal_length=person_output["focal_length"], faces=faces)
+            color = tuple(c / 255.0 for c in color_list[track_id + 4])
+            tmesh = renderer.vertices_to_trimesh(
+                person_output["pred_vertices"], person_output["pred_cam_t"], color
+            )
+            mesh_path = os.path.join(save_dir, str(track_id), f"{os.path.basename(image_path)[:-4]}.ply")
+            tmesh.export(mesh_path)
 
-        focal_length = {'focal_length': person_output["focal_length"].item(), 'camera': [float(x) for x in person_output['pred_cam_t']]}
-        with open(f"{focal_dir}/{pid+1}/{os.path.basename(image_path)[:-4]}.json", "w") as f:
-            json.dump(focal_length, f, indent=4)
+        if save_focal:
+            os.makedirs(os.path.join(focal_dir, str(track_id)), exist_ok=True)
+            focal_length = {
+                "focal_length": person_output["focal_length"].item(),
+                "camera": [float(x) for x in person_output["pred_cam_t"]],
+            }
+            with open(os.path.join(focal_dir, str(track_id), f"{os.path.basename(image_path)[:-4]}.json"), "w") as f:
+                json.dump(focal_length, f, indent=4)
 
 
 def display_results_grid(
@@ -288,13 +296,35 @@ def display_results_grid(
     plt.show()
 
 
-def process_image_with_mask(estimator, image_path: str, mask_path: str, idx_path, idx_dict, mhr_shape_scale_dict, occ_dict, batch_kps=None, kps_id=None, cam_int=None, iou_dict=None, predictor=None):
+def process_image_with_mask(
+    estimator,
+    image_path: str,
+    mask_path: str,
+    idx_path,
+    idx_dict,
+    mhr_shape_scale_dict,
+    occ_dict,
+    batch_kps=None,
+    kps_id=None,
+    cam_int=None,
+    iou_dict=None,
+    predictor=None,
+    completion_cache=None,
+    mask_frames=None,
+    image_cache=None,
+    cam_int_cache=None,
+):
     """
     Process image with external mask input.
 
     Note: The refactored code requires bboxes to be provided along with masks.
     This function automatically computes bboxes from the mask.
     """
+    del iou_dict, predictor
+
+    completion_cache = completion_cache or {}
+    idx_path = idx_path or {}
+    idx_dict = idx_dict or {}
     n_frames = len(image_path)
     obj_ids = sorted(map(int, occ_dict.keys()))
     empty_dict = {}
@@ -318,12 +348,17 @@ def process_image_with_mask(estimator, image_path: str, mask_path: str, idx_path
         _occ_image_batch_ori = []
         _occ_id_batch = []
         _occ_empty_frame_list = []
+        no_occ_outputs = []
+        _occ_outputs = []
 
         occ_idx = occ_dict[obj_id]
         # for each frame:
         for i in range(n_frames):
             # Load mask
-            mask = np.array(Image.open(mask_path[i]).convert('P'))
+            if mask_frames is not None:
+                mask = np.array(mask_frames[i], copy=True)
+            else:
+                mask = np.array(Image.open(mask_path[i]).convert('P'))
 
             no_occ_mask_list = []
             no_occ_bbox_list = []
@@ -335,10 +370,17 @@ def process_image_with_mask(estimator, image_path: str, mask_path: str, idx_path
             _occ_id_current = []
 
             if occ_idx[i] == 0:
-                if kps_id is not None:
-                    mask_com = np.array(Image.open(os.path.join(idx_path[obj_id]['masks'], f"{kps_id[0]:08d}.png")).convert('P'))     
+                completion_frame_idx = int(kps_id[0]) if kps_id is not None else int(i)
+                completion_entry = completion_cache.get(obj_id, {})
+                completion_masks = completion_entry.get("masks", {})
+                completion_images = completion_entry.get("images", {})
+
+                if completion_frame_idx in completion_masks:
+                    mask_com = np.array(completion_masks[completion_frame_idx], copy=True)
                 else:
-                    mask_com = np.array(Image.open(os.path.join(idx_path[obj_id]['masks'], f"{i:08d}.png")).convert('P')) 
+                    mask_com = np.array(
+                        Image.open(os.path.join(idx_path[obj_id]['masks'], f"{completion_frame_idx:08d}.png")).convert('P')
+                    )
                 zero_mask = np.zeros_like(mask_com)
                 zero_mask[mask_com==obj_id] = 255
                 mask_binary = zero_mask.astype(np.uint8)
@@ -366,7 +408,10 @@ def process_image_with_mask(estimator, image_path: str, mask_path: str, idx_path
                     mask_binary = np.stack(_occ_mask_list, axis=0)
                     # Process with external mask and computed bbox
                     # Note: The mask needs to match the number of bboxes (1 bbox -> 1 mask)
-                    _occ_image_batch.append(os.path.join(idx_path[obj_id]['images'], f"{i:08d}.jpg"))
+                    if completion_frame_idx in completion_images:
+                        _occ_image_batch.append(np.array(completion_images[completion_frame_idx], copy=True))
+                    else:
+                        _occ_image_batch.append(os.path.join(idx_path[obj_id]['images'], f"{completion_frame_idx:08d}.jpg"))
                     _occ_image_batch_ori.append(image_path[i])
                     _occ_mask_batch.append(mask_binary)
                     _occ_bbox_batch.append(bbox)
@@ -432,9 +477,40 @@ def process_image_with_mask(estimator, image_path: str, mask_path: str, idx_path
             _occ_kps_batch = None
 
         if len(no_occ_image_batch) > 0:
-            no_occ_outputs = estimator.process_frames(no_occ_image_batch, bboxes=no_occ_bbox_batch, masks=no_occ_mask_batch, id_batch=[[1] for idb in range(len(no_occ_image_batch))], idx_path={}, idx_dict={}, mhr_shape_scale_dict=mhr_shape_scale_dict, kps_batch=no_occ_kps_batch, occ_dict=None, use_mask=True, kps_id=kps_id, cam_int=cam_int)
+            no_occ_outputs = estimator.process_frames(
+                no_occ_image_batch,
+                bboxes=no_occ_bbox_batch,
+                masks=no_occ_mask_batch,
+                id_batch=[[1] for idb in range(len(no_occ_image_batch))],
+                idx_path={},
+                idx_dict={},
+                mhr_shape_scale_dict=mhr_shape_scale_dict,
+                kps_batch=no_occ_kps_batch,
+                occ_dict=None,
+                use_mask=True,
+                kps_id=kps_id,
+                cam_int=cam_int,
+                image_cache=image_cache,
+                cam_int_cache=cam_int_cache,
+            )
         if len(_occ_image_batch) > 0:
-            _occ_outputs = estimator.process_frames(_occ_image_batch, bboxes=_occ_bbox_batch, masks=_occ_mask_batch, id_batch=[[1] for idb in range(len(_occ_image_batch))], idx_path={}, idx_dict={}, mhr_shape_scale_dict=mhr_shape_scale_dict, kps_batch=_occ_kps_batch, occ_dict=None, use_mask=True, kps_id=kps_id, _occ_image_batch_ori=_occ_image_batch_ori, cam_int=cam_int)
+            _occ_outputs = estimator.process_frames(
+                _occ_image_batch,
+                bboxes=_occ_bbox_batch,
+                masks=_occ_mask_batch,
+                id_batch=[[1] for idb in range(len(_occ_image_batch))],
+                idx_path={},
+                idx_dict={},
+                mhr_shape_scale_dict=mhr_shape_scale_dict,
+                kps_batch=_occ_kps_batch,
+                occ_dict=None,
+                use_mask=True,
+                kps_id=kps_id,
+                _occ_image_batch_ori=_occ_image_batch_ori,
+                cam_int=cam_int,
+                image_cache=image_cache,
+                cam_int_cache=cam_int_cache,
+            )
         
         oid_outputs = []
         ia, ib = 0, 0

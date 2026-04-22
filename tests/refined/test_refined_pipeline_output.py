@@ -62,6 +62,31 @@ class RefinedOutputLayoutTests(unittest.TestCase):
             for rel_path in expected:
                 self.assertTrue(os.path.isdir(os.path.join(tmpdir, rel_path)), rel_path)
 
+    def test_prepare_output_dirs_skips_disabled_optional_directories(self):
+        from scripts.offline_app_refined import prepare_output_dirs
+
+        with make_workspace_tempdir() as tmpdir:
+            prepare_output_dirs(
+                tmpdir,
+                [1, 2],
+                save_debug_metrics=False,
+                storage_options={
+                    "save_rendered_frames": False,
+                    "save_rendered_frames_individual": False,
+                    "save_mesh_4d_individual": False,
+                    "save_focal_4d_individual": True,
+                },
+            )
+
+            self.assertTrue(os.path.isdir(os.path.join(tmpdir, "images")))
+            self.assertTrue(os.path.isdir(os.path.join(tmpdir, "masks_raw")))
+            self.assertTrue(os.path.isdir(os.path.join(tmpdir, "masks_refined")))
+            self.assertFalse(os.path.isdir(os.path.join(tmpdir, "rendered_frames")))
+            self.assertFalse(os.path.isdir(os.path.join(tmpdir, "rendered_frames_individual")))
+            self.assertFalse(os.path.isdir(os.path.join(tmpdir, "mesh_4d_individual")))
+            self.assertTrue(os.path.isdir(os.path.join(tmpdir, "focal_4d_individual", "1")))
+            self.assertTrue(os.path.isdir(os.path.join(tmpdir, "focal_4d_individual", "2")))
+
     def test_write_chunk_manifest_persists_json_records(self):
         from scripts.offline_app_refined import write_chunk_manifest
 
