@@ -23,6 +23,56 @@ def make_workspace_tempdir():
 
 
 class Run4DFromCacheTests(unittest.TestCase):
+    def test_parser_accepts_cache_root_mode(self):
+        from scripts.run_4d_from_cache import build_parser
+
+        parser = build_parser()
+        args = parser.parse_args(["--cache_root", "/tmp/sam3_cache"])
+
+        self.assertIsNone(args.cache_dir)
+        self.assertEqual(args.cache_root, "/tmp/sam3_cache")
+        self.assertIsNone(args.output_root)
+        self.assertFalse(args.overwrite)
+
+    def test_build_cache_runtime_restores_completion_safety_profile(self):
+        from scripts.run_4d_from_cache import build_cache_runtime
+
+        runtime = build_cache_runtime(
+            {
+                "obj_ids": [1, 2],
+                "fps": 30.0,
+                "runtime_profile": {
+                    "batch_size": 8,
+                    "detection_resolution": [192, 384],
+                    "completion_resolution": [256, 512],
+                    "completion_batch_size": 1,
+                    "completion_decode_chunk_size": 2,
+                    "max_occ_len": 8,
+                    "smpl_export": True,
+                },
+            },
+            runtime_defaults={
+                "batch_size": 64,
+                "detection_resolution": [256, 512],
+                "completion_resolution": [512, 1024],
+                "completion_batch_size": 3,
+                "completion_decode_chunk_size": 5,
+                "max_occ_len": 25,
+                "smpl_export": False,
+                "video_fps": 24.0,
+            },
+        )
+
+        self.assertEqual(runtime["out_obj_ids"], [1, 2])
+        self.assertEqual(runtime["batch_size"], 8)
+        self.assertEqual(runtime["detection_resolution"], [192, 384])
+        self.assertEqual(runtime["completion_resolution"], [256, 512])
+        self.assertEqual(runtime["completion_batch_size"], 1)
+        self.assertEqual(runtime["completion_decode_chunk_size"], 2)
+        self.assertEqual(runtime["max_occ_len"], 8)
+        self.assertTrue(runtime["smpl_export"])
+        self.assertEqual(runtime["video_fps"], 30.0)
+
     def test_run_cache_sample_restores_runtime_profile_and_writes_to_outputs_root(self):
         from scripts.run_4d_from_cache import run_cache_sample
 
@@ -46,8 +96,11 @@ class Run4DFromCacheTests(unittest.TestCase):
                         "obj_ids": [1],
                         "runtime_profile": {
                             "batch_size": 8,
-                            "detection_resolution": [256, 512],
-                            "completion_resolution": [512, 1024],
+                            "detection_resolution": [192, 384],
+                            "completion_resolution": [256, 512],
+                            "completion_batch_size": 1,
+                            "completion_decode_chunk_size": 2,
+                            "max_occ_len": 8,
                             "smpl_export": False,
                         },
                         "config_path": "configs/body4d.yaml",
@@ -85,7 +138,11 @@ class Run4DFromCacheTests(unittest.TestCase):
             self.assertEqual(context.input_dir, cache_dir)
             self.assertEqual(context.output_dir, os.path.join(output_root, "demo"))
             self.assertEqual(context.runtime["batch_size"], 8)
-            self.assertEqual(context.runtime["completion_resolution"], [512, 1024])
+            self.assertEqual(context.runtime["detection_resolution"], [192, 384])
+            self.assertEqual(context.runtime["completion_resolution"], [256, 512])
+            self.assertEqual(context.runtime["completion_batch_size"], 1)
+            self.assertEqual(context.runtime["completion_decode_chunk_size"], 2)
+            self.assertEqual(context.runtime["max_occ_len"], 8)
 
     def test_run_cache_sample_provides_frame_writer_for_pose_exports(self):
         from scripts.run_4d_from_cache import run_cache_sample
@@ -253,6 +310,32 @@ class Run4DFromCacheTests(unittest.TestCase):
         self.assertEqual(results[0]["output"], "/tmp/out_a.mp4")
         self.assertEqual(results[1]["status"], "failed")
         self.assertIn("boom", results[1]["error"])
+
+    def test_main_uses_run_cache_batch_for_cache_root(self):
+        from scripts import run_4d_from_cache
+
+        with patch(
+            "scripts.run_4d_from_cache.run_cache_batch",
+            return_value=[{"cache_dir": "/tmp/sam3_cache/demo", "status": "completed"}],
+        ) as mock_batch, patch(
+            "sys.argv",
+            [
+                "run_4d_from_cache.py",
+                "--cache_root",
+                "/tmp/sam3_cache",
+                "--output_root",
+                "/tmp/outputs_4d",
+                "--overwrite",
+            ],
+        ):
+            run_4d_from_cache.main()
+
+        mock_batch.assert_called_once_with(
+            "/tmp/sam3_cache",
+            output_root="/tmp/outputs_4d",
+            overwrite=True,
+            config_path=None,
+        )
 
 
 if __name__ == "__main__":

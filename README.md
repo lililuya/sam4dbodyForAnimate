@@ -109,6 +109,11 @@ The exported cache is written under `<runtime.output_dir>/sam3_cache/<sample_id>
 python scripts/run_4d_from_cache.py --cache_dir <path/to/sam3_cache/sample_id>
 ```
 
+Or run every exported sample under a cache root:
+```bash
+python scripts/run_4d_from_cache.py --cache_root <path/to/sam3_cache>
+```
+
 Useful options:
 - `--output_root <path>` writes results under a custom root instead of the default config-derived location
 - `--config <path>` overrides the config path stored in `meta.json`

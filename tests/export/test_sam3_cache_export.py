@@ -140,6 +140,9 @@ class Sam3CacheExportTests(unittest.TestCase):
             "batch_size": 8,
             "detection_resolution": [256, 512],
             "completion_resolution": [512, 1024],
+            "completion_batch_size": 1,
+            "completion_decode_chunk_size": 2,
+            "max_occ_len": 8,
             "smpl_export": False,
             "video_fps": 24.0,
             "prompt_log": {
@@ -160,6 +163,9 @@ class Sam3CacheExportTests(unittest.TestCase):
         self.assertEqual(payload["runtime_profile"]["batch_size"], 8)
         self.assertEqual(payload["runtime_profile"]["detection_resolution"], [256, 512])
         self.assertEqual(payload["runtime_profile"]["completion_resolution"], [512, 1024])
+        self.assertEqual(payload["runtime_profile"]["completion_batch_size"], 1)
+        self.assertEqual(payload["runtime_profile"]["completion_decode_chunk_size"], 2)
+        self.assertEqual(payload["runtime_profile"]["max_occ_len"], 8)
         self.assertEqual(payload["runtime_profile"]["smpl_export"], False)
         self.assertEqual(payload["runtime_profile"]["fps"], 24.0)
         self.assertEqual(payload["prompt_log"]["1"]["frames"]["0"]["labels"], [1])
