@@ -24,6 +24,21 @@ runtime:
   save_mesh_4d_individual: true
   save_focal_4d_individual: true
 
+wan_export:
+  enable: false
+  fps: 25
+  resolution_area: [512, 768]
+  face_resolution: [512, 512]
+  min_track_frames: 16
+  min_valid_face_ratio: 0.60
+  face_expand: 1.30
+  face_gap: 8
+  mask_kernel_size: 7
+  mask_iterations: 3
+  mask_w_len: 10
+  mask_h_len: 20
+  save_pose_meta_json: true
+
 completion:
   enable: true
   detection_resolution: [256, 512]

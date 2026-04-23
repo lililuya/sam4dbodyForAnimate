@@ -556,6 +556,11 @@ def run_4d_pipeline_from_context(context):
     if cam_int_hits > 0 or cam_int_misses > 0:
         print(f"cam_int cache: {cam_int_misses} misses, {cam_int_hits} hits")
 
+    frame_writer = getattr(context, "frame_writer", None)
+    finalize = getattr(frame_writer, "finalize", None)
+    if callable(finalize):
+        finalize()
+
     if not save_rendered_frames:
         return None
 

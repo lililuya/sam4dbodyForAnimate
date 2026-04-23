@@ -412,6 +412,12 @@ class RefinedCliTests(unittest.TestCase):
                     "save_mesh_4d_individual": True,
                     "save_focal_4d_individual": False,
                 },
+                "wan_export": {
+                    "enable": True,
+                    "fps": 25,
+                    "resolution_area": [512, 768],
+                    "face_resolution": [512, 512],
+                },
                 "sam_3d_body": {"batch_size": 12},
                 "completion": {
                     "detection_resolution": [192, 384],
@@ -439,6 +445,15 @@ class RefinedCliTests(unittest.TestCase):
         self.assertFalse(runtime_app.RUNTIME["save_rendered_frames_individual"])
         self.assertTrue(runtime_app.RUNTIME["save_mesh_4d_individual"])
         self.assertFalse(runtime_app.RUNTIME["save_focal_4d_individual"])
+        self.assertEqual(
+            runtime_app.RUNTIME["wan_export"],
+            {
+                "enable": True,
+                "fps": 25,
+                "resolution_area": [512, 768],
+                "face_resolution": [512, 512],
+            },
+        )
 
     def test_iter_chunks_yields_stable_chunk_metadata(self):
         from scripts.offline_app_refined import RefinedOfflineApp

@@ -28,6 +28,31 @@ runtime:
   save_mesh_4d_individual: true
   save_focal_4d_individual: true
 
+wan_export:
+  # Optional WanAnimate-style per-track export from the refined offline batch path.
+  enable: false
+  # WanAnimate-compatible sampling/output fps.
+  fps: 25
+  # Resize each exported frame by target area and keep the final canvas 16-aligned.
+  resolution_area: [512, 768]
+  # Face crops are written as square clips.
+  face_resolution: [512, 512]
+  # Skip short tracks to avoid low-value training samples.
+  min_track_frames: 16
+  # Require enough usable face detections after temporal gap fill.
+  min_valid_face_ratio: 0.60
+  # Expand the detected face crop roughly in line with WanAnimate preprocessing.
+  face_expand: 1.30
+  # Fill short face-detection gaps with the previous valid target face box.
+  face_gap: 8
+  # Mask augmentation settings for src_mask.mp4. Background export still only removes the raw target body region.
+  mask_kernel_size: 7
+  mask_iterations: 3
+  mask_w_len: 10
+  mask_h_len: 20
+  # Save per-frame Wan pose metadata jsons alongside the videos.
+  save_pose_meta_json: true
+
 completion:
   # Keep completion enabled, but use a small temporal footprint for VRAM safety.
   enable: true

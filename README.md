@@ -305,6 +305,50 @@ Key properties of this batch runner:
 
 For resumable runs, use `--skip_existing`; it relies on `debug_metrics/sample_summary.json` from runs where debug metrics are enabled. For large batches where you want failure isolation, add `--continue_on_error`.
 
+## WanAnimate Export From Refined Offline Batch
+
+This branch also supports WanAnimate-style per-track export on top of the refined offline batch pipeline.
+
+Install the optional face-export dependencies:
+
+```bash
+pip install -e .[wan-export]
+```
+
+Enable the exporter in your refined config:
+
+```yaml
+wan_export:
+  enable: true
+```
+
+Then run the refined batch pipeline as usual:
+
+```bash
+python scripts/offline_batch_refined.py \
+  --input_root /path/to/videos \
+  --output_dir /path/to/outputs_refined \
+  --config configs/body4d_refined_low_memory.yaml \
+  --skip_existing \
+  --continue_on_error
+```
+
+Each refined sample can emit one Wan training sample per tracked person under:
+
+```text
+<sample_output>/wan_export/<sample_id>_track_<track_id>/
+```
+
+That directory contains:
+- `target.mp4`
+- `src_pose.mp4`
+- `src_face.mp4`
+- `src_bg.mp4`
+- `src_mask.mp4`
+- `src_ref.png`
+- `meta.json`
+- `pose_meta_json/*.json` when `wan_export.save_pose_meta_json: true`
+
 ## Offline Export Run
 
 Run the export-focused offline pipeline:

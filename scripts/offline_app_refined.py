@@ -161,6 +161,7 @@ def build_runtime_storage_options(cfg) -> Dict[str, object]:
         "save_mesh_4d_individual": bool(cfg_get(cfg, "runtime.save_mesh_4d_individual", True)),
         "save_focal_4d_individual": bool(cfg_get(cfg, "runtime.save_focal_4d_individual", True)),
         "pose_exports": list(cfg_get(cfg, "runtime.pose_exports", []) or []),
+        "wan_export": to_plain_runtime_dict(cfg_get(cfg, "wan_export", {})),
     }
 
 
@@ -228,6 +229,14 @@ def write_debug_json(debug_dir: str, filename: str, payload) -> None:
 
 def clone_runtime_config(cfg):
     return OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+
+
+def to_plain_runtime_dict(value) -> dict:
+    if value is None:
+        return {}
+    if OmegaConf.is_config(value):
+        return OmegaConf.to_container(value, resolve=False) or {}
+    return dict(value)
 
 
 def apply_sample_runtime_profile(cfg, runtime_profile: Optional[dict]) -> dict:
@@ -478,6 +487,9 @@ class RefinedOfflineApp:
         )
         runtime_app.RUNTIME["pose_exports"] = list(
             cfg_get(self.CONFIG, "runtime.pose_exports", runtime_app.RUNTIME.get("pose_exports", [])) or []
+        )
+        runtime_app.RUNTIME["wan_export"] = to_plain_runtime_dict(
+            cfg_get(self.CONFIG, "wan_export", runtime_app.RUNTIME.get("wan_export", {}))
         )
         runtime_app.RUNTIME["save_rendered_frames"] = bool(
             cfg_get(self.CONFIG, "runtime.save_rendered_frames", runtime_app.RUNTIME.get("save_rendered_frames", True))
