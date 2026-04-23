@@ -4,6 +4,16 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+    return bool(value)
+
+
 @dataclass(frozen=True)
 class WanExportConfig:
     enable: bool = False
@@ -24,7 +34,7 @@ class WanExportConfig:
     def from_runtime(cls, runtime: Mapping[str, Any] | None) -> "WanExportConfig":
         payload = dict(runtime or {})
         return cls(
-            enable=bool(payload.get("enable", False)),
+            enable=_coerce_bool(payload.get("enable", False)),
             fps=int(payload.get("fps", 25)),
             resolution_area=tuple(int(value) for value in payload.get("resolution_area", (512, 768))),
             face_resolution=tuple(int(value) for value in payload.get("face_resolution", (512, 512))),
@@ -36,5 +46,5 @@ class WanExportConfig:
             mask_iterations=int(payload.get("mask_iterations", 3)),
             mask_w_len=int(payload.get("mask_w_len", 10)),
             mask_h_len=int(payload.get("mask_h_len", 20)),
-            save_pose_meta_json=bool(payload.get("save_pose_meta_json", True)),
+            save_pose_meta_json=_coerce_bool(payload.get("save_pose_meta_json", True)),
         )

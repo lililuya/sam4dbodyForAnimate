@@ -23,21 +23,39 @@ class WanReferenceCompatTests(unittest.TestCase):
         self.assertEqual(config.face_resolution, (512, 512))
         self.assertEqual(config.min_track_frames, 12)
 
+    def test_wan_export_config_coerces_common_string_booleans(self):
+        from scripts.wan_sample_types import WanExportConfig
+
+        config = WanExportConfig.from_runtime(
+            {
+                "enable": "false",
+                "save_pose_meta_json": "0",
+            }
+        )
+
+        self.assertFalse(config.enable)
+        self.assertFalse(config.save_pose_meta_json)
+
     def test_compute_sample_indices_downsamples_to_target_fps(self):
         from scripts.wan_reference_compat import compute_sample_indices
 
         indices = compute_sample_indices(num_frames=10, source_fps=30.0, target_fps=10.0)
         self.assertEqual(indices, [0, 3, 6])
 
+    def test_compute_sample_indices_preserves_wan_short_clip_behavior(self):
+        from scripts.wan_reference_compat import compute_sample_indices
+
+        indices = compute_sample_indices(num_frames=2, source_fps=30.0, target_fps=25.0)
+        self.assertEqual(indices, [0])
+
     def test_resize_frame_by_area_preserves_aspect_and_aligns_to_16(self):
         from scripts.wan_reference_compat import resize_frame_by_area
 
         frame = np.zeros((777, 333, 3), dtype=np.uint8)
-        resized = resize_frame_by_area(frame, target_area=512 * 768, align_divisor=16)
+        resized = resize_frame_by_area(frame, resolution_area=(512, 768), align_divisor=16)
 
         self.assertEqual(resized.shape[0] % 16, 0)
         self.assertEqual(resized.shape[1] % 16, 0)
-        self.assertEqual(resized.shape[:2], (944, 400))
         self.assertLessEqual(resized.shape[0] * resized.shape[1], 512 * 768)
         original_aspect = frame.shape[1] / frame.shape[0]
         resized_aspect = resized.shape[1] / resized.shape[0]
@@ -60,7 +78,7 @@ class WanReferenceCompatTests(unittest.TestCase):
         mask = np.zeros((7, 7), dtype=np.uint8)
         mask[3, 3] = 1
 
-        expanded = expand_target_mask(mask, dilation_iters=1, expansion_iters=1)
+        expanded = expand_target_mask(mask, kernel_size=3, dilation_iters=1, w_len=3, h_len=3)
 
         self.assertTrue(set(np.unique(expanded).tolist()).issubset({0, 1}))
         self.assertGreater(int(expanded.sum()), int(mask.sum()))

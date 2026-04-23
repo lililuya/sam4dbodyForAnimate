@@ -12,6 +12,7 @@ def compute_sample_indices(num_frames: int, source_fps: float, target_fps: float
     if source_fps <= 0 or target_fps <= 0:
         return list(range(int(num_frames)))
 
+    # Match WanAnimate's current target_num/timestamp rounding behavior.
     target_num = int(float(num_frames) / float(source_fps) * float(target_fps))
     if target_num <= 0:
         return [0]
@@ -22,8 +23,21 @@ def compute_sample_indices(num_frames: int, source_fps: float, target_fps: float
     return indices.tolist()
 
 
-def resize_frame_by_area(frame: np.ndarray, target_area: int, align_divisor: int = 16) -> np.ndarray:
+def _resolve_target_area(resolution_area: int | tuple[int, int] | list[int]) -> int:
+    if isinstance(resolution_area, (tuple, list)):
+        if len(resolution_area) != 2:
+            raise ValueError("resolution_area must contain exactly two values")
+        return int(resolution_area[0]) * int(resolution_area[1])
+    return int(resolution_area)
+
+
+def resize_frame_by_area(
+    frame: np.ndarray,
+    resolution_area: int | tuple[int, int] | list[int],
+    align_divisor: int = 16,
+) -> np.ndarray:
     height, width = frame.shape[:2]
+    target_area = _resolve_target_area(resolution_area)
     aspect_ratio = float(width) / float(max(height, 1))
     aligned_height_float = math.sqrt(float(target_area) / max(aspect_ratio, 1e-6))
     aligned_width_float = float(target_area) / max(aligned_height_float, 1e-6)
@@ -47,32 +61,26 @@ def dilate_target_mask(mask: np.ndarray, kernel_size: int = 7, iterations: int =
 
 def expand_target_mask(
     mask: np.ndarray,
-    dilation_iters: int = 1,
-    expansion_iters: int = 1,
     *,
-    w_len: int | None = None,
-    h_len: int | None = None,
+    kernel_size: int = 3,
+    dilation_iters: int = 1,
+    w_len: int = 10,
+    h_len: int = 20,
 ) -> np.ndarray:
-    expanded = dilate_target_mask(mask, kernel_size=3, iterations=max(int(dilation_iters), 0))
+    expanded = dilate_target_mask(mask, kernel_size=kernel_size, iterations=max(int(dilation_iters), 0))
+    ys, xs = np.nonzero(expanded)
+    if len(xs) == 0 or len(ys) == 0:
+        return expanded
 
-    if w_len is not None and h_len is not None:
-        ys, xs = np.nonzero(expanded)
-        if len(xs) == 0 or len(ys) == 0:
-            return expanded
+    x_min, x_max = int(xs.min()), int(xs.max())
+    y_min, y_max = int(ys.min()), int(ys.max())
+    w_slice = max(1, int((x_max - x_min + 1) / max(int(w_len), 1)))
+    h_slice = max(1, int((y_max - y_min + 1) / max(int(h_len), 1)))
 
-        x_min, x_max = int(xs.min()), int(xs.max())
-        y_min, y_max = int(ys.min()), int(ys.max())
-        w_slice = max(1, int((x_max - x_min + 1) / max(int(w_len), 1)))
-        h_slice = max(1, int((y_max - y_min + 1) / max(int(h_len), 1)))
-
-        for x_start in range(x_min, x_max + 1, w_slice):
-            x_end = min(x_start + w_slice, x_max + 1)
-            for y_start in range(y_min, y_max + 1, h_slice):
-                y_end = min(y_start + h_slice, y_max + 1)
-                if expanded[y_start:y_end, x_start:x_end].sum() > 0:
-                    expanded[y_start:y_end, x_start:x_end] = 1
-        return expanded.astype(np.uint8)
-
-    if int(expansion_iters) > 0:
-        expanded = dilate_target_mask(expanded, kernel_size=3, iterations=int(expansion_iters))
+    for x_start in range(x_min, x_max + 1, w_slice):
+        x_end = min(x_start + w_slice, x_max + 1)
+        for y_start in range(y_min, y_max + 1, h_slice):
+            y_end = min(y_start + h_slice, y_max + 1)
+            if expanded[y_start:y_end, x_start:x_end].sum() > 0:
+                expanded[y_start:y_end, x_start:x_end] = 1
     return expanded.astype(np.uint8)
