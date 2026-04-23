@@ -67,7 +67,24 @@ def _mask_overlap(mask: np.ndarray, bbox: tuple[int, int, int, int]) -> float:
         return 0.0
 
     crop = mask[y1:y2, x1:x2]
-    return float((crop > 0).sum()) / float(crop.size)
+    total_mask_area = float((mask > 0).sum())
+    if total_mask_area <= 0:
+        return 0.0
+    return float((crop > 0).sum()) / total_mask_area
+
+
+def _resolve_head_anchor(target_mask: np.ndarray, body_keypoints: np.ndarray) -> np.ndarray:
+    if body_keypoints.ndim == 2 and len(body_keypoints) > 0 and body_keypoints.shape[1] >= 2:
+        head_anchor = body_keypoints[0, :2].astype(np.float32).copy()
+        if head_anchor.max(initial=0.0) <= 1.0:
+            head_anchor[0] *= float(target_mask.shape[1])
+            head_anchor[1] *= float(target_mask.shape[0])
+        return head_anchor
+
+    ys, xs = np.nonzero(target_mask > 0)
+    if len(xs) > 0 and len(ys) > 0:
+        return np.array([float(xs.mean()), float(ys.mean())], dtype=np.float32)
+    return np.array([target_mask.shape[1] / 2.0, target_mask.shape[0] / 2.0], dtype=np.float32)
 
 
 def select_target_face(detections, target_mask: np.ndarray, body_keypoints: np.ndarray, previous_bbox=None):
@@ -75,10 +92,7 @@ def select_target_face(detections, target_mask: np.ndarray, body_keypoints: np.n
         return None
 
     body_keypoints = np.asarray(body_keypoints, dtype=np.float32)
-    head_anchor = body_keypoints[0, :2].copy()
-    if head_anchor.max(initial=0.0) <= 1.0:
-        head_anchor[0] *= float(target_mask.shape[1])
-        head_anchor[1] *= float(target_mask.shape[0])
+    head_anchor = _resolve_head_anchor(target_mask, body_keypoints)
 
     best_detection = None
     best_score = None
@@ -98,8 +112,8 @@ def select_target_face(detections, target_mask: np.ndarray, body_keypoints: np.n
 def fill_face_gaps(sequence, max_gap: int):
     filled = list(sequence)
     gap_start = None
-    for index in range(len(filled) + 1):
-        current = None if index == len(filled) else filled[index]
+    for index in range(len(filled)):
+        current = filled[index]
         if current is None:
             if gap_start is None:
                 gap_start = index
@@ -113,6 +127,13 @@ def fill_face_gaps(sequence, max_gap: int):
             for fill_index in range(gap_start, index):
                 filled[fill_index] = previous
         gap_start = None
+
+    if gap_start is not None:
+        previous = filled[gap_start - 1] if gap_start > 0 else None
+        gap_length = len(filled) - gap_start
+        if previous is not None and gap_length <= int(max_gap):
+            for fill_index in range(gap_start, len(filled)):
+                filled[fill_index] = previous
     return filled
 
 
