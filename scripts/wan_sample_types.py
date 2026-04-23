@@ -14,6 +14,16 @@ def _coerce_bool(value: Any) -> bool:
     return bool(value)
 
 
+def _coerce_pair(value: Any, default: tuple[int, int], field_name: str) -> tuple[int, int]:
+    if value is None:
+        return default
+
+    pair = tuple(int(item) for item in value)
+    if len(pair) != 2:
+        raise ValueError(f"{field_name} must contain exactly two values")
+    return pair
+
+
 @dataclass(frozen=True)
 class WanExportConfig:
     enable: bool = False
@@ -36,8 +46,8 @@ class WanExportConfig:
         return cls(
             enable=_coerce_bool(payload.get("enable", False)),
             fps=int(payload.get("fps", 25)),
-            resolution_area=tuple(int(value) for value in payload.get("resolution_area", (512, 768))),
-            face_resolution=tuple(int(value) for value in payload.get("face_resolution", (512, 512))),
+            resolution_area=_coerce_pair(payload.get("resolution_area"), (512, 768), "resolution_area"),
+            face_resolution=_coerce_pair(payload.get("face_resolution"), (512, 512), "face_resolution"),
             min_track_frames=int(payload.get("min_track_frames", 16)),
             min_valid_face_ratio=float(payload.get("min_valid_face_ratio", 0.60)),
             face_expand=float(payload.get("face_expand", 1.30)),

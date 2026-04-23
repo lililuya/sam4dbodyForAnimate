@@ -36,6 +36,15 @@ class WanReferenceCompatTests(unittest.TestCase):
         self.assertFalse(config.enable)
         self.assertFalse(config.save_pose_meta_json)
 
+    def test_wan_export_config_validates_pair_lengths(self):
+        from scripts.wan_sample_types import WanExportConfig
+
+        with self.assertRaises(ValueError):
+            WanExportConfig.from_runtime({"resolution_area": [512]})
+
+        with self.assertRaises(ValueError):
+            WanExportConfig.from_runtime({"face_resolution": [512, 512, 512]})
+
     def test_compute_sample_indices_downsamples_to_target_fps(self):
         from scripts.wan_reference_compat import compute_sample_indices
 
@@ -73,15 +82,28 @@ class WanReferenceCompatTests(unittest.TestCase):
         self.assertGreater(int(dilated.sum()), int(mask.sum()))
 
     def test_expand_target_mask_is_binary_and_expands(self):
-        from scripts.wan_reference_compat import expand_target_mask
+        from scripts.wan_reference_compat import dilate_target_mask, expand_target_mask
 
-        mask = np.zeros((7, 7), dtype=np.uint8)
-        mask[3, 3] = 1
+        mask = np.zeros((9, 9), dtype=np.uint8)
+        mask[2, 2] = 1
+        mask[2, 6] = 1
+        dilated = dilate_target_mask(mask, kernel_size=1, iterations=1)
 
-        expanded = expand_target_mask(mask, kernel_size=3, dilation_iters=1, w_len=3, h_len=3)
+        expanded = expand_target_mask(dilated, w_len=2, h_len=2)
 
         self.assertTrue(set(np.unique(expanded).tolist()).issubset({0, 1}))
-        self.assertGreater(int(expanded.sum()), int(mask.sum()))
+        self.assertGreater(int(expanded.sum()), int(dilated.sum()))
+
+    def test_expand_target_mask_does_not_apply_hidden_extra_dilation(self):
+        from scripts.wan_reference_compat import dilate_target_mask, expand_target_mask
+
+        mask = np.zeros((9, 9), dtype=np.uint8)
+        mask[3:6, 3:6] = 1
+        dilated = dilate_target_mask(mask, kernel_size=3, iterations=1)
+
+        expanded = expand_target_mask(dilated, w_len=9, h_len=9)
+
+        np.testing.assert_array_equal(expanded, dilated)
 
 
 if __name__ == "__main__":

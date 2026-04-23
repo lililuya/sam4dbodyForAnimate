@@ -62,12 +62,10 @@ def dilate_target_mask(mask: np.ndarray, kernel_size: int = 7, iterations: int =
 def expand_target_mask(
     mask: np.ndarray,
     *,
-    kernel_size: int = 3,
-    dilation_iters: int = 1,
     w_len: int = 10,
     h_len: int = 20,
 ) -> np.ndarray:
-    expanded = dilate_target_mask(mask, kernel_size=kernel_size, iterations=max(int(dilation_iters), 0))
+    expanded = (np.asarray(mask, dtype=np.uint8) > 0).astype(np.uint8).copy()
     ys, xs = np.nonzero(expanded)
     if len(xs) == 0 or len(ys) == 0:
         return expanded
