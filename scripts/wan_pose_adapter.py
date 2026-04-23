@@ -12,8 +12,8 @@ WAN_BODY_FROM_OPENPOSE25 = [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 1
 
 def _normalize_xyc(points: np.ndarray, width: int, height: int) -> np.ndarray:
     normalized = np.zeros((points.shape[0], 3), dtype=np.float32)
-    normalized[:, 0] = points[:, 0] / float(max(width, 1))
-    normalized[:, 1] = points[:, 1] / float(max(height, 1))
+    normalized[:, 0] = np.clip(points[:, 0] / float(max(width, 1)), 0.0, 1.0)
+    normalized[:, 1] = np.clip(points[:, 1] / float(max(height, 1)), 0.0, 1.0)
     normalized[:, 2] = points[:, 2]
     return normalized
 
@@ -24,8 +24,8 @@ def _extract_hand(keypoints_2d, indices, width: int, height: int) -> np.ndarray:
     for output_index, source_index in enumerate(indices):
         if source_index >= len(keypoints_2d):
             continue
-        hand[output_index, 0] = keypoints_2d[source_index, 0] / float(max(width, 1))
-        hand[output_index, 1] = keypoints_2d[source_index, 1] / float(max(height, 1))
+        hand[output_index, 0] = np.clip(keypoints_2d[source_index, 0] / float(max(width, 1)), 0.0, 1.0)
+        hand[output_index, 1] = np.clip(keypoints_2d[source_index, 1] / float(max(height, 1)), 0.0, 1.0)
         hand[output_index, 2] = 1.0
     return hand
 
