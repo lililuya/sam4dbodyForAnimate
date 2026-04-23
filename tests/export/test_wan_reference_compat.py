@@ -27,16 +27,18 @@ class WanReferenceCompatTests(unittest.TestCase):
         from scripts.wan_reference_compat import compute_sample_indices
 
         indices = compute_sample_indices(num_frames=10, source_fps=30.0, target_fps=10.0)
-        self.assertEqual(indices, [0, 3, 6, 9])
+        self.assertEqual(indices, [0, 3, 6])
 
     def test_resize_frame_by_area_preserves_aspect_and_aligns_to_16(self):
         from scripts.wan_reference_compat import resize_frame_by_area
 
-        frame = np.zeros((120, 200, 3), dtype=np.uint8)
-        resized = resize_frame_by_area(frame, target_area=128 * 128, align_divisor=16)
+        frame = np.zeros((777, 333, 3), dtype=np.uint8)
+        resized = resize_frame_by_area(frame, target_area=512 * 768, align_divisor=16)
 
         self.assertEqual(resized.shape[0] % 16, 0)
         self.assertEqual(resized.shape[1] % 16, 0)
+        self.assertEqual(resized.shape[:2], (944, 400))
+        self.assertLessEqual(resized.shape[0] * resized.shape[1], 512 * 768)
         original_aspect = frame.shape[1] / frame.shape[0]
         resized_aspect = resized.shape[1] / resized.shape[0]
         self.assertLess(abs(resized_aspect - original_aspect), 0.05)

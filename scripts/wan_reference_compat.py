@@ -9,27 +9,33 @@ import numpy as np
 def compute_sample_indices(num_frames: int, source_fps: float, target_fps: float) -> list[int]:
     if num_frames <= 0:
         return []
-    if source_fps <= 0 or target_fps <= 0 or target_fps >= source_fps:
+    if source_fps <= 0 or target_fps <= 0:
         return list(range(int(num_frames)))
 
-    step = float(source_fps) / float(target_fps)
-    indices = np.arange(0.0, float(num_frames), step, dtype=np.float32)
-    sampled = np.rint(indices).astype(np.int32)
-    sampled = np.clip(sampled, 0, int(num_frames) - 1)
-    return sampled.tolist()
+    target_num = int(float(num_frames) / float(source_fps) * float(target_fps))
+    if target_num <= 0:
+        return [0]
+
+    times = np.arange(0, target_num, dtype=np.float32) / float(target_fps)
+    indices = np.round(times * float(source_fps)).astype(np.int32)
+    indices = np.clip(indices, 0, int(num_frames) - 1)
+    return indices.tolist()
 
 
 def resize_frame_by_area(frame: np.ndarray, target_area: int, align_divisor: int = 16) -> np.ndarray:
     height, width = frame.shape[:2]
-    current_area = max(height * width, 1)
-    scale = math.sqrt(float(target_area) / float(current_area))
-    scaled_width = max(int(width * scale), 1)
-    scaled_height = max(int(height * scale), 1)
-
-    aligned_width = max(align_divisor, int(round(scaled_width / align_divisor)) * align_divisor)
-    aligned_height = max(align_divisor, int(round(scaled_height / align_divisor)) * align_divisor)
-
-    interpolation = cv2.INTER_AREA if aligned_width * aligned_height <= current_area else cv2.INTER_LINEAR
+    aspect_ratio = float(width) / float(max(height, 1))
+    aligned_height_float = math.sqrt(float(target_area) / max(aspect_ratio, 1e-6))
+    aligned_width_float = float(target_area) / max(aligned_height_float, 1e-6)
+    aligned_height = max(
+        int(align_divisor),
+        int((aligned_height_float // float(align_divisor)) * int(align_divisor)),
+    )
+    aligned_width = max(
+        int(align_divisor),
+        int((aligned_width_float // float(align_divisor)) * int(align_divisor)),
+    )
+    interpolation = cv2.INTER_AREA if aligned_width * aligned_height <= height * width else cv2.INTER_LINEAR
     return cv2.resize(frame, (aligned_width, aligned_height), interpolation=interpolation)
 
 
