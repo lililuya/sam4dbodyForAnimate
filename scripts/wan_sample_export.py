@@ -65,6 +65,11 @@ def _resize_indexed_mask(indexed_mask: np.ndarray, target_shape: tuple[int, int]
     )
 
 
+def _load_indexed_mask(mask_path: str) -> np.ndarray:
+    with Image.open(mask_path) as mask_image:
+        return np.asarray(mask_image.convert("P"), dtype=np.uint8)
+
+
 def _scale_person_output(person_output: dict, scale_x: float, scale_y: float) -> dict:
     scaled = dict(person_output)
     keypoints_2d = np.asarray(person_output["pred_keypoints_2d"], dtype=np.float32).copy()
@@ -184,7 +189,7 @@ class WanSampleExporter:
             previous_bbox = None
             for record in track_records:
                 frame_bgr = cv2.imread(record["image_path"], cv2.IMREAD_COLOR)
-                indexed_mask = cv2.imread(record["mask_path"], cv2.IMREAD_GRAYSCALE)
+                indexed_mask = _load_indexed_mask(record["mask_path"])
                 if frame_bgr is None or indexed_mask is None:
                     continue
 

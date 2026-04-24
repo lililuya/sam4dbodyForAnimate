@@ -18,6 +18,10 @@ runtime:
   # Pose json exports written per-frame and per-person.
   # Supported: openpose, smpl, coco17, coco_wholebody
   pose_exports: [openpose, smpl, coco17, coco_wholebody]
+  # Keep the final 4D mp4 even if per-frame rendered JPGs are disabled.
+  save_rendered_video: true
+  # Direct inline mp4 writing forces per-frame rendering in the main loop, so keep it off unless needed.
+  save_rendered_video_direct: false
   # Optional 4D artifacts. Turn off the ones you do not need to reduce IO and disk usage.
   save_rendered_frames: true
   save_rendered_frames_individual: true

@@ -156,6 +156,8 @@ def build_reprompt_thresholds(cfg) -> Dict[str, float]:
 
 def build_runtime_storage_options(cfg) -> Dict[str, object]:
     return {
+        "save_rendered_video": bool(cfg_get(cfg, "runtime.save_rendered_video", True)),
+        "save_rendered_video_direct": bool(cfg_get(cfg, "runtime.save_rendered_video_direct", False)),
         "save_rendered_frames": bool(cfg_get(cfg, "runtime.save_rendered_frames", True)),
         "save_rendered_frames_individual": bool(cfg_get(cfg, "runtime.save_rendered_frames_individual", True)),
         "save_mesh_4d_individual": bool(cfg_get(cfg, "runtime.save_mesh_4d_individual", True)),
@@ -490,6 +492,16 @@ class RefinedOfflineApp:
         )
         runtime_app.RUNTIME["wan_export"] = to_plain_runtime_dict(
             cfg_get(self.CONFIG, "wan_export", runtime_app.RUNTIME.get("wan_export", {}))
+        )
+        runtime_app.RUNTIME["save_rendered_video"] = bool(
+            cfg_get(self.CONFIG, "runtime.save_rendered_video", runtime_app.RUNTIME.get("save_rendered_video", True))
+        )
+        runtime_app.RUNTIME["save_rendered_video_direct"] = bool(
+            cfg_get(
+                self.CONFIG,
+                "runtime.save_rendered_video_direct",
+                runtime_app.RUNTIME.get("save_rendered_video_direct", False),
+            )
         )
         runtime_app.RUNTIME["save_rendered_frames"] = bool(
             cfg_get(self.CONFIG, "runtime.save_rendered_frames", runtime_app.RUNTIME.get("save_rendered_frames", True))

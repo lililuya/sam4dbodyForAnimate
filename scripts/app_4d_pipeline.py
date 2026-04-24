@@ -75,6 +75,48 @@ def jpg_folder_to_mp4(*args, **kwargs):
     return _jpg_folder_to_mp4(*args, **kwargs)
 
 
+def _get_imageio():
+    import imageio.v2 as imageio
+
+    return imageio
+
+
+class _BrowserSafeVideoWriter:
+    def __init__(self, output_path: str, frame_shape, fps: float):
+        self.output_path = output_path
+        self.height = int(frame_shape[0])
+        self.width = int(frame_shape[1])
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        self._writer = _get_imageio().get_writer(
+            output_path,
+            fps=int(fps),
+            format="FFMPEG",
+            codec="libx264",
+            pixelformat="yuv420p",
+        )
+
+    def write(self, frame_bgr: np.ndarray) -> None:
+        frame = np.asarray(frame_bgr)
+        if frame.ndim == 2:
+            frame = np.stack([frame] * 3, axis=-1)
+        if frame.shape[:2] != (self.height, self.width):
+            frame = cv2.resize(frame, (self.width, self.height))
+        if frame.shape[2] == 4:
+            frame = frame[:, :, :3]
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        self._writer.append_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+    def release(self) -> None:
+        self._writer.close()
+
+
+def _open_video_writer(output_path: str, frame_shape, fps: float):
+    return _BrowserSafeVideoWriter(output_path, frame_shape, fps)
+
+
 def _load_runtime_utils():
     from utils import DAVIS_PALETTE
     from utils.mask_utils import (
@@ -196,10 +238,17 @@ def run_4d_pipeline_from_context(context):
 
     output_dir = context.output_dir
     os.makedirs(output_dir, exist_ok=True)
+    save_rendered_video = bool(context.runtime.get("save_rendered_video", True))
+    # Direct mp4 encoding forces per-frame full-scene rendering even when JPG outputs are disabled,
+    # so keep it opt-in to preserve the previous low-memory behavior.
+    save_rendered_video_direct = bool(context.runtime.get("save_rendered_video_direct", False))
     save_rendered_frames = bool(context.runtime.get("save_rendered_frames", True))
     save_rendered_frames_individual = bool(context.runtime.get("save_rendered_frames_individual", True))
     save_mesh = bool(context.runtime.get("save_mesh_4d_individual", True))
     save_focal = bool(context.runtime.get("save_focal_4d_individual", True))
+    write_rendered_video_direct = save_rendered_video and save_rendered_video_direct and not save_rendered_frames
+    out_4d_path = os.path.join(output_dir, f"4d_{time.time():.0f}.mp4") if save_rendered_video else None
+    direct_video_writer = None
 
     if save_rendered_frames:
         os.makedirs(os.path.join(output_dir, "rendered_frames"), exist_ok=True)
@@ -501,20 +550,30 @@ def run_4d_pipeline_from_context(context):
                 mask_output = mask_outputs[frame_id - num_empty_ids]
                 id_current = id_batch[frame_id - num_empty_ids]
             image_bgr = None
-            if save_rendered_frames or save_rendered_frames_individual:
+            if save_rendered_frames or save_rendered_frames_individual or write_rendered_video_direct:
                 image_bgr = _load_bgr_image_cached(runtime_cache["image_frames"], image_path)
 
-            if save_rendered_frames:
+            render_all = None
+            if save_rendered_frames or write_rendered_video_direct:
                 render_all = visualize_sample_together(
                     image_bgr,
                     mask_output,
                     context.sam3_3d_body_model.faces,
                     id_current,
                 )
+            if save_rendered_frames:
                 cv2.imwrite(
                     os.path.join(output_dir, "rendered_frames", f"{os.path.basename(image_path)[:-4]}.jpg"),
                     render_all.astype(np.uint8),
                 )
+            if write_rendered_video_direct:
+                if direct_video_writer is None:
+                    direct_video_writer = _open_video_writer(
+                        out_4d_path,
+                        render_all.shape,
+                        fps=context.runtime.get("video_fps", 25),
+                    )
+                direct_video_writer.write(render_all.astype(np.uint8))
 
             if save_rendered_frames_individual:
                 rendered_individual = visualize_sample(
@@ -561,10 +620,25 @@ def run_4d_pipeline_from_context(context):
     if callable(finalize):
         finalize()
 
-    if not save_rendered_frames:
+    if direct_video_writer is not None:
+        direct_video_writer.release()
+
+    if not save_rendered_video:
         return None
 
-    out_4d_path = os.path.join(output_dir, f"4d_{time.time():.0f}.mp4")
+    if write_rendered_video_direct:
+        return out_4d_path
+
+    if not save_rendered_frames:
+        print(
+            "Skipping final 4D video export because save_rendered_frames is disabled "
+            "and save_rendered_video_direct is false."
+        )
+        return None
+
+    if out_4d_path is None:
+        return None
+
     jpg_folder_to_mp4(
         os.path.join(output_dir, "rendered_frames"),
         out_4d_path,

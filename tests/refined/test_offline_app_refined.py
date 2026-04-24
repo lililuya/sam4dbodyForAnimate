@@ -407,6 +407,8 @@ class RefinedCliTests(unittest.TestCase):
                 "runtime": {
                     "output_dir": "./outputs_refined",
                     "pose_exports": ["coco17", "coco_wholebody"],
+                    "save_rendered_video": False,
+                    "save_rendered_video_direct": True,
                     "save_rendered_frames": False,
                     "save_rendered_frames_individual": False,
                     "save_mesh_4d_individual": True,
@@ -441,6 +443,8 @@ class RefinedCliTests(unittest.TestCase):
         self.assertEqual(runtime_app.RUNTIME["detection_resolution"], [192, 384])
         self.assertEqual(runtime_app.RUNTIME["completion_resolution"], [256, 512])
         self.assertEqual(runtime_app.RUNTIME["pose_exports"], ["coco17", "coco_wholebody"])
+        self.assertFalse(runtime_app.RUNTIME["save_rendered_video"])
+        self.assertTrue(runtime_app.RUNTIME["save_rendered_video_direct"])
         self.assertFalse(runtime_app.RUNTIME["save_rendered_frames"])
         self.assertFalse(runtime_app.RUNTIME["save_rendered_frames_individual"])
         self.assertTrue(runtime_app.RUNTIME["save_mesh_4d_individual"])

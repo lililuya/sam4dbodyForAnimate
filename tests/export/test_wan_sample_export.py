@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 
 from scripts.wan_face_export import WanFaceDetection
+from scripts.offline_app_refined import save_indexed_mask
 
 
 class _FakeFaceBackend:
@@ -79,6 +80,57 @@ class WanSampleExportTests(unittest.TestCase):
                 meta = json.load(handle)
             self.assertEqual(meta["track_id"], 1)
             self.assertEqual(meta["fps"], 25)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_finalize_preserves_target_labels_from_paletted_png_masks(self):
+        from scripts.wan_sample_export import WanSampleExporter
+        from scripts.wan_sample_types import WanExportConfig
+
+        temp_dir = tempfile.mkdtemp(prefix="wan_export_palette_")
+        try:
+            image_dir = os.path.join(temp_dir, "images")
+            mask_dir = os.path.join(temp_dir, "masks")
+            os.makedirs(image_dir, exist_ok=True)
+            os.makedirs(mask_dir, exist_ok=True)
+
+            frame = np.full((48, 48, 3), 180, dtype=np.uint8)
+            indexed_mask = np.zeros((48, 48), dtype=np.uint8)
+            indexed_mask[8:32, 12:28] = 1
+            for index in range(2):
+                frame_stem = f"{index:08d}"
+                cv2.imwrite(os.path.join(image_dir, f"{frame_stem}.jpg"), frame)
+                save_indexed_mask(indexed_mask, os.path.join(mask_dir, f"{frame_stem}.png"))
+
+            exporter = WanSampleExporter(
+                sample_id="demo_palette",
+                output_dir=temp_dir,
+                images_dir=image_dir,
+                masks_dir=mask_dir,
+                source_video_path=None,
+                config=WanExportConfig(enable=True, min_track_frames=1, min_valid_face_ratio=0.0),
+                face_backend=_FakeFaceBackend([]),
+            )
+
+            person_output = {
+                "pred_keypoints_2d": np.zeros((70, 2), dtype=np.float32),
+                "pred_keypoints_3d": np.zeros((70, 3), dtype=np.float32),
+            }
+            for index in range(2):
+                image_path = os.path.join(image_dir, f"{index:08d}.jpg")
+                exporter(image_path, [person_output], [1])
+
+            sample_dirs = exporter.finalize()
+
+            self.assertEqual(len(sample_dirs), 1)
+            sample_dir = sample_dirs[0]
+            capture = cv2.VideoCapture(os.path.join(sample_dir, "src_mask.mp4"))
+            try:
+                ok, frame_bgr = capture.read()
+            finally:
+                capture.release()
+            self.assertTrue(ok)
+            self.assertGreater(int(frame_bgr.sum()), 0)
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
