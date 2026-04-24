@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import sys
+import time
 import uuid
 from datetime import datetime
 from contextlib import nullcontext
@@ -455,6 +456,77 @@ class RefinedOfflineApp:
         if self.reprompt_events:
             write_debug_json(debug_dir, "reprompt_events.json", self.reprompt_events)
 
+    def _ensure_wan_sample_summary(self, sample: dict) -> tuple[Optional[str], Optional[str]]:
+        wan_export_cfg = to_plain_runtime_dict(cfg_get(self.CONFIG, "wan_export", {}))
+        if not bool(wan_export_cfg.get("enable", False)):
+            return None, None
+
+        export_root = str(wan_export_cfg.get("output_dir") or "").strip()
+        if not export_root:
+            return None, None
+
+        from scripts.wan_sample_export import resolve_or_create_wan_sample_uuid, update_wan_sample_summary
+
+        source_path = os.path.abspath(str(sample.get("input_video") or self.sample_state.get("input_video") or ""))
+        sample_output_dir = sample.get("output_dir")
+        sample_id = os.path.splitext(os.path.basename(source_path))[0] or os.path.basename(
+            os.path.abspath(str(sample_output_dir or "sample"))
+        )
+        sample_uuid = resolve_or_create_wan_sample_uuid(
+            export_root,
+            source_path,
+            sample_id=sample_id,
+            working_output_dir=sample_output_dir,
+        )
+        update_wan_sample_summary(
+            export_root,
+            sample_uuid,
+            {
+                "sample_id": sample_id,
+                "source_path": source_path,
+                "working_output_dir": None if not sample_output_dir else os.path.abspath(sample_output_dir),
+                "export_root": os.path.abspath(export_root),
+            },
+        )
+        self.sample_summary["sample_uuid"] = sample_uuid
+        return sample_uuid, os.path.abspath(export_root)
+
+    def _persist_sample_runtime(
+        self,
+        *,
+        start_time: float,
+        sample_output_dir: Optional[str],
+        runtime_profile: Optional[dict],
+        sample_uuid: Optional[str],
+        wan_export_root: Optional[str],
+    ) -> dict:
+        pipeline_seconds = max(0.0, float(time.perf_counter() - start_time))
+        runtime_payload = {
+            "status": self.sample_summary.get("status", "unknown"),
+            "pipeline_seconds": pipeline_seconds,
+        }
+        if runtime_profile is not None:
+            runtime_payload["runtime_profile"] = runtime_profile
+        if sample_uuid:
+            runtime_payload["sample_uuid"] = sample_uuid
+
+        self.sample_summary["pipeline_runtime"] = runtime_payload
+        if sample_output_dir and os.path.isdir(sample_output_dir):
+            with open(os.path.join(sample_output_dir, "sample_runtime.json"), "w", encoding="utf-8") as handle:
+                json.dump(runtime_payload, handle, indent=2)
+
+        if sample_uuid and wan_export_root:
+            from scripts.wan_sample_export import update_wan_sample_summary
+
+            update_wan_sample_summary(
+                wan_export_root,
+                sample_uuid,
+                {
+                    "pipeline_runtime": runtime_payload,
+                },
+            )
+        return runtime_payload
+
     def _ensure_base_app(self):
         if self._base_app is None:
             self._base_module = load_base_offline_module()
@@ -665,9 +737,15 @@ class RefinedOfflineApp:
         self.CONFIG = sample_cfg
         self.sample_config = sample_cfg
         self.sample_summary = {"status": "running", "runtime_profile": resolved_runtime_profile}
+        pipeline_start = time.perf_counter()
+        sample_output_dir = None
+        sample_uuid = None
+        wan_export_root = None
 
         try:
             sample = self.prepare_input(input_video, output_dir, skip_existing)
+            sample_output_dir = sample.get("output_dir")
+            sample_uuid, wan_export_root = self._ensure_wan_sample_summary(sample)
             initial_targets = self.detect_initial_targets(sample)
             self.prepare_sample_output(sample["output_dir"], initial_targets["obj_ids"])
 
@@ -683,6 +761,13 @@ class RefinedOfflineApp:
             self.sample_summary["status"] = "failed"
             raise
         finally:
+            self._persist_sample_runtime(
+                start_time=pipeline_start,
+                sample_output_dir=sample_output_dir,
+                runtime_profile=resolved_runtime_profile,
+                sample_uuid=sample_uuid,
+                wan_export_root=wan_export_root,
+            )
             try:
                 self.finalize_sample()
             finally:
@@ -1055,8 +1140,16 @@ def run_refined_pipeline(args) -> None:
     app = RefinedOfflineApp(args.config, config=cfg)
     app.reprompt_thresholds = build_reprompt_thresholds(cfg)
     app.sample_summary = {"status": "running", "runtime_profile": {}}
+    pipeline_start = time.perf_counter()
+    sample_output_dir = None
+    sample_uuid = None
+    wan_export_root = None
     try:
         sample = app.prepare_input(args.input_video, args.output_dir, args.skip_existing)
+        sample_output_dir = sample.get("output_dir")
+        wan_summary_result = app._ensure_wan_sample_summary(sample)
+        if isinstance(wan_summary_result, tuple) and len(wan_summary_result) == 2:
+            sample_uuid, wan_export_root = wan_summary_result
         initial_targets = app.detect_initial_targets(sample)
         app.prepare_sample_output(sample["output_dir"], initial_targets["obj_ids"])
 
@@ -1072,6 +1165,13 @@ def run_refined_pipeline(args) -> None:
         app.sample_summary["status"] = "failed"
         raise
     finally:
+        app._persist_sample_runtime(
+            start_time=pipeline_start,
+            sample_output_dir=sample_output_dir,
+            runtime_profile=app.sample_summary.get("runtime_profile"),
+            sample_uuid=sample_uuid,
+            wan_export_root=wan_export_root,
+        )
         app.finalize_sample()
     return cfg
 

@@ -27,6 +27,7 @@ def _coerce_pair(value: Any, default: tuple[int, int], field_name: str) -> tuple
 @dataclass(frozen=True)
 class WanExportConfig:
     enable: bool = False
+    output_dir: str | None = None
     fps: int = 25
     resolution_area: tuple[int, int] = (512, 768)
     face_resolution: tuple[int, int] = (512, 512)
@@ -45,6 +46,7 @@ class WanExportConfig:
         payload = dict(runtime or {})
         return cls(
             enable=_coerce_bool(payload.get("enable", False)),
+            output_dir=None if payload.get("output_dir") in {None, ""} else str(payload.get("output_dir")),
             fps=int(payload.get("fps", 25)),
             resolution_area=_coerce_pair(payload.get("resolution_area"), (512, 768), "resolution_area"),
             face_resolution=_coerce_pair(payload.get("face_resolution"), (512, 512), "face_resolution"),

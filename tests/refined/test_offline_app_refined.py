@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import unittest
@@ -1008,6 +1009,69 @@ class RefinedCliTests(unittest.TestCase):
         self.assertEqual(config.tracking.chunk_size, 180)
         self.assertEqual(app.sample_summary["status"], "completed")
         self.assertEqual(app.sample_summary["runtime_profile"], runtime_profile)
+
+    def test_run_sample_writes_sample_runtime_json(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        with make_workspace_tempdir() as tmpdir:
+            export_root = os.path.join(tmpdir, "WanExport")
+            sample_output_dir = os.path.join(tmpdir, "sample_out")
+            os.makedirs(sample_output_dir, exist_ok=True)
+
+            config = OmegaConf.create(
+                {
+                    "runtime": {"output_dir": "./outputs_refined"},
+                    "tracking": {"chunk_size": 180},
+                    "wan_export": {"enable": True, "output_dir": export_root},
+                    "reprompt": {
+                        "enable": True,
+                        "empty_mask_patience": 3,
+                        "area_drop_ratio": 0.35,
+                        "edge_touch_ratio": 0.4,
+                        "iou_low_threshold": 0.55,
+                    },
+                    "debug": {"save_metrics": False},
+                }
+            )
+            app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+            sample = {
+                "frames": [],
+                "output_dir": sample_output_dir,
+                "input_video": os.path.join(tmpdir, "sample.mp4"),
+            }
+
+            app.prepare_input = unittest.mock.MagicMock(return_value=sample)
+            app.detect_initial_targets = unittest.mock.MagicMock(return_value={"obj_ids": [1]})
+            app.prepare_sample_output = unittest.mock.MagicMock(
+                return_value={"images": os.path.join(sample_output_dir, "images")}
+            )
+            app.iter_chunks = unittest.mock.MagicMock(return_value=[])
+            app.track_chunk = unittest.mock.MagicMock()
+            app.refine_chunk_masks = unittest.mock.MagicMock()
+            app.maybe_reprompt_chunk = unittest.mock.MagicMock()
+            app.write_chunk_outputs = unittest.mock.MagicMock()
+            app.run_refined_4d_generation = unittest.mock.MagicMock()
+
+            with patch("scripts.offline_app_refined.time.perf_counter", side_effect=[10.0, 16.5]), patch(
+                "scripts.wan_sample_export.uuid.uuid4",
+                return_value=SimpleNamespace(hex="runtimeuuid123456"),
+            ):
+                app.run_sample("sample.mp4", "./custom_out", skip_existing=False, runtime_profile=None)
+
+            runtime_path = os.path.join(sample_output_dir, "sample_runtime.json")
+            self.assertTrue(os.path.isfile(runtime_path))
+            with open(runtime_path, "r", encoding="utf-8") as handle:
+                runtime_payload = json.load(handle)
+            self.assertEqual(runtime_payload["status"], "completed")
+            self.assertAlmostEqual(runtime_payload["pipeline_seconds"], 6.5)
+
+            summary_path = os.path.join(export_root, "runtimeuuid123456_summary.json")
+            self.assertTrue(os.path.isfile(summary_path))
+            with open(summary_path, "r", encoding="utf-8") as handle:
+                wan_summary = json.load(handle)
+            self.assertEqual(wan_summary["sample_uuid"], "runtimeuuid123456")
+            self.assertEqual(wan_summary["pipeline_runtime"]["status"], "completed")
+            self.assertAlmostEqual(wan_summary["pipeline_runtime"]["pipeline_seconds"], 6.5)
 
     def test_run_sample_finalizes_and_marks_failed_when_setup_fails(self):
         from scripts.offline_app_refined import RefinedOfflineApp

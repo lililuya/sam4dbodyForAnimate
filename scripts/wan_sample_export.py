@@ -4,6 +4,7 @@ import json
 import math
 import os
 from typing import Iterable
+import uuid
 
 import cv2
 import numpy as np
@@ -14,6 +15,9 @@ from scripts.wan_mask_bg_export import build_bg_and_mask_frame, score_reference_
 from scripts.wan_pose_adapter import build_wan_pose_meta, render_wan_pose_frame
 from scripts.wan_reference_compat import compute_sample_indices, resize_frame_by_area
 from scripts.wan_sample_types import WanExportConfig
+
+
+SOURCE_UUID_MAP_FILENAME = "source_uuid_map.json"
 
 
 class CompositeFrameWriter:
@@ -42,6 +46,104 @@ def _coerce_config(config) -> WanExportConfig:
     if isinstance(config, WanExportConfig):
         return config
     return WanExportConfig.from_runtime(config)
+
+
+def _read_json_dict(path: str) -> dict:
+    if not os.path.isfile(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as handle:
+        try:
+            payload = json.load(handle)
+        except json.JSONDecodeError:
+            return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_json(path: str, payload: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def _merge_dicts(base: dict, updates: dict) -> dict:
+    merged = dict(base)
+    for key, value in updates.items():
+        if isinstance(merged.get(key), dict) and isinstance(value, dict):
+            merged[key] = _merge_dicts(merged[key], value)
+            continue
+        merged[key] = value
+    return merged
+
+
+def resolve_wan_source_path(source_video_path: str | None, images_dir: str | None) -> str:
+    if source_video_path:
+        return os.path.abspath(source_video_path)
+    if images_dir:
+        return os.path.abspath(images_dir)
+    return os.path.abspath(".")
+
+
+def get_wan_source_uuid_map_path(export_root: str) -> str:
+    return os.path.join(os.path.abspath(export_root), SOURCE_UUID_MAP_FILENAME)
+
+
+def get_wan_summary_path(export_root: str, sample_uuid: str) -> str:
+    return os.path.join(os.path.abspath(export_root), f"{sample_uuid}_summary.json")
+
+
+def get_wan_skipped_path(export_root: str, sample_uuid: str) -> str:
+    return os.path.join(os.path.abspath(export_root), f"{sample_uuid}_skipped.json")
+
+
+def resolve_or_create_wan_sample_uuid(
+    export_root: str,
+    source_path: str,
+    sample_id: str | None = None,
+    working_output_dir: str | None = None,
+) -> str:
+    export_root_abs = os.path.abspath(export_root)
+    source_path_abs = os.path.abspath(source_path)
+    mapping_path = get_wan_source_uuid_map_path(export_root_abs)
+    mapping = _read_json_dict(mapping_path)
+    items = mapping.get("items")
+    if not isinstance(items, list):
+        items = []
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if os.path.abspath(str(item.get("source_path", ""))) != source_path_abs:
+            continue
+        sample_uuid = str(item.get("sample_uuid", "")).strip()
+        if sample_uuid:
+            return sample_uuid
+
+    sample_uuid = uuid.uuid4().hex
+    items.append(
+        {
+            "sample_uuid": sample_uuid,
+            "sample_id": None if sample_id is None else str(sample_id),
+            "source_path": source_path_abs,
+            "working_output_dir": None if not working_output_dir else os.path.abspath(working_output_dir),
+        }
+    )
+    mapping["items"] = items
+    _write_json(mapping_path, mapping)
+    return sample_uuid
+
+
+def update_wan_sample_summary(export_root: str, sample_uuid: str, updates: dict) -> dict:
+    summary_path = get_wan_summary_path(export_root, sample_uuid)
+    current = _read_json_dict(summary_path)
+    merged = _merge_dicts(current, {"sample_uuid": str(sample_uuid), **dict(updates or {})})
+    _write_json(summary_path, merged)
+    return merged
+
+
+def write_wan_skipped_report(export_root: str, sample_uuid: str, payload: dict) -> dict:
+    report = {"sample_uuid": str(sample_uuid), **dict(payload or {})}
+    _write_json(get_wan_skipped_path(export_root, sample_uuid), report)
+    return report
 
 
 def _resolve_source_fps(source_video_path: str | None, default_fps: float) -> float:
@@ -125,10 +227,14 @@ class WanSampleExporter:
     ):
         self.sample_id = str(sample_id)
         self.output_dir = output_dir
+        self.working_output_dir = os.path.abspath(output_dir)
         self.images_dir = images_dir
         self.masks_dir = masks_dir
         self.source_video_path = source_video_path
         self.config = _coerce_config(config)
+        self.export_root = os.path.abspath(self.config.output_dir) if self.config.output_dir else None
+        self.source_reference = resolve_wan_source_path(source_video_path, images_dir)
+        self.sample_uuid = None
         self.face_backend = face_backend or InsightFaceBackend()
         self._records: list[dict] = []
 
@@ -158,6 +264,25 @@ class WanSampleExporter:
         finally:
             writer.release()
 
+    def _resolve_sample_dir(self, track_id: int) -> str:
+        sample_uuid = self._ensure_sample_uuid()
+        if self.export_root and sample_uuid:
+            return os.path.join(self.export_root, f"{sample_uuid}_target{int(track_id)}")
+        return os.path.join(self.working_output_dir, "wan_export", f"{self.sample_id}_track_{track_id}")
+
+    def _ensure_sample_uuid(self) -> str | None:
+        if not self.export_root:
+            return None
+        if self.sample_uuid:
+            return self.sample_uuid
+        self.sample_uuid = resolve_or_create_wan_sample_uuid(
+            self.export_root,
+            self.source_reference,
+            sample_id=self.sample_id,
+            working_output_dir=self.working_output_dir,
+        )
+        return self.sample_uuid
+
     def finalize(self) -> list[str]:
         if not self._records:
             return []
@@ -179,9 +304,19 @@ class WanSampleExporter:
         )
 
         written: list[str] = []
+        written_targets: list[dict] = []
+        skipped_targets: list[dict] = []
         for track_id in track_ids:
             track_records = [record for record in sampled_records if track_id in record["person_outputs"]]
             if len(track_records) < int(self.config.min_track_frames):
+                skipped_targets.append(
+                    {
+                        "track_id": int(track_id),
+                        "reason": "track_frames_below_threshold",
+                        "track_frame_count": len(track_records),
+                        "min_track_frames": int(self.config.min_track_frames),
+                    }
+                )
                 continue
 
             face_sequence = []
@@ -234,6 +369,14 @@ class WanSampleExporter:
                 )
 
             if len(frame_payloads) < int(self.config.min_track_frames):
+                skipped_targets.append(
+                    {
+                        "track_id": int(track_id),
+                        "reason": "readable_frames_below_threshold",
+                        "readable_frame_count": len(frame_payloads),
+                        "min_track_frames": int(self.config.min_track_frames),
+                    }
+                )
                 continue
 
             face_sequence = fill_face_gaps(face_sequence, self.config.face_gap)
@@ -290,9 +433,18 @@ class WanSampleExporter:
 
             valid_face_ratio = float(valid_face_count) / float(max(len(target_frames), 1))
             if valid_face_ratio < float(self.config.min_valid_face_ratio):
+                skipped_targets.append(
+                    {
+                        "track_id": int(track_id),
+                        "reason": "valid_face_ratio_below_threshold",
+                        "valid_face_ratio": valid_face_ratio,
+                        "min_valid_face_ratio": float(self.config.min_valid_face_ratio),
+                        "frame_count": len(target_frames),
+                    }
+                )
                 continue
 
-            sample_dir = os.path.join(self.output_dir, "wan_export", f"{self.sample_id}_track_{track_id}")
+            sample_dir = self._resolve_sample_dir(track_id)
             os.makedirs(sample_dir, exist_ok=True)
             if self.config.save_pose_meta_json:
                 pose_meta_json_dir = os.path.join(sample_dir, "pose_meta_json")
@@ -313,7 +465,9 @@ class WanSampleExporter:
                 json.dump(
                     {
                         "sample_id": self.sample_id,
+                        "sample_uuid": self.sample_uuid,
                         "track_id": int(track_id),
+                        "source_path": self.source_reference,
                         "fps": int(self.config.fps),
                         "resolution_area": list(self.config.resolution_area),
                         "face_resolution": list(self.config.face_resolution),
@@ -324,5 +478,38 @@ class WanSampleExporter:
                     indent=2,
                 )
             written.append(sample_dir)
+            written_targets.append(
+                {
+                    "track_id": int(track_id),
+                    "sample_dir": sample_dir,
+                    "frame_count": len(target_frames),
+                    "valid_face_ratio": valid_face_ratio,
+                }
+            )
+
+        sample_uuid = self._ensure_sample_uuid()
+        if self.export_root and sample_uuid:
+            update_wan_sample_summary(
+                self.export_root,
+                sample_uuid,
+                {
+                    "sample_id": self.sample_id,
+                    "source_path": self.source_reference,
+                    "working_output_dir": self.working_output_dir,
+                    "export_root": self.export_root,
+                    "exported_target_count": len(written_targets),
+                    "exported_targets": written_targets,
+                    "skipped_target_count": len(skipped_targets),
+                },
+            )
+            write_wan_skipped_report(
+                self.export_root,
+                sample_uuid,
+                {
+                    "sample_id": self.sample_id,
+                    "source_path": self.source_reference,
+                    "skipped_targets": skipped_targets,
+                },
+            )
 
         return written

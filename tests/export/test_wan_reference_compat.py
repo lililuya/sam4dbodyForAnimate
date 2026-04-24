@@ -14,6 +14,7 @@ class WanReferenceCompatTests(unittest.TestCase):
                 "resolution_area": [512, 768],
                 "face_resolution": [512, 512],
                 "min_track_frames": 12,
+                "output_dir": "./WanExport",
             }
         )
 
@@ -22,6 +23,7 @@ class WanReferenceCompatTests(unittest.TestCase):
         self.assertEqual(config.resolution_area, (512, 768))
         self.assertEqual(config.face_resolution, (512, 512))
         self.assertEqual(config.min_track_frames, 12)
+        self.assertEqual(config.output_dir, "./WanExport")
 
     def test_wan_export_config_coerces_common_string_booleans(self):
         from scripts.wan_sample_types import WanExportConfig
