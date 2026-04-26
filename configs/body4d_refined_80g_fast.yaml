@@ -31,6 +31,9 @@ runtime:
 wan_export:
   # Optional WanAnimate-style per-track export from the refined offline batch path.
   enable: false
+  # Optional independent parent directory for source_uuid_map / summary / skipped / issue ledger metadata.
+  # Leave empty to reuse wan_export.output_dir.
+  metadata_output_dir: ""
   # WanAnimate-compatible sampling/output fps.
   fps: 25
   # Resize each exported frame by target area and keep the final canvas 16-aligned.
@@ -62,6 +65,8 @@ wan_export:
   mask_h_len: 20
   # Save per-frame Wan pose metadata jsons alongside the videos.
   save_pose_meta_json: true
+  # Raw SMPL per-frame bundles are very large; keep disabled unless explicitly needed for debugging.
+  save_smpl_sequence_json: false
 
 completion:
   # Speed-priority profile for large-memory GPUs:

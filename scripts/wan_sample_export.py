@@ -268,6 +268,11 @@ class WanSampleExporter:
         self.source_video_path = source_video_path
         self.config = _coerce_config(config)
         self.export_root = os.path.abspath(self.config.output_dir) if self.config.output_dir else None
+        self.metadata_root = (
+            os.path.abspath(self.config.metadata_output_dir)
+            if self.config.metadata_output_dir
+            else self.export_root
+        )
         self.source_reference = resolve_wan_source_path(source_video_path, images_dir)
         self.sample_uuid = None
         self.face_backend = face_backend or InsightFaceBackend()
@@ -307,12 +312,12 @@ class WanSampleExporter:
         return os.path.join(self.working_output_dir, "wan_export", f"{self.sample_id}_track_{track_id}")
 
     def _ensure_sample_uuid(self) -> str | None:
-        if not self.export_root:
+        if not self.metadata_root:
             return None
         if self.sample_uuid:
             return self.sample_uuid
         self.sample_uuid = resolve_or_create_wan_sample_uuid(
-            self.export_root,
+            self.metadata_root,
             self.source_reference,
             sample_id=self.sample_id,
             working_output_dir=self.working_output_dir,
@@ -503,23 +508,24 @@ class WanSampleExporter:
                     "records": [pose_meta for _, pose_meta in pose_meta_records],
                 },
             )
-            _write_json(
-                os.path.join(sample_dir, "smpl_sequence.json"),
-                {
-                    "sample_id": self.sample_id,
-                    "sample_uuid": sample_uuid,
-                    "track_id": int(track_id),
-                    "source_path": self.source_reference,
-                    "frame_count": len(frame_payloads),
-                    "records": [
-                        {
-                            "frame_stem": payload["frame_stem"],
-                            "person_output": _to_json_safe(payload["raw_person_output"]),
-                        }
-                        for payload in frame_payloads
-                    ],
-                },
-            )
+            if bool(self.config.save_smpl_sequence_json):
+                _write_json(
+                    os.path.join(sample_dir, "smpl_sequence.json"),
+                    {
+                        "sample_id": self.sample_id,
+                        "sample_uuid": sample_uuid,
+                        "track_id": int(track_id),
+                        "source_path": self.source_reference,
+                        "frame_count": len(frame_payloads),
+                        "records": [
+                            {
+                                "frame_stem": payload["frame_stem"],
+                                "person_output": _to_json_safe(payload["raw_person_output"]),
+                            }
+                            for payload in frame_payloads
+                        ],
+                    },
+                )
 
             self._write_mp4(target_frames, os.path.join(sample_dir, "target.mp4"), self.config.fps)
             self._write_mp4(pose_frames, os.path.join(sample_dir, "src_pose.mp4"), self.config.fps)
@@ -557,22 +563,23 @@ class WanSampleExporter:
             self.finalized_targets.append(dict(written_targets[-1]))
 
         sample_uuid = self._ensure_sample_uuid()
-        if self.export_root and sample_uuid:
+        if self.metadata_root and sample_uuid:
             update_wan_sample_summary(
-                self.export_root,
+                self.metadata_root,
                 sample_uuid,
                 {
                     "sample_id": self.sample_id,
                     "source_path": self.source_reference,
                     "working_output_dir": self.working_output_dir,
                     "export_root": self.export_root,
+                    "metadata_root": self.metadata_root,
                     "exported_target_count": len(written_targets),
                     "exported_targets": written_targets,
                     "skipped_target_count": len(skipped_targets),
                 },
             )
             write_wan_skipped_report(
-                self.export_root,
+                self.metadata_root,
                 sample_uuid,
                 {
                     "sample_id": self.sample_id,
@@ -582,7 +589,7 @@ class WanSampleExporter:
             )
             if skipped_targets:
                 append_wan_issue_records(
-                    self.export_root,
+                    self.metadata_root,
                     [
                         {
                             "recorded_at": datetime.now(timezone.utc).isoformat(),

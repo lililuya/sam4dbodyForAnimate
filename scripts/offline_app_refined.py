@@ -513,10 +513,12 @@ class RefinedOfflineApp:
         }
 
     def _resolve_issue_ledger_root(self, sample: Optional[dict] = None) -> str:
-        wan_export_cfg = to_plain_runtime_dict(cfg_get(self.CONFIG, "wan_export", {}))
-        export_root = str(wan_export_cfg.get("output_dir") or "").strip()
-        if export_root:
-            return os.path.abspath(export_root)
+        from scripts.wan_sample_types import WanExportConfig
+
+        wan_cfg = WanExportConfig.from_runtime(cfg_get(self.CONFIG, "wan_export", {}))
+        metadata_root = str(wan_cfg.metadata_output_dir or wan_cfg.output_dir or "").strip()
+        if metadata_root:
+            return os.path.abspath(metadata_root)
 
         configured_output_root = os.path.abspath(
             str(cfg_get(self.CONFIG, "runtime.output_dir", os.path.join(ROOT, "outputs_refined")))
@@ -627,13 +629,18 @@ class RefinedOfflineApp:
         return float(face_presence.get("no_face_ratio", 0.0) or 0.0) >= float(wan_cfg.max_no_face_ratio)
 
     def _ensure_wan_sample_summary(self, sample: dict) -> tuple[Optional[str], Optional[str]]:
-        wan_export_cfg = to_plain_runtime_dict(cfg_get(self.CONFIG, "wan_export", {}))
-        if not bool(wan_export_cfg.get("enable", False)):
+        from scripts.wan_sample_types import WanExportConfig
+
+        wan_cfg = WanExportConfig.from_runtime(cfg_get(self.CONFIG, "wan_export", {}))
+        if not bool(wan_cfg.enable):
             return None, None
 
-        export_root = str(wan_export_cfg.get("output_dir") or "").strip()
-        if not export_root:
+        metadata_root = str(wan_cfg.metadata_output_dir or wan_cfg.output_dir or "").strip()
+        if not metadata_root:
             return None, None
+
+        export_root = None if not wan_cfg.output_dir else os.path.abspath(str(wan_cfg.output_dir))
+        metadata_root = os.path.abspath(metadata_root)
 
         from scripts.wan_sample_export import resolve_or_create_wan_sample_uuid, update_wan_sample_summary
 
@@ -642,23 +649,24 @@ class RefinedOfflineApp:
         sample_id = identity["sample_id"]
         sample_output_dir = identity["working_output_dir"]
         sample_uuid = resolve_or_create_wan_sample_uuid(
-            export_root,
+            metadata_root,
             source_path,
             sample_id=sample_id,
             working_output_dir=sample_output_dir,
         )
         update_wan_sample_summary(
-            export_root,
+            metadata_root,
             sample_uuid,
             {
                 "sample_id": sample_id,
                 "source_path": source_path,
                 "working_output_dir": None if not sample_output_dir else os.path.abspath(sample_output_dir),
-                "export_root": os.path.abspath(export_root),
+                "export_root": export_root,
+                "metadata_root": metadata_root,
             },
         )
         self.sample_summary["sample_uuid"] = sample_uuid
-        return sample_uuid, os.path.abspath(export_root)
+        return sample_uuid, metadata_root
 
     def _load_wan_exported_target_dirs(self, sample_uuid: Optional[str], wan_export_root: Optional[str]) -> list[str]:
         if not sample_uuid or not wan_export_root:

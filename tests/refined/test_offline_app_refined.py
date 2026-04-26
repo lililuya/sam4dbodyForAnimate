@@ -973,6 +973,7 @@ class RefinedCliTests(unittest.TestCase):
 
         with make_workspace_tempdir() as tmpdir:
             export_root = os.path.join(tmpdir, "WanExport")
+            metadata_root = os.path.join(tmpdir, "WanExportMeta")
             sample_output_dir = os.path.join(tmpdir, "sample_out")
             os.makedirs(sample_output_dir, exist_ok=True)
 
@@ -980,7 +981,12 @@ class RefinedCliTests(unittest.TestCase):
                 {
                     "runtime": {"output_dir": "./outputs_refined"},
                     "tracking": {"chunk_size": 180},
-                    "wan_export": {"enable": True, "output_dir": export_root, "fps": 25},
+                    "wan_export": {
+                        "enable": True,
+                        "output_dir": export_root,
+                        "metadata_output_dir": metadata_root,
+                        "fps": 25,
+                    },
                     "reprompt": {
                         "enable": True,
                         "empty_mask_patience": 3,
@@ -1036,7 +1042,7 @@ class RefinedCliTests(unittest.TestCase):
                 },
             )
 
-            summary_path = os.path.join(export_root, "runtimeuuid123456_summary.json")
+            summary_path = os.path.join(metadata_root, "runtimeuuid123456_summary.json")
             self.assertTrue(os.path.isfile(summary_path))
             with open(summary_path, "r", encoding="utf-8") as handle:
                 wan_summary = json.load(handle)
@@ -1109,6 +1115,7 @@ class RefinedCliTests(unittest.TestCase):
 
         with make_workspace_tempdir() as tmpdir:
             export_root = os.path.join(tmpdir, "WanExport")
+            metadata_root = os.path.join(tmpdir, "WanExportMeta")
             sample_output_dir = os.path.join(tmpdir, "sample_out")
 
             config = OmegaConf.create(
@@ -1118,6 +1125,7 @@ class RefinedCliTests(unittest.TestCase):
                     "wan_export": {
                         "enable": True,
                         "output_dir": export_root,
+                        "metadata_output_dir": metadata_root,
                         "skip_sample_without_face": True,
                         "face_presence_stride": 5,
                         "max_no_face_ratio": 0.80,
@@ -1174,7 +1182,7 @@ class RefinedCliTests(unittest.TestCase):
             app.prepare_sample_output.assert_not_called()
             app.run_refined_4d_generation.assert_not_called()
 
-            ledger_path = os.path.join(export_root, "sample_issue_ledger.json")
+            ledger_path = os.path.join(metadata_root, "sample_issue_ledger.json")
             self.assertTrue(os.path.isfile(ledger_path))
             with open(ledger_path, "r", encoding="utf-8") as handle:
                 ledger = json.load(handle)
@@ -1189,6 +1197,7 @@ class RefinedCliTests(unittest.TestCase):
 
         with make_workspace_tempdir() as tmpdir:
             export_root = os.path.join(tmpdir, "WanExport")
+            metadata_root = os.path.join(tmpdir, "WanExportMeta")
             sample_output_dir = os.path.join(tmpdir, "sample_out")
 
             config = OmegaConf.create(
@@ -1198,6 +1207,7 @@ class RefinedCliTests(unittest.TestCase):
                     "wan_export": {
                         "enable": True,
                         "output_dir": export_root,
+                        "metadata_output_dir": metadata_root,
                         "skip_sample_without_face": True,
                         "face_presence_stride": 5,
                         "max_no_face_ratio": 0.80,
@@ -1248,7 +1258,7 @@ class RefinedCliTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "tracker failed"):
                     app.run_sample("sample.mp4", "./custom_out", skip_existing=False, runtime_profile=None)
 
-            ledger_path = os.path.join(export_root, "sample_issue_ledger.json")
+            ledger_path = os.path.join(metadata_root, "sample_issue_ledger.json")
             self.assertTrue(os.path.isfile(ledger_path))
             with open(ledger_path, "r", encoding="utf-8") as handle:
                 ledger = json.load(handle)

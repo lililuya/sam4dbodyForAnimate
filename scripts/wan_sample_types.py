@@ -28,6 +28,7 @@ def _coerce_pair(value: Any, default: tuple[int, int], field_name: str) -> tuple
 class WanExportConfig:
     enable: bool = False
     output_dir: str | None = None
+    metadata_output_dir: str | None = None
     fps: int = 25
     resolution_area: tuple[int, int] = (512, 768)
     face_resolution: tuple[int, int] = (512, 512)
@@ -45,6 +46,7 @@ class WanExportConfig:
     mask_w_len: int = 10
     mask_h_len: int = 20
     save_pose_meta_json: bool = True
+    save_smpl_sequence_json: bool = False
 
     @classmethod
     def from_runtime(cls, runtime: Mapping[str, Any] | None) -> "WanExportConfig":
@@ -52,6 +54,9 @@ class WanExportConfig:
         return cls(
             enable=_coerce_bool(payload.get("enable", False)),
             output_dir=None if payload.get("output_dir") in {None, ""} else str(payload.get("output_dir")),
+            metadata_output_dir=(
+                None if payload.get("metadata_output_dir") in {None, ""} else str(payload.get("metadata_output_dir"))
+            ),
             fps=int(payload.get("fps", 25)),
             resolution_area=_coerce_pair(payload.get("resolution_area"), (512, 768), "resolution_area"),
             face_resolution=_coerce_pair(payload.get("face_resolution"), (512, 512), "face_resolution"),
@@ -71,4 +76,5 @@ class WanExportConfig:
             mask_w_len=int(payload.get("mask_w_len", 10)),
             mask_h_len=int(payload.get("mask_h_len", 20)),
             save_pose_meta_json=_coerce_bool(payload.get("save_pose_meta_json", True)),
+            save_smpl_sequence_json=_coerce_bool(payload.get("save_smpl_sequence_json", False)),
         )

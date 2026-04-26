@@ -15,6 +15,7 @@ class WanReferenceCompatTests(unittest.TestCase):
                 "face_resolution": [512, 512],
                 "min_track_frames": 12,
                 "output_dir": "./WanExport",
+                "metadata_output_dir": "./WanExportMeta",
             }
         )
 
@@ -24,6 +25,8 @@ class WanReferenceCompatTests(unittest.TestCase):
         self.assertEqual(config.face_resolution, (512, 512))
         self.assertEqual(config.min_track_frames, 12)
         self.assertEqual(config.output_dir, "./WanExport")
+        self.assertEqual(config.metadata_output_dir, "./WanExportMeta")
+        self.assertFalse(config.save_smpl_sequence_json)
 
     def test_wan_export_config_coerces_common_string_booleans(self):
         from scripts.wan_sample_types import WanExportConfig
@@ -32,11 +35,13 @@ class WanReferenceCompatTests(unittest.TestCase):
             {
                 "enable": "false",
                 "save_pose_meta_json": "0",
+                "save_smpl_sequence_json": "1",
             }
         )
 
         self.assertFalse(config.enable)
         self.assertFalse(config.save_pose_meta_json)
+        self.assertTrue(config.save_smpl_sequence_json)
 
     def test_wan_export_config_validates_pair_lengths(self):
         from scripts.wan_sample_types import WanExportConfig

@@ -32,6 +32,7 @@ class WanSampleExportTests(unittest.TestCase):
             image_dir = os.path.join(temp_dir, "images")
             mask_dir = os.path.join(temp_dir, "masks")
             export_root = os.path.join(temp_dir, "WanExport")
+            metadata_root = os.path.join(temp_dir, "WanExportMeta")
             os.makedirs(image_dir, exist_ok=True)
             os.makedirs(mask_dir, exist_ok=True)
 
@@ -49,7 +50,12 @@ class WanSampleExportTests(unittest.TestCase):
                 images_dir=image_dir,
                 masks_dir=mask_dir,
                 source_video_path="/dataset/source/demo.mp4",
-                config=WanExportConfig(enable=True, min_track_frames=1, output_dir=export_root),
+                config=WanExportConfig(
+                    enable=True,
+                    min_track_frames=1,
+                    output_dir=export_root,
+                    metadata_output_dir=metadata_root,
+                ),
                 face_backend=_FakeFaceBackend(
                     [
                         WanFaceDetection(
@@ -75,11 +81,12 @@ class WanSampleExportTests(unittest.TestCase):
             self.assertEqual(sample_dirs, [os.path.join(export_root, "abc123def4567890_target1")])
             sample_dir = sample_dirs[0]
             self.assertTrue(os.path.isfile(os.path.join(sample_dir, "target.mp4")))
-            self.assertTrue(os.path.isfile(os.path.join(export_root, "source_uuid_map.json")))
-            self.assertTrue(os.path.isfile(os.path.join(export_root, "abc123def4567890_summary.json")))
-            self.assertTrue(os.path.isfile(os.path.join(export_root, "abc123def4567890_skipped.json")))
+            self.assertTrue(os.path.isfile(os.path.join(metadata_root, "source_uuid_map.json")))
+            self.assertTrue(os.path.isfile(os.path.join(metadata_root, "abc123def4567890_summary.json")))
+            self.assertTrue(os.path.isfile(os.path.join(metadata_root, "abc123def4567890_skipped.json")))
+            self.assertFalse(os.path.isfile(os.path.join(export_root, "source_uuid_map.json")))
 
-            with open(os.path.join(export_root, "source_uuid_map.json"), "r", encoding="utf-8") as handle:
+            with open(os.path.join(metadata_root, "source_uuid_map.json"), "r", encoding="utf-8") as handle:
                 mapping = json.load(handle)
             self.assertEqual(mapping["items"][0]["sample_uuid"], "abc123def4567890")
             self.assertEqual(mapping["items"][0]["source_path"], os.path.abspath("/dataset/source/demo.mp4"))
@@ -100,6 +107,7 @@ class WanSampleExportTests(unittest.TestCase):
             image_dir = os.path.join(temp_dir, "images")
             mask_dir = os.path.join(temp_dir, "masks")
             export_root = os.path.join(temp_dir, "WanExport")
+            metadata_root = os.path.join(temp_dir, "WanExportMeta")
             os.makedirs(image_dir, exist_ok=True)
             os.makedirs(mask_dir, exist_ok=True)
 
@@ -122,6 +130,7 @@ class WanSampleExportTests(unittest.TestCase):
                     min_track_frames=1,
                     min_valid_face_ratio=0.6,
                     output_dir=export_root,
+                    metadata_output_dir=metadata_root,
                 ),
                 face_backend=_FakeFaceBackend([]),
             )
@@ -138,7 +147,7 @@ class WanSampleExportTests(unittest.TestCase):
                 sample_dirs = exporter.finalize()
 
             self.assertEqual(sample_dirs, [])
-            skipped_path = os.path.join(export_root, "feedfacecafebeef_skipped.json")
+            skipped_path = os.path.join(metadata_root, "feedfacecafebeef_skipped.json")
             self.assertTrue(os.path.isfile(skipped_path))
             with open(skipped_path, "r", encoding="utf-8") as handle:
                 skipped = json.load(handle)
@@ -157,6 +166,7 @@ class WanSampleExportTests(unittest.TestCase):
             image_dir = os.path.join(temp_dir, "images")
             mask_dir = os.path.join(temp_dir, "masks")
             export_root = os.path.join(temp_dir, "WanExport")
+            metadata_root = os.path.join(temp_dir, "WanExportMeta")
             os.makedirs(image_dir, exist_ok=True)
             os.makedirs(mask_dir, exist_ok=True)
 
@@ -179,6 +189,7 @@ class WanSampleExportTests(unittest.TestCase):
                     min_track_frames=1,
                     min_valid_face_ratio=0.6,
                     output_dir=export_root,
+                    metadata_output_dir=metadata_root,
                 ),
                 face_backend=_FakeFaceBackend([]),
             )
@@ -195,7 +206,7 @@ class WanSampleExportTests(unittest.TestCase):
                 sample_dirs = exporter.finalize()
 
             self.assertEqual(sample_dirs, [])
-            ledger_path = os.path.join(export_root, "sample_issue_ledger.json")
+            ledger_path = os.path.join(metadata_root, "sample_issue_ledger.json")
             self.assertTrue(os.path.isfile(ledger_path))
             with open(ledger_path, "r", encoding="utf-8") as handle:
                 ledger = json.load(handle)
@@ -270,7 +281,69 @@ class WanSampleExportTests(unittest.TestCase):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def test_finalize_writes_bundled_pose_and_smpl_sequences(self):
+    def test_finalize_does_not_write_smpl_sequence_by_default(self):
+        from scripts.wan_sample_export import WanSampleExporter
+        from scripts.wan_sample_types import WanExportConfig
+
+        temp_dir = tempfile.mkdtemp(prefix="wan_export_pose_only_")
+        try:
+            image_dir = os.path.join(temp_dir, "images")
+            mask_dir = os.path.join(temp_dir, "masks")
+            export_root = os.path.join(temp_dir, "WanExport")
+            os.makedirs(image_dir, exist_ok=True)
+            os.makedirs(mask_dir, exist_ok=True)
+
+            frame = np.full((64, 48, 3), 180, dtype=np.uint8)
+            mask = np.zeros((64, 48), dtype=np.uint8)
+            mask[8:40, 10:30] = 1
+            for index in range(3):
+                frame_stem = f"{index:08d}"
+                cv2.imwrite(os.path.join(image_dir, f"{frame_stem}.jpg"), frame)
+                save_indexed_mask(mask, os.path.join(mask_dir, f"{frame_stem}.png"))
+
+            exporter = WanSampleExporter(
+                sample_id="demo_pose_only",
+                output_dir=temp_dir,
+                images_dir=image_dir,
+                masks_dir=mask_dir,
+                source_video_path="/dataset/source/demo_pose_only.mp4",
+                config=WanExportConfig(
+                    enable=True,
+                    min_track_frames=1,
+                    output_dir=export_root,
+                    save_pose_meta_json=False,
+                ),
+                face_backend=_FakeFaceBackend(
+                    [
+                        WanFaceDetection(
+                            bbox=(12, 10, 28, 28),
+                            landmarks=np.zeros((5, 3), dtype=np.float32),
+                            score=0.9,
+                        )
+                    ]
+                ),
+            )
+
+            person_output = {
+                "pred_keypoints_2d": np.zeros((70, 2), dtype=np.float32),
+                "pred_keypoints_3d": np.zeros((70, 3), dtype=np.float32),
+                "bbox": np.array([10.0, 8.0, 30.0, 40.0], dtype=np.float32),
+            }
+            for index in range(3):
+                image_path = os.path.join(image_dir, f"{index:08d}.jpg")
+                exporter(image_path, [person_output], [1])
+
+            with patch("scripts.wan_sample_export.uuid.uuid4", return_value=SimpleNamespace(hex="poseonlyuuid1234")):
+                sample_dirs = exporter.finalize()
+
+            self.assertEqual(len(sample_dirs), 1)
+            sample_dir = sample_dirs[0]
+            self.assertTrue(os.path.isfile(os.path.join(sample_dir, "pose_meta_sequence.json")))
+            self.assertFalse(os.path.isfile(os.path.join(sample_dir, "smpl_sequence.json")))
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_finalize_writes_bundled_pose_and_optional_smpl_sequences(self):
         from scripts.wan_sample_export import WanSampleExporter
         from scripts.wan_sample_types import WanExportConfig
 
@@ -301,6 +374,7 @@ class WanSampleExportTests(unittest.TestCase):
                     min_track_frames=1,
                     output_dir=export_root,
                     save_pose_meta_json=False,
+                    save_smpl_sequence_json=True,
                 ),
                 face_backend=_FakeFaceBackend(
                     [

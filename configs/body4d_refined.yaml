@@ -30,6 +30,7 @@ runtime:
 
 wan_export:
   enable: false
+  metadata_output_dir: ""
   fps: 25
   resolution_area: [512, 768]
   face_resolution: [512, 512]
@@ -47,6 +48,7 @@ wan_export:
   mask_w_len: 10
   mask_h_len: 20
   save_pose_meta_json: true
+  save_smpl_sequence_json: false
 
 completion:
   enable: true
