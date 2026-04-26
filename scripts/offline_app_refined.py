@@ -280,6 +280,17 @@ def count_video_frames(video_path: str) -> int:
     return frame_count
 
 
+def resolve_video_fps(video_path: str) -> Optional[float]:
+    capture = cv2.VideoCapture(video_path)
+    try:
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+    finally:
+        capture.release()
+    if fps > 0:
+        return fps
+    return None
+
+
 def build_frame_stems(frame_count: int) -> List[str]:
     return [f"{frame_idx:08d}" for frame_idx in range(int(frame_count))]
 
@@ -456,6 +467,28 @@ class RefinedOfflineApp:
         if self.reprompt_events:
             write_debug_json(debug_dir, "reprompt_events.json", self.reprompt_events)
 
+    def _build_sample_fps_summary(self, sample: dict) -> dict:
+        input_type = str(sample.get("input_type") or "")
+        source_fps = None
+        source_fps_source = "unavailable"
+        if input_type == "video":
+            source_fps = resolve_video_fps(str(sample.get("input_video") or ""))
+            source_fps_source = "video_metadata" if source_fps is not None else "unavailable"
+        elif input_type == "images":
+            source_fps_source = "image_sequence"
+
+        wan_export_cfg = to_plain_runtime_dict(cfg_get(self.CONFIG, "wan_export", {}))
+        wan_target_fps = None
+        if bool(wan_export_cfg.get("enable", False)):
+            wan_target_fps = int(wan_export_cfg.get("fps", 25))
+
+        return {
+            "source_fps": source_fps,
+            "source_fps_source": source_fps_source,
+            "rendered_4d_fps": float(getattr(self, "RUNTIME", {}).get("video_fps", 25) or 25),
+            "wan_target_fps": wan_target_fps,
+        }
+
     def _ensure_wan_sample_summary(self, sample: dict) -> tuple[Optional[str], Optional[str]]:
         wan_export_cfg = to_plain_runtime_dict(cfg_get(self.CONFIG, "wan_export", {}))
         if not bool(wan_export_cfg.get("enable", False)):
@@ -509,6 +542,7 @@ class RefinedOfflineApp:
             runtime_payload["runtime_profile"] = runtime_profile
         if sample_uuid:
             runtime_payload["sample_uuid"] = sample_uuid
+        runtime_payload["fps_summary"] = copy.deepcopy(self.sample_summary.get("fps_summary", {}))
 
         self.sample_summary["pipeline_runtime"] = runtime_payload
         if sample_output_dir and os.path.isdir(sample_output_dir):
@@ -523,6 +557,7 @@ class RefinedOfflineApp:
                 sample_uuid,
                 {
                     "pipeline_runtime": runtime_payload,
+                    "fps_summary": copy.deepcopy(self.sample_summary.get("fps_summary", {})),
                 },
             )
         return runtime_payload
@@ -745,6 +780,7 @@ class RefinedOfflineApp:
         try:
             sample = self.prepare_input(input_video, output_dir, skip_existing)
             sample_output_dir = sample.get("output_dir")
+            self.sample_summary["fps_summary"] = self._build_sample_fps_summary(sample)
             sample_uuid, wan_export_root = self._ensure_wan_sample_summary(sample)
             initial_targets = self.detect_initial_targets(sample)
             self.prepare_sample_output(sample["output_dir"], initial_targets["obj_ids"])
@@ -1147,6 +1183,9 @@ def run_refined_pipeline(args) -> None:
     try:
         sample = app.prepare_input(args.input_video, args.output_dir, args.skip_existing)
         sample_output_dir = sample.get("output_dir")
+        fps_summary_builder = getattr(app, "_build_sample_fps_summary", None)
+        if callable(fps_summary_builder):
+            app.sample_summary["fps_summary"] = fps_summary_builder(sample)
         wan_summary_result = app._ensure_wan_sample_summary(sample)
         if isinstance(wan_summary_result, tuple) and len(wan_summary_result) == 2:
             sample_uuid, wan_export_root = wan_summary_result
