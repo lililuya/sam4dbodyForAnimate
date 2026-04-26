@@ -172,20 +172,7 @@ class RefinedCliTests(unittest.TestCase):
             save_debug_metrics=True,
             skip_existing=True,
         )
-        sample = {"frames": ["f0.png", "f1.png"], "output_dir": "./sample_out"}
-        initial_targets = {"obj_ids": [1, 4]}
-        chunks = [{"chunk_id": 0}, {"chunk_id": 1}]
-        raw_chunks = [{"raw": 0}, {"raw": 1}]
-        refined_chunks = [{"refined": 0}, {"refined": 1}]
-        final_chunks = [{"final": 0}, {"final": 1}]
-
         app = unittest.mock.MagicMock()
-        app.prepare_input.return_value = sample
-        app.detect_initial_targets.return_value = initial_targets
-        app.iter_chunks.return_value = chunks
-        app.track_chunk.side_effect = raw_chunks
-        app.refine_chunk_masks.side_effect = refined_chunks
-        app.maybe_reprompt_chunk.side_effect = final_chunks
 
         with patch.object(offline_app_refined, "load_refined_config", return_value=cfg), patch.object(
             offline_app_refined, "RefinedOfflineApp", return_value=app
@@ -209,25 +196,7 @@ class RefinedCliTests(unittest.TestCase):
                 "iou_low_threshold": 0.55,
             },
         )
-        app.prepare_input.assert_called_once_with("sample.mp4", "./custom_out", True)
-        app.detect_initial_targets.assert_called_once_with(sample)
-        app.prepare_sample_output.assert_called_once_with("./sample_out", [1, 4])
-        app.iter_chunks.assert_called_once_with(["f0.png", "f1.png"], 96)
-        self.assertEqual(app.track_chunk.call_args_list, [unittest.mock.call(chunks[0], initial_targets), unittest.mock.call(chunks[1], initial_targets)])
-        self.assertEqual(app.refine_chunk_masks.call_args_list, [unittest.mock.call(raw_chunks[0]), unittest.mock.call(raw_chunks[1])])
-        self.assertEqual(
-            app.maybe_reprompt_chunk.call_args_list,
-            [unittest.mock.call(chunks[0], refined_chunks[0], initial_targets), unittest.mock.call(chunks[1], refined_chunks[1], initial_targets)],
-        )
-        self.assertEqual(
-            app.write_chunk_outputs.call_args_list,
-            [
-                unittest.mock.call(chunks[0], raw_chunks[0], final_chunks[0]),
-                unittest.mock.call(chunks[1], raw_chunks[1], final_chunks[1]),
-            ],
-        )
-        app.run_refined_4d_generation.assert_called_once_with()
-        app.finalize_sample.assert_called_once_with()
+        app.run_sample.assert_called_once_with("sample.mp4", "./custom_out", True, runtime_profile=None)
 
     def test_run_refined_pipeline_finalizes_sample_when_chunk_processing_fails(self):
         import scripts.offline_app_refined as offline_app_refined
@@ -260,10 +229,7 @@ class RefinedCliTests(unittest.TestCase):
             skip_existing=False,
         )
         app = unittest.mock.MagicMock()
-        app.prepare_input.return_value = {"frames": ["f0.png"], "output_dir": "./sample_out"}
-        app.detect_initial_targets.return_value = {"obj_ids": [1]}
-        app.iter_chunks.return_value = [{"chunk_id": 0}]
-        app.track_chunk.side_effect = RuntimeError("chunk failed")
+        app.run_sample.side_effect = RuntimeError("chunk failed")
 
         with patch.object(offline_app_refined, "load_refined_config", return_value=cfg), patch.object(
             offline_app_refined, "RefinedOfflineApp", return_value=app
@@ -271,9 +237,7 @@ class RefinedCliTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "chunk failed"):
                 offline_app_refined.run_refined_pipeline(args)
 
-        app.prepare_sample_output.assert_called_once_with("./sample_out", [1])
-        app.finalize_sample.assert_called_once_with()
-        app.run_refined_4d_generation.assert_not_called()
+        app.run_sample.assert_called_once_with("sample.mp4", None, False, runtime_profile=None)
 
     def test_run_refined_pipeline_finalizes_sample_when_setup_fails(self):
         import scripts.offline_app_refined as offline_app_refined
@@ -306,7 +270,7 @@ class RefinedCliTests(unittest.TestCase):
             skip_existing=False,
         )
         app = unittest.mock.MagicMock()
-        app.prepare_input.side_effect = RuntimeError("setup failed")
+        app.run_sample.side_effect = RuntimeError("setup failed")
 
         with patch.object(offline_app_refined, "load_refined_config", return_value=cfg), patch.object(
             offline_app_refined, "RefinedOfflineApp", return_value=app
@@ -314,10 +278,7 @@ class RefinedCliTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "setup failed"):
                 offline_app_refined.run_refined_pipeline(args)
 
-        app.finalize_sample.assert_called_once_with()
-        self.assertEqual(app.sample_summary["status"], "failed")
-        app.detect_initial_targets.assert_not_called()
-        app.iter_chunks.assert_not_called()
+        app.run_sample.assert_called_once_with("sample.mp4", None, False, runtime_profile=None)
 
     def test_main_routes_through_run_refined_pipeline(self):
         import scripts.offline_app_refined as offline_app_refined
@@ -389,16 +350,13 @@ class RefinedCliTests(unittest.TestCase):
             skip_existing=False,
         )
         app = unittest.mock.MagicMock()
-        app.prepare_input.return_value = {"frames": [], "output_dir": "./sample_out"}
-        app.detect_initial_targets.return_value = {"obj_ids": [1]}
-        app.iter_chunks.return_value = []
 
         with patch.object(offline_app_refined, "load_refined_config", return_value=cfg), patch.object(
             offline_app_refined, "RefinedOfflineApp", return_value=app
         ):
             offline_app_refined.run_refined_pipeline(args)
 
-        app.prepare_input.assert_called_once_with("sample.mp4", None, False)
+        app.run_sample.assert_called_once_with("sample.mp4", None, False, runtime_profile=None)
 
     def test_sync_base_app_runtime_propagates_pose_exports_and_storage_flags(self):
         from scripts.offline_app_refined import RefinedOfflineApp
@@ -1146,6 +1104,161 @@ class RefinedCliTests(unittest.TestCase):
                 },
             )
 
+    def test_run_sample_skips_face_sparse_sample_without_creating_output_dir(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        with make_workspace_tempdir() as tmpdir:
+            export_root = os.path.join(tmpdir, "WanExport")
+            sample_output_dir = os.path.join(tmpdir, "sample_out")
+
+            config = OmegaConf.create(
+                {
+                    "runtime": {"output_dir": "./outputs_refined"},
+                    "tracking": {"chunk_size": 180},
+                    "wan_export": {
+                        "enable": True,
+                        "output_dir": export_root,
+                        "skip_sample_without_face": True,
+                        "face_presence_stride": 5,
+                        "max_no_face_ratio": 0.80,
+                    },
+                    "reprompt": {
+                        "enable": True,
+                        "empty_mask_patience": 3,
+                        "area_drop_ratio": 0.35,
+                        "edge_touch_ratio": 0.4,
+                        "iou_low_threshold": 0.55,
+                    },
+                    "debug": {"save_metrics": False},
+                }
+            )
+            app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+            sample = {
+                "frames": ["00000000", "00000001"],
+                "frame_count": 2,
+                "output_dir": sample_output_dir,
+                "input_video": os.path.join(tmpdir, "sample.mp4"),
+                "input_type": "video",
+            }
+
+            app.prepare_input = unittest.mock.MagicMock(return_value=sample)
+            app.detect_initial_targets = unittest.mock.MagicMock()
+            app.prepare_sample_output = unittest.mock.MagicMock()
+            app.iter_chunks = unittest.mock.MagicMock(return_value=[])
+            app.track_chunk = unittest.mock.MagicMock()
+            app.refine_chunk_masks = unittest.mock.MagicMock()
+            app.maybe_reprompt_chunk = unittest.mock.MagicMock()
+            app.write_chunk_outputs = unittest.mock.MagicMock()
+            app.run_refined_4d_generation = unittest.mock.MagicMock()
+
+            with patch.object(
+                app,
+                "_probe_sample_face_presence",
+                return_value={
+                    "checked_frame_count": 5,
+                    "face_detected_frame_count": 1,
+                    "no_face_frame_count": 4,
+                    "no_face_ratio": 0.80,
+                    "face_presence_stride": 5,
+                    "max_no_face_ratio": 0.80,
+                    "skip_sample_without_face": True,
+                },
+                create=True,
+            ), patch("scripts.offline_app_refined.time.perf_counter", side_effect=[30.0, 31.5]):
+                summary = app.run_sample("sample.mp4", "./custom_out", skip_existing=False, runtime_profile=None)
+
+            self.assertEqual(summary["status"], "skipped")
+            self.assertEqual(summary["skip_reason"], "face_presence_below_threshold")
+            self.assertFalse(os.path.exists(sample_output_dir))
+            app.detect_initial_targets.assert_not_called()
+            app.prepare_sample_output.assert_not_called()
+            app.run_refined_4d_generation.assert_not_called()
+
+            ledger_path = os.path.join(export_root, "sample_issue_ledger.json")
+            self.assertTrue(os.path.isfile(ledger_path))
+            with open(ledger_path, "r", encoding="utf-8") as handle:
+                ledger = json.load(handle)
+
+            self.assertGreaterEqual(len(ledger["items"]), 1)
+            self.assertEqual(ledger["items"][-1]["event_type"], "sample_skipped_no_face")
+            self.assertEqual(ledger["items"][-1]["reason"], "face_presence_below_threshold")
+            self.assertEqual(ledger["items"][-1]["details"]["no_face_ratio"], 0.80)
+
+    def test_run_sample_records_failed_case_in_issue_ledger(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        with make_workspace_tempdir() as tmpdir:
+            export_root = os.path.join(tmpdir, "WanExport")
+            sample_output_dir = os.path.join(tmpdir, "sample_out")
+
+            config = OmegaConf.create(
+                {
+                    "runtime": {"output_dir": "./outputs_refined"},
+                    "tracking": {"chunk_size": 180},
+                    "wan_export": {
+                        "enable": True,
+                        "output_dir": export_root,
+                        "skip_sample_without_face": True,
+                        "face_presence_stride": 5,
+                        "max_no_face_ratio": 0.80,
+                    },
+                    "reprompt": {
+                        "enable": True,
+                        "empty_mask_patience": 3,
+                        "area_drop_ratio": 0.35,
+                        "edge_touch_ratio": 0.4,
+                        "iou_low_threshold": 0.55,
+                    },
+                    "debug": {"save_metrics": False},
+                }
+            )
+            app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+            sample = {
+                "frames": ["00000000", "00000001"],
+                "frame_count": 2,
+                "output_dir": sample_output_dir,
+                "input_video": os.path.join(tmpdir, "sample.mp4"),
+                "input_type": "video",
+            }
+
+            app.prepare_input = unittest.mock.MagicMock(return_value=sample)
+            app.detect_initial_targets = unittest.mock.MagicMock(side_effect=RuntimeError("tracker failed"))
+            app.prepare_sample_output = unittest.mock.MagicMock()
+            app.iter_chunks = unittest.mock.MagicMock(return_value=[])
+            app.track_chunk = unittest.mock.MagicMock()
+            app.refine_chunk_masks = unittest.mock.MagicMock()
+            app.maybe_reprompt_chunk = unittest.mock.MagicMock()
+            app.write_chunk_outputs = unittest.mock.MagicMock()
+            app.run_refined_4d_generation = unittest.mock.MagicMock()
+
+            with patch.object(
+                app,
+                "_probe_sample_face_presence",
+                return_value={
+                    "checked_frame_count": 5,
+                    "face_detected_frame_count": 5,
+                    "no_face_frame_count": 0,
+                    "no_face_ratio": 0.0,
+                    "face_presence_stride": 5,
+                    "max_no_face_ratio": 0.80,
+                    "skip_sample_without_face": True,
+                },
+                create=True,
+            ), patch("scripts.offline_app_refined.time.perf_counter", side_effect=[40.0, 41.0]):
+                with self.assertRaisesRegex(RuntimeError, "tracker failed"):
+                    app.run_sample("sample.mp4", "./custom_out", skip_existing=False, runtime_profile=None)
+
+            ledger_path = os.path.join(export_root, "sample_issue_ledger.json")
+            self.assertTrue(os.path.isfile(ledger_path))
+            with open(ledger_path, "r", encoding="utf-8") as handle:
+                ledger = json.load(handle)
+
+            self.assertGreaterEqual(len(ledger["items"]), 1)
+            self.assertEqual(ledger["items"][-1]["event_type"], "sample_failed")
+            self.assertEqual(ledger["items"][-1]["reason"], "pipeline_exception")
+            self.assertEqual(ledger["items"][-1]["details"]["error_type"], "RuntimeError")
+            self.assertEqual(ledger["items"][-1]["details"]["error_message"], "tracker failed")
+
     def test_run_sample_finalizes_and_marks_failed_when_setup_fails(self):
         from scripts.offline_app_refined import RefinedOfflineApp
 
@@ -1288,6 +1401,194 @@ class RefinedCliTests(unittest.TestCase):
         self.assertEqual(int(config.sam_3d_body.batch_size), 32)
         self.assertEqual(int(config.batch.initial_search_frames), 24)
         self.assertIs(app.CONFIG, config)
+
+    def test_run_sample_packages_4d_into_targets_and_cleans_workdir(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+        from scripts.wan_sample_export import update_wan_sample_summary
+
+        with make_workspace_tempdir() as tmpdir:
+            export_root = os.path.join(tmpdir, "WanExport")
+            sample_output_dir = os.path.join(tmpdir, "sample_out")
+            config = OmegaConf.create(
+                {
+                    "runtime": {"output_dir": "./outputs_refined"},
+                    "tracking": {"chunk_size": 180},
+                    "wan_export": {
+                        "enable": True,
+                        "output_dir": export_root,
+                        "copy_rendered_4d_to_targets": True,
+                        "cleanup_sample_workdir_after_export": True,
+                    },
+                    "reprompt": {
+                        "enable": True,
+                        "empty_mask_patience": 3,
+                        "area_drop_ratio": 0.35,
+                        "edge_touch_ratio": 0.4,
+                        "iou_low_threshold": 0.55,
+                    },
+                    "debug": {"save_metrics": True},
+                }
+            )
+            app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+            sample = {
+                "frames": [],
+                "frame_count": 2,
+                "output_dir": sample_output_dir,
+                "input_video": os.path.join(tmpdir, "sample.mp4"),
+                "input_type": "video",
+            }
+
+            app.prepare_input = unittest.mock.MagicMock(return_value=sample)
+            app.detect_initial_targets = unittest.mock.MagicMock(return_value={"obj_ids": [1]})
+            app.iter_chunks = unittest.mock.MagicMock(return_value=[])
+            app.track_chunk = unittest.mock.MagicMock()
+            app.refine_chunk_masks = unittest.mock.MagicMock()
+            app.maybe_reprompt_chunk = unittest.mock.MagicMock()
+            app.write_chunk_outputs = unittest.mock.MagicMock()
+
+            def build_final_outputs():
+                images_dir = os.path.join(sample_output_dir, "images")
+                masks_dir = os.path.join(sample_output_dir, "masks")
+                rendered_frames_dir = os.path.join(sample_output_dir, "rendered_frames")
+                completion_dir = os.path.join(sample_output_dir, "completion_refined")
+                local_wan_dir = os.path.join(sample_output_dir, "wan_export")
+                os.makedirs(images_dir, exist_ok=True)
+                os.makedirs(masks_dir, exist_ok=True)
+                os.makedirs(rendered_frames_dir, exist_ok=True)
+                os.makedirs(completion_dir, exist_ok=True)
+                os.makedirs(local_wan_dir, exist_ok=True)
+                with open(os.path.join(images_dir, "keep.txt"), "w", encoding="utf-8") as handle:
+                    handle.write("x")
+                with open(os.path.join(masks_dir, "keep.txt"), "w", encoding="utf-8") as handle:
+                    handle.write("x")
+                with open(os.path.join(rendered_frames_dir, "keep.txt"), "w", encoding="utf-8") as handle:
+                    handle.write("x")
+                with open(os.path.join(completion_dir, "keep.txt"), "w", encoding="utf-8") as handle:
+                    handle.write("x")
+                with open(os.path.join(local_wan_dir, "keep.txt"), "w", encoding="utf-8") as handle:
+                    handle.write("x")
+                final_4d_path = os.path.join(sample_output_dir, "4d_123456.mp4")
+                with open(final_4d_path, "wb") as handle:
+                    handle.write(b"fake-4d")
+                target_dir = os.path.join(export_root, "runtimeuuid123456_target1")
+                os.makedirs(target_dir, exist_ok=True)
+                update_wan_sample_summary(
+                    export_root,
+                    "runtimeuuid123456",
+                    {
+                        "exported_targets": [
+                            {
+                                "track_id": 1,
+                                "sample_dir": target_dir,
+                                "frame_count": 2,
+                            }
+                        ],
+                        "exported_target_count": 1,
+                    },
+                )
+                return final_4d_path
+
+            app.run_refined_4d_generation = unittest.mock.MagicMock(side_effect=build_final_outputs)
+
+            with patch.object(
+                app,
+                "_probe_sample_face_presence",
+                return_value={
+                    "checked_frame_count": 2,
+                    "face_detected_frame_count": 2,
+                    "no_face_frame_count": 0,
+                    "no_face_ratio": 0.0,
+                    "face_presence_stride": 5,
+                    "max_no_face_ratio": 0.80,
+                    "skip_sample_without_face": True,
+                },
+                create=True,
+            ), patch("scripts.wan_sample_export.uuid.uuid4", return_value=SimpleNamespace(hex="runtimeuuid123456")):
+                app.run_sample("sample.mp4", "./custom_out", skip_existing=False, runtime_profile=None)
+
+            self.assertTrue(os.path.isfile(os.path.join(sample_output_dir, "sample_runtime.json")))
+            self.assertTrue(os.path.isdir(os.path.join(sample_output_dir, "debug_metrics")))
+            self.assertFalse(os.path.exists(os.path.join(sample_output_dir, "images")))
+            self.assertFalse(os.path.exists(os.path.join(sample_output_dir, "masks")))
+            self.assertFalse(os.path.exists(os.path.join(sample_output_dir, "rendered_frames")))
+            self.assertFalse(os.path.exists(os.path.join(sample_output_dir, "completion_refined")))
+            self.assertFalse(os.path.exists(os.path.join(sample_output_dir, "wan_export")))
+            self.assertFalse(os.path.exists(os.path.join(sample_output_dir, "4d_123456.mp4")))
+            self.assertTrue(os.path.isfile(os.path.join(export_root, "runtimeuuid123456_target1", "4d.mp4")))
+
+    def test_run_sample_skips_cleanup_when_no_wan_targets_exported(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        with make_workspace_tempdir() as tmpdir:
+            export_root = os.path.join(tmpdir, "WanExport")
+            sample_output_dir = os.path.join(tmpdir, "sample_out")
+            config = OmegaConf.create(
+                {
+                    "runtime": {"output_dir": "./outputs_refined"},
+                    "tracking": {"chunk_size": 180},
+                    "wan_export": {
+                        "enable": True,
+                        "output_dir": export_root,
+                        "copy_rendered_4d_to_targets": True,
+                        "cleanup_sample_workdir_after_export": True,
+                    },
+                    "reprompt": {
+                        "enable": True,
+                        "empty_mask_patience": 3,
+                        "area_drop_ratio": 0.35,
+                        "edge_touch_ratio": 0.4,
+                        "iou_low_threshold": 0.55,
+                    },
+                    "debug": {"save_metrics": True},
+                }
+            )
+            app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+            sample = {
+                "frames": [],
+                "frame_count": 2,
+                "output_dir": sample_output_dir,
+                "input_video": os.path.join(tmpdir, "sample.mp4"),
+                "input_type": "video",
+            }
+
+            app.prepare_input = unittest.mock.MagicMock(return_value=sample)
+            app.detect_initial_targets = unittest.mock.MagicMock(return_value={"obj_ids": [1]})
+            app.iter_chunks = unittest.mock.MagicMock(return_value=[])
+            app.track_chunk = unittest.mock.MagicMock()
+            app.refine_chunk_masks = unittest.mock.MagicMock()
+            app.maybe_reprompt_chunk = unittest.mock.MagicMock()
+            app.write_chunk_outputs = unittest.mock.MagicMock()
+
+            def build_partial_outputs():
+                images_dir = os.path.join(sample_output_dir, "images")
+                os.makedirs(images_dir, exist_ok=True)
+                with open(os.path.join(images_dir, "keep.txt"), "w", encoding="utf-8") as handle:
+                    handle.write("x")
+                final_4d_path = os.path.join(sample_output_dir, "4d_123456.mp4")
+                with open(final_4d_path, "wb") as handle:
+                    handle.write(b"fake-4d")
+                return final_4d_path
+
+            app.run_refined_4d_generation = unittest.mock.MagicMock(side_effect=build_partial_outputs)
+
+            with patch.object(
+                app,
+                "_probe_sample_face_presence",
+                return_value={
+                    "checked_frame_count": 2,
+                    "face_detected_frame_count": 2,
+                    "no_face_frame_count": 0,
+                    "no_face_ratio": 0.0,
+                    "face_presence_stride": 5,
+                    "max_no_face_ratio": 0.80,
+                    "skip_sample_without_face": True,
+                },
+                create=True,
+            ), patch("scripts.wan_sample_export.uuid.uuid4", return_value=SimpleNamespace(hex="runtimeuuid123456")):
+                app.run_sample("sample.mp4", "./custom_out", skip_existing=False, runtime_profile=None)
+
+            self.assertTrue(os.path.exists(os.path.join(sample_output_dir, "images")))
+            self.assertTrue(os.path.exists(os.path.join(sample_output_dir, "4d_123456.mp4")))
 
 
 if __name__ == "__main__":

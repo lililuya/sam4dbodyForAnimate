@@ -50,6 +50,16 @@ wan_export:
   face_expand: 1.30
   # Fill short face-detection gaps with the previous valid target face box.
   face_gap: 8
+  # Skip samples early when sampled frames contain too few detectable faces.
+  skip_sample_without_face: true
+  # Check face presence on every Nth frame before refined tracking begins.
+  face_presence_stride: 5
+  # Skip when the sampled no-face ratio reaches or exceeds this threshold.
+  max_no_face_ratio: 0.80
+  # Copy the final rendered 4D video into each exported target directory.
+  copy_rendered_4d_to_targets: true
+  # Remove heavy refined intermediates after successful Wan export packaging.
+  cleanup_sample_workdir_after_export: true
   # Mask augmentation settings for src_mask.mp4. Background export still only removes the raw target body region.
   mask_kernel_size: 7
   mask_iterations: 3

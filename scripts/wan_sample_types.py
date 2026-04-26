@@ -35,6 +35,11 @@ class WanExportConfig:
     min_valid_face_ratio: float = 0.60
     face_expand: float = 1.30
     face_gap: int = 8
+    skip_sample_without_face: bool = True
+    face_presence_stride: int = 5
+    max_no_face_ratio: float = 0.80
+    copy_rendered_4d_to_targets: bool = True
+    cleanup_sample_workdir_after_export: bool = True
     mask_kernel_size: int = 7
     mask_iterations: int = 3
     mask_w_len: int = 10
@@ -54,6 +59,13 @@ class WanExportConfig:
             min_valid_face_ratio=float(payload.get("min_valid_face_ratio", 0.60)),
             face_expand=float(payload.get("face_expand", 1.30)),
             face_gap=int(payload.get("face_gap", 8)),
+            skip_sample_without_face=_coerce_bool(payload.get("skip_sample_without_face", True)),
+            face_presence_stride=int(payload.get("face_presence_stride", 5)),
+            max_no_face_ratio=float(payload.get("max_no_face_ratio", 0.80)),
+            copy_rendered_4d_to_targets=_coerce_bool(payload.get("copy_rendered_4d_to_targets", True)),
+            cleanup_sample_workdir_after_export=_coerce_bool(
+                payload.get("cleanup_sample_workdir_after_export", True)
+            ),
             mask_kernel_size=int(payload.get("mask_kernel_size", 7)),
             mask_iterations=int(payload.get("mask_iterations", 3)),
             mask_w_len=int(payload.get("mask_w_len", 10)),

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from datetime import datetime, timezone
 from typing import Iterable
 import uuid
 
@@ -18,6 +19,7 @@ from scripts.wan_sample_types import WanExportConfig
 
 
 SOURCE_UUID_MAP_FILENAME = "source_uuid_map.json"
+ISSUE_LEDGER_FILENAME = "sample_issue_ledger.json"
 
 
 class CompositeFrameWriter:
@@ -65,6 +67,18 @@ def _write_json(path: str, payload: dict) -> None:
         json.dump(payload, handle, indent=2)
 
 
+def _to_json_safe(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): _to_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_json_safe(item) for item in value]
+    return value
+
+
 def _merge_dicts(base: dict, updates: dict) -> dict:
     merged = dict(base)
     for key, value in updates.items():
@@ -93,6 +107,10 @@ def get_wan_summary_path(export_root: str, sample_uuid: str) -> str:
 
 def get_wan_skipped_path(export_root: str, sample_uuid: str) -> str:
     return os.path.join(os.path.abspath(export_root), f"{sample_uuid}_skipped.json")
+
+
+def get_wan_issue_ledger_path(root_dir: str) -> str:
+    return os.path.join(os.path.abspath(root_dir), ISSUE_LEDGER_FILENAME)
 
 
 def resolve_or_create_wan_sample_uuid(
@@ -144,6 +162,23 @@ def write_wan_skipped_report(export_root: str, sample_uuid: str, payload: dict) 
     report = {"sample_uuid": str(sample_uuid), **dict(payload or {})}
     _write_json(get_wan_skipped_path(export_root, sample_uuid), report)
     return report
+
+
+def append_wan_issue_records(root_dir: str, records: list[dict]) -> dict:
+    ledger_path = get_wan_issue_ledger_path(root_dir)
+    ledger = _read_json_dict(ledger_path)
+    items = ledger.get("items")
+    if not isinstance(items, list):
+        items = []
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        items.append(dict(record))
+
+    ledger["items"] = items
+    _write_json(ledger_path, ledger)
+    return ledger
 
 
 def _resolve_source_fps(source_video_path: str | None, default_fps: float) -> float:
@@ -237,6 +272,7 @@ class WanSampleExporter:
         self.sample_uuid = None
         self.face_backend = face_backend or InsightFaceBackend()
         self._records: list[dict] = []
+        self.finalized_targets: list[dict] = []
 
     def __call__(self, image_path, mask_output, id_current):
         frame_stem = os.path.splitext(os.path.basename(image_path))[0]
@@ -305,6 +341,7 @@ class WanSampleExporter:
 
         written: list[str] = []
         written_targets: list[dict] = []
+        self.finalized_targets = []
         skipped_targets: list[dict] = []
         for track_id in track_ids:
             track_records = [record for record in sampled_records if track_id in record["person_outputs"]]
@@ -365,6 +402,7 @@ class WanSampleExporter:
                         "bg_rgb": bg_rgb,
                         "target_mask": target_mask,
                         "person_output": scaled_person_output,
+                        "raw_person_output": record["person_outputs"][track_id],
                     }
                 )
 
@@ -446,12 +484,42 @@ class WanSampleExporter:
 
             sample_dir = self._resolve_sample_dir(track_id)
             os.makedirs(sample_dir, exist_ok=True)
+            sample_uuid = self._ensure_sample_uuid()
             if self.config.save_pose_meta_json:
                 pose_meta_json_dir = os.path.join(sample_dir, "pose_meta_json")
                 os.makedirs(pose_meta_json_dir, exist_ok=True)
                 for frame_stem, pose_meta in pose_meta_records:
                     with open(os.path.join(pose_meta_json_dir, f"{frame_stem}.json"), "w", encoding="utf-8") as handle:
                         json.dump(pose_meta, handle, indent=2)
+
+            _write_json(
+                os.path.join(sample_dir, "pose_meta_sequence.json"),
+                {
+                    "sample_id": self.sample_id,
+                    "sample_uuid": sample_uuid,
+                    "track_id": int(track_id),
+                    "source_path": self.source_reference,
+                    "frame_count": len(pose_meta_records),
+                    "records": [pose_meta for _, pose_meta in pose_meta_records],
+                },
+            )
+            _write_json(
+                os.path.join(sample_dir, "smpl_sequence.json"),
+                {
+                    "sample_id": self.sample_id,
+                    "sample_uuid": sample_uuid,
+                    "track_id": int(track_id),
+                    "source_path": self.source_reference,
+                    "frame_count": len(frame_payloads),
+                    "records": [
+                        {
+                            "frame_stem": payload["frame_stem"],
+                            "person_output": _to_json_safe(payload["raw_person_output"]),
+                        }
+                        for payload in frame_payloads
+                    ],
+                },
+            )
 
             self._write_mp4(target_frames, os.path.join(sample_dir, "target.mp4"), self.config.fps)
             self._write_mp4(pose_frames, os.path.join(sample_dir, "src_pose.mp4"), self.config.fps)
@@ -486,6 +554,7 @@ class WanSampleExporter:
                     "valid_face_ratio": valid_face_ratio,
                 }
             )
+            self.finalized_targets.append(dict(written_targets[-1]))
 
         sample_uuid = self._ensure_sample_uuid()
         if self.export_root and sample_uuid:
@@ -511,5 +580,24 @@ class WanSampleExporter:
                     "skipped_targets": skipped_targets,
                 },
             )
+            if skipped_targets:
+                append_wan_issue_records(
+                    self.export_root,
+                    [
+                        {
+                            "recorded_at": datetime.now(timezone.utc).isoformat(),
+                            "event_type": "wan_target_skipped",
+                            "status": "skipped",
+                            "reason": str(skipped_target.get("reason", "unknown")),
+                            "source_path": self.source_reference,
+                            "sample_id": self.sample_id,
+                            "sample_uuid": sample_uuid,
+                            "working_output_dir": self.working_output_dir,
+                            "runtime_profile": None,
+                            "details": dict(skipped_target),
+                        }
+                        for skipped_target in skipped_targets
+                    ],
+                )
 
         return written

@@ -7,7 +7,7 @@ import shutil
 import sys
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from contextlib import nullcontext
 from typing import Dict, Iterable, List, Optional
 
@@ -427,6 +427,7 @@ class RefinedOfflineApp:
         self._base_module = None
         self._base_app = None
         self._detector_signature = None
+        self._face_backend = None
         self.reset_sample_state()
 
     def reset_sample_state(self):
@@ -445,6 +446,13 @@ class RefinedOfflineApp:
         self._last_track_boxes = {}
 
     def prepare_sample_output(self, output_dir: str, obj_ids: Iterable[int]):
+        output_dir = os.path.abspath(output_dir)
+        self.OUTPUT_DIR = output_dir
+        if self.sample_state:
+            self.sample_state["output_dir"] = output_dir
+            self.sample_state["output_dir_ready"] = True
+        if self._base_app is not None:
+            self._sync_base_app_runtime(self._base_app, output_dir)
         self.chunk_records = []
         self.output_paths = prepare_output_dirs(
             output_dir,
@@ -489,6 +497,135 @@ class RefinedOfflineApp:
             "wan_target_fps": wan_target_fps,
         }
 
+    def _resolve_sample_identity(self, sample: Optional[dict] = None, input_video: Optional[str] = None) -> dict:
+        sample = dict(sample or {})
+        source_path = os.path.abspath(
+            str(sample.get("input_video") or input_video or self.sample_state.get("input_video") or "")
+        )
+        working_output_dir = sample.get("output_dir") or self.sample_state.get("output_dir")
+        sample_id = os.path.splitext(os.path.basename(source_path))[0] or os.path.basename(
+            os.path.abspath(str(working_output_dir or "sample"))
+        )
+        return {
+            "sample_id": sample_id,
+            "source_path": source_path,
+            "working_output_dir": None if not working_output_dir else os.path.abspath(str(working_output_dir)),
+        }
+
+    def _resolve_issue_ledger_root(self, sample: Optional[dict] = None) -> str:
+        wan_export_cfg = to_plain_runtime_dict(cfg_get(self.CONFIG, "wan_export", {}))
+        export_root = str(wan_export_cfg.get("output_dir") or "").strip()
+        if export_root:
+            return os.path.abspath(export_root)
+
+        configured_output_root = os.path.abspath(
+            str(cfg_get(self.CONFIG, "runtime.output_dir", os.path.join(ROOT, "outputs_refined")))
+        )
+        planned_output_dir = None if not sample else sample.get("output_dir")
+        if planned_output_dir:
+            planned_output_dir_abs = os.path.abspath(str(planned_output_dir))
+            if planned_output_dir_abs == configured_output_root:
+                return configured_output_root
+            return os.path.dirname(planned_output_dir_abs) or configured_output_root
+        return configured_output_root
+
+    def _append_issue_ledger_record(self, record: dict, sample: Optional[dict] = None) -> None:
+        from scripts.wan_sample_export import append_wan_issue_records
+
+        append_wan_issue_records(self._resolve_issue_ledger_root(sample), [record])
+
+    def _build_issue_ledger_record(
+        self,
+        *,
+        event_type: str,
+        status: str,
+        reason: str,
+        sample: Optional[dict] = None,
+        sample_uuid: Optional[str] = None,
+        runtime_profile: Optional[dict] = None,
+        details: Optional[dict] = None,
+        input_video: Optional[str] = None,
+    ) -> dict:
+        identity = self._resolve_sample_identity(sample, input_video=input_video)
+        return {
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "event_type": str(event_type),
+            "status": str(status),
+            "reason": str(reason),
+            "source_path": identity["source_path"],
+            "sample_id": identity["sample_id"],
+            "sample_uuid": None if not sample_uuid else str(sample_uuid),
+            "working_output_dir": identity["working_output_dir"],
+            "runtime_profile": None if runtime_profile is None else copy.deepcopy(runtime_profile),
+            "details": dict(details or {}),
+        }
+
+    def _ensure_face_backend(self):
+        if self._face_backend is None:
+            from scripts.wan_face_export import InsightFaceBackend
+
+            self._face_backend = InsightFaceBackend()
+        return self._face_backend
+
+    def _probe_sample_face_presence(self, sample: dict) -> dict:
+        from scripts.wan_sample_types import WanExportConfig
+
+        wan_cfg = WanExportConfig.from_runtime(cfg_get(self.CONFIG, "wan_export", {}))
+        stride = max(1, int(wan_cfg.face_presence_stride))
+        summary = {
+            "checked_frame_count": 0,
+            "face_detected_frame_count": 0,
+            "no_face_frame_count": 0,
+            "no_face_ratio": 0.0,
+            "face_presence_stride": stride,
+            "max_no_face_ratio": float(wan_cfg.max_no_face_ratio),
+            "skip_sample_without_face": bool(wan_cfg.skip_sample_without_face),
+            "probe_executed": False,
+        }
+        if not bool(wan_cfg.enable) or not bool(wan_cfg.skip_sample_without_face):
+            return summary
+
+        frame_count = int(sample.get("frame_count", 0) or 0)
+        if frame_count <= 0:
+            return summary
+
+        frame_indices = list(range(0, frame_count, stride))
+        if not frame_indices:
+            frame_indices = [0]
+
+        backend = self._ensure_face_backend()
+        face_detected_frame_count = 0
+        for frame_idx in frame_indices:
+            frame_rgb = self._load_source_frame(sample, frame_idx)
+            detections = backend.detect(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+            if detections:
+                face_detected_frame_count += 1
+
+        checked_frame_count = len(frame_indices)
+        no_face_frame_count = max(0, checked_frame_count - face_detected_frame_count)
+        no_face_ratio = float(no_face_frame_count) / float(max(checked_frame_count, 1))
+        summary.update(
+            {
+                "checked_frame_count": checked_frame_count,
+                "face_detected_frame_count": face_detected_frame_count,
+                "no_face_frame_count": no_face_frame_count,
+                "no_face_ratio": no_face_ratio,
+                "probe_executed": True,
+            }
+        )
+        return summary
+
+    def _should_skip_sample_for_face_presence(self, face_presence: dict) -> bool:
+        from scripts.wan_sample_types import WanExportConfig
+
+        wan_cfg = WanExportConfig.from_runtime(cfg_get(self.CONFIG, "wan_export", {}))
+        if not bool(wan_cfg.enable) or not bool(wan_cfg.skip_sample_without_face):
+            return False
+        checked_frame_count = int(face_presence.get("checked_frame_count", 0) or 0)
+        if checked_frame_count <= 0:
+            return False
+        return float(face_presence.get("no_face_ratio", 0.0) or 0.0) >= float(wan_cfg.max_no_face_ratio)
+
     def _ensure_wan_sample_summary(self, sample: dict) -> tuple[Optional[str], Optional[str]]:
         wan_export_cfg = to_plain_runtime_dict(cfg_get(self.CONFIG, "wan_export", {}))
         if not bool(wan_export_cfg.get("enable", False)):
@@ -500,11 +637,10 @@ class RefinedOfflineApp:
 
         from scripts.wan_sample_export import resolve_or_create_wan_sample_uuid, update_wan_sample_summary
 
-        source_path = os.path.abspath(str(sample.get("input_video") or self.sample_state.get("input_video") or ""))
-        sample_output_dir = sample.get("output_dir")
-        sample_id = os.path.splitext(os.path.basename(source_path))[0] or os.path.basename(
-            os.path.abspath(str(sample_output_dir or "sample"))
-        )
+        identity = self._resolve_sample_identity(sample)
+        source_path = identity["source_path"]
+        sample_id = identity["sample_id"]
+        sample_output_dir = identity["working_output_dir"]
         sample_uuid = resolve_or_create_wan_sample_uuid(
             export_root,
             source_path,
@@ -523,6 +659,92 @@ class RefinedOfflineApp:
         )
         self.sample_summary["sample_uuid"] = sample_uuid
         return sample_uuid, os.path.abspath(export_root)
+
+    def _load_wan_exported_target_dirs(self, sample_uuid: Optional[str], wan_export_root: Optional[str]) -> list[str]:
+        if not sample_uuid or not wan_export_root:
+            return []
+
+        from scripts.wan_sample_export import get_wan_summary_path
+
+        summary_path = get_wan_summary_path(wan_export_root, sample_uuid)
+        if not os.path.isfile(summary_path):
+            return []
+
+        with open(summary_path, "r", encoding="utf-8") as handle:
+            try:
+                payload = json.load(handle)
+            except json.JSONDecodeError:
+                return []
+
+        exported_targets = payload.get("exported_targets")
+        if not isinstance(exported_targets, list):
+            return []
+
+        target_dirs: list[str] = []
+        for target in exported_targets:
+            if not isinstance(target, dict):
+                continue
+            sample_dir = str(target.get("sample_dir", "")).strip()
+            if not sample_dir:
+                continue
+            target_dirs.append(os.path.abspath(sample_dir))
+        return target_dirs
+
+    def _copy_rendered_4d_to_wan_targets(self, final_4d_path: Optional[str], target_dirs: list[str]) -> None:
+        if not final_4d_path or not os.path.isfile(final_4d_path):
+            return
+        for target_dir in target_dirs:
+            os.makedirs(target_dir, exist_ok=True)
+            shutil.copy2(final_4d_path, os.path.join(target_dir, "4d.mp4"))
+
+    def _cleanup_sample_workdir_after_export(self, sample_output_dir: Optional[str]) -> None:
+        if not sample_output_dir or not os.path.isdir(sample_output_dir):
+            return
+
+        removable_dirs = [
+            "images",
+            "masks",
+            "masks_raw",
+            "masks_refined",
+            "rendered_frames",
+            "rendered_frames_individual",
+            "mesh_4d_individual",
+            "focal_4d_individual",
+            "completion_refined",
+            "wan_export",
+        ]
+        for dirname in removable_dirs:
+            path = os.path.join(sample_output_dir, dirname)
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+
+        for video_path in glob.glob(os.path.join(sample_output_dir, "4d_*.mp4")):
+            if os.path.isfile(video_path):
+                os.remove(video_path)
+
+    def _package_successful_wan_export_outputs(
+        self,
+        *,
+        sample_output_dir: Optional[str],
+        sample_uuid: Optional[str],
+        wan_export_root: Optional[str],
+        final_4d_path: Optional[str],
+    ) -> list[str]:
+        from scripts.wan_sample_types import WanExportConfig
+
+        wan_cfg = WanExportConfig.from_runtime(cfg_get(self.CONFIG, "wan_export", {}))
+        if not bool(wan_cfg.enable):
+            return []
+
+        target_dirs = self._load_wan_exported_target_dirs(sample_uuid, wan_export_root)
+        if not target_dirs:
+            return []
+
+        if bool(wan_cfg.copy_rendered_4d_to_targets):
+            self._copy_rendered_4d_to_wan_targets(final_4d_path, target_dirs)
+        if bool(wan_cfg.cleanup_sample_workdir_after_export):
+            self._cleanup_sample_workdir_after_export(sample_output_dir)
+        return target_dirs
 
     def _persist_sample_runtime(
         self,
@@ -566,7 +788,8 @@ class RefinedOfflineApp:
         if self._base_app is None:
             self._base_module = load_base_offline_module()
             self._base_app = self._base_module.OfflineApp(config_path=self.config_path)
-        self._sync_base_app_runtime(self._base_app, self.sample_state.get("output_dir"))
+        output_dir = self.sample_state.get("output_dir") if self.sample_state.get("output_dir_ready") else None
+        self._sync_base_app_runtime(self._base_app, output_dir)
         return self._base_app
 
     def _sync_base_app_runtime(self, runtime_app, output_dir: Optional[str] = None):
@@ -773,6 +996,7 @@ class RefinedOfflineApp:
         self.sample_config = sample_cfg
         self.sample_summary = {"status": "running", "runtime_profile": resolved_runtime_profile}
         pipeline_start = time.perf_counter()
+        sample = None
         sample_output_dir = None
         sample_uuid = None
         wan_export_root = None
@@ -781,6 +1005,24 @@ class RefinedOfflineApp:
             sample = self.prepare_input(input_video, output_dir, skip_existing)
             sample_output_dir = sample.get("output_dir")
             self.sample_summary["fps_summary"] = self._build_sample_fps_summary(sample)
+            face_presence = self._probe_sample_face_presence(sample)
+            self.sample_summary["face_presence"] = face_presence
+            if self._should_skip_sample_for_face_presence(face_presence):
+                self.sample_summary["status"] = "skipped"
+                self.sample_summary["skip_reason"] = "face_presence_below_threshold"
+                self._append_issue_ledger_record(
+                    self._build_issue_ledger_record(
+                        event_type="sample_skipped_no_face",
+                        status="skipped",
+                        reason="face_presence_below_threshold",
+                        sample=sample,
+                        runtime_profile=resolved_runtime_profile,
+                        details=face_presence,
+                    ),
+                    sample=sample,
+                )
+                return self.sample_summary
+
             sample_uuid, wan_export_root = self._ensure_wan_sample_summary(sample)
             initial_targets = self.detect_initial_targets(sample)
             self.prepare_sample_output(sample["output_dir"], initial_targets["obj_ids"])
@@ -791,10 +1033,34 @@ class RefinedOfflineApp:
                 final_chunk = self.maybe_reprompt_chunk(chunk, refined_chunk, initial_targets)
                 self.write_chunk_outputs(chunk, raw_chunk, final_chunk)
 
-            self.run_refined_4d_generation()
+            final_4d_path = self.run_refined_4d_generation()
+            target_dirs = self._package_successful_wan_export_outputs(
+                sample_output_dir=sample_output_dir,
+                sample_uuid=sample_uuid,
+                wan_export_root=wan_export_root,
+                final_4d_path=final_4d_path,
+            )
+            if target_dirs:
+                self.sample_summary["exported_target_dirs"] = list(target_dirs)
             self.sample_summary["status"] = "completed"
-        except Exception:
+        except Exception as exc:
             self.sample_summary["status"] = "failed"
+            self._append_issue_ledger_record(
+                self._build_issue_ledger_record(
+                    event_type="sample_failed",
+                    status="failed",
+                    reason="pipeline_exception",
+                    sample=sample,
+                    sample_uuid=sample_uuid,
+                    runtime_profile=resolved_runtime_profile,
+                    details={
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                    },
+                    input_video=input_video,
+                ),
+                sample=sample,
+            )
             raise
         finally:
             self._persist_sample_runtime(
@@ -848,13 +1114,11 @@ class RefinedOfflineApp:
             output_dir,
             cfg_get(self.CONFIG, "runtime.output_dir", os.path.join(ROOT, "outputs_refined")),
         )
-        os.makedirs(resolved_output_dir, exist_ok=True)
         sample["output_dir"] = resolved_output_dir
+        sample["output_dir_ready"] = False
 
         self.sample_state = dict(sample)
         self.OUTPUT_DIR = resolved_output_dir
-        if self._base_app is not None:
-            self._sync_base_app_runtime(self._base_app, resolved_output_dir)
         return dict(sample)
 
     def detect_initial_targets(self, sample: dict) -> dict:
@@ -1175,43 +1439,7 @@ def run_refined_pipeline(args) -> None:
     print(f"Loaded refined config for detector backend: {cfg.detector.backend}")
     app = RefinedOfflineApp(args.config, config=cfg)
     app.reprompt_thresholds = build_reprompt_thresholds(cfg)
-    app.sample_summary = {"status": "running", "runtime_profile": {}}
-    pipeline_start = time.perf_counter()
-    sample_output_dir = None
-    sample_uuid = None
-    wan_export_root = None
-    try:
-        sample = app.prepare_input(args.input_video, args.output_dir, args.skip_existing)
-        sample_output_dir = sample.get("output_dir")
-        fps_summary_builder = getattr(app, "_build_sample_fps_summary", None)
-        if callable(fps_summary_builder):
-            app.sample_summary["fps_summary"] = fps_summary_builder(sample)
-        wan_summary_result = app._ensure_wan_sample_summary(sample)
-        if isinstance(wan_summary_result, tuple) and len(wan_summary_result) == 2:
-            sample_uuid, wan_export_root = wan_summary_result
-        initial_targets = app.detect_initial_targets(sample)
-        app.prepare_sample_output(sample["output_dir"], initial_targets["obj_ids"])
-
-        for chunk in app.iter_chunks(sample["frames"], cfg.tracking.chunk_size):
-            raw_chunk = app.track_chunk(chunk, initial_targets)
-            refined_chunk = app.refine_chunk_masks(raw_chunk)
-            final_chunk = app.maybe_reprompt_chunk(chunk, refined_chunk, initial_targets)
-            app.write_chunk_outputs(chunk, raw_chunk, final_chunk)
-
-        app.run_refined_4d_generation()
-        app.sample_summary["status"] = "completed"
-    except Exception:
-        app.sample_summary["status"] = "failed"
-        raise
-    finally:
-        app._persist_sample_runtime(
-            start_time=pipeline_start,
-            sample_output_dir=sample_output_dir,
-            runtime_profile=app.sample_summary.get("runtime_profile"),
-            sample_uuid=sample_uuid,
-            wan_export_root=wan_export_root,
-        )
-        app.finalize_sample()
+    app.run_sample(args.input_video, args.output_dir, args.skip_existing, runtime_profile=None)
     return cfg
 
 
