@@ -5,12 +5,16 @@ import sys
 from types import SimpleNamespace
 from typing import Dict, List
 
+from omegaconf import OmegaConf
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.append(ROOT)
 
+from scripts.face_clip_pipeline import extract_face_clips_from_video
 from scripts.offline_app_refined import RefinedOfflineApp, apply_runtime_overrides, load_refined_config
 from scripts.offline_batch_helpers import build_retry_profiles, discover_samples
+from scripts.wan_sample_types import WanExportConfig
 
 
 def build_batch_parser() -> argparse.ArgumentParser:
@@ -79,6 +83,72 @@ def append_batch_result(batch_output_dir: str, record: Dict[str, object]) -> Non
         handle.write(json.dumps(record) + "\n")
 
 
+def _resolve_wan_export_config(cfg) -> WanExportConfig:
+    runtime = OmegaConf.select(cfg, "wan_export", default={})
+    if runtime is None:
+        return WanExportConfig()
+    if OmegaConf.is_config(runtime):
+        runtime = OmegaConf.to_container(runtime, resolve=False)
+    return WanExportConfig.from_runtime(runtime)
+
+
+def _resolve_face_clip_output_root(cfg, batch_output_dir: str) -> str:
+    wan_cfg = _resolve_wan_export_config(cfg)
+    if wan_cfg.face_clip_output_dir:
+        return os.path.abspath(wan_cfg.face_clip_output_dir)
+    return os.path.join(os.path.abspath(batch_output_dir), "face_clips")
+
+
+def _build_sample_result_base(sample: Dict[str, str], output_dir: str, *, stage: str) -> Dict[str, object]:
+    record: Dict[str, object] = {
+        "stage": str(stage),
+        "sample_id": sample["sample_id"],
+        "input": sample["input"],
+        "output_dir": output_dir,
+    }
+    for key in ("clip_id", "source_sample_id", "source_input"):
+        value = sample.get(key)
+        if value not in {None, ""}:
+            record[key] = value
+    return record
+
+
+def extract_face_first_clip_samples(app, sample, cfg, batch_output_dir):
+    input_path = str(sample["input"])
+    if not input_path.lower().endswith(".mp4"):
+        raise ValueError("face-first clip mode only supports .mp4 video inputs")
+
+    wan_cfg = _resolve_wan_export_config(cfg)
+    clip_output_root = _resolve_face_clip_output_root(cfg, batch_output_dir)
+    clip_dirs = extract_face_clips_from_video(
+        input_video=input_path,
+        output_root=clip_output_root,
+        min_clip_seconds=float(wan_cfg.face_clip_min_clip_seconds),
+        face_backend=app._ensure_face_backend(),
+        sample_id=sample["sample_id"],
+    )
+    clip_ids = [os.path.basename(os.path.abspath(path)) for path in clip_dirs]
+    clip_samples = [
+        {
+            "input": clip_dir,
+            "sample_id": clip_id,
+            "clip_id": clip_id,
+            "source_sample_id": sample["sample_id"],
+            "source_input": input_path,
+        }
+        for clip_dir, clip_id in zip(clip_dirs, clip_ids)
+    ]
+    record = _build_sample_result_base(sample, clip_output_root, stage="face_clip_extraction")
+    record.update(
+        {
+            "status": "completed" if clip_dirs else "completed_no_clips",
+            "kept_clip_count": len(clip_dirs),
+            "clip_ids": clip_ids,
+        }
+    )
+    return clip_samples, record
+
+
 def should_skip_sample(sample_output_path: str, skip_existing: bool) -> bool:
     if not skip_existing:
         return False
@@ -97,11 +167,10 @@ def should_skip_sample(sample_output_path: str, skip_existing: bool) -> bool:
 
 def run_sample_with_retries(app, sample, batch_output_dir, cfg, args):
     output_dir = sample_output_dir(batch_output_dir, sample["sample_id"])
+    base_record = _build_sample_result_base(sample, output_dir, stage="refined_pipeline")
     if should_skip_sample(output_dir, args.skip_existing):
         return {
-            "sample_id": sample["sample_id"],
-            "input": sample["input"],
-            "output_dir": output_dir,
+            **base_record,
             "status": "skipped",
             "retry_index": 0,
             "runtime_profile": None,
@@ -126,9 +195,7 @@ def run_sample_with_retries(app, sample, batch_output_dir, cfg, args):
             continue
 
         return {
-            "sample_id": sample["sample_id"],
-            "input": sample["input"],
-            "output_dir": output_dir,
+            **base_record,
             "status": "completed" if profile_for_call["retry_index"] == 0 else "retry_succeeded",
             "summary_status": summary["status"],
             "retry_index": profile_for_call["retry_index"],
@@ -136,9 +203,7 @@ def run_sample_with_retries(app, sample, batch_output_dir, cfg, args):
         }
 
     return {
-        "sample_id": sample["sample_id"],
-        "input": sample["input"],
-        "output_dir": output_dir,
+        **base_record,
         "status": "failed",
         "retry_index": None if last_runtime_profile is None else last_runtime_profile["retry_index"],
         "runtime_profile": last_runtime_profile,
@@ -161,8 +226,44 @@ def run_batch(args):
 
     app = RefinedOfflineApp(args.config, config=cfg)
     records = []
+    wan_cfg = _resolve_wan_export_config(cfg)
 
-    for sample in samples:
+    pipeline_samples = list(samples)
+    if bool(wan_cfg.face_clip_enable):
+        pipeline_samples = []
+        for sample in samples:
+            try:
+                clip_samples, extraction_record = extract_face_first_clip_samples(
+                    app,
+                    sample,
+                    cfg,
+                    args.output_dir,
+                )
+            except Exception as exc:  # noqa: BLE001 - batch runner records stage-1 failures explicitly
+                extraction_record = _build_sample_result_base(
+                    sample,
+                    _resolve_face_clip_output_root(cfg, args.output_dir),
+                    stage="face_clip_extraction",
+                )
+                extraction_record.update(
+                    {
+                        "status": "failed",
+                        "kept_clip_count": 0,
+                        "clip_ids": [],
+                        "error": str(exc),
+                    }
+                )
+                append_batch_result(args.output_dir, extraction_record)
+                records.append(extraction_record)
+                if not args.continue_on_error:
+                    raise RuntimeError(f"Stopping batch on failed sample: {sample['sample_id']}")
+                continue
+
+            append_batch_result(args.output_dir, extraction_record)
+            records.append(extraction_record)
+            pipeline_samples.extend(clip_samples)
+
+    for sample in pipeline_samples:
         record = run_sample_with_retries(app, sample, args.output_dir, cfg, args)
         append_batch_result(args.output_dir, record)
         records.append(record)

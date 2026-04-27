@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import cv2
 import numpy as np
 from omegaconf import OmegaConf
 from PIL import Image
@@ -319,6 +320,79 @@ class RefinedCliTests(unittest.TestCase):
         self.assertEqual(os.path.basename(os.path.dirname(sample["output_dir"])), "outputs_refined")
         self.assertNotEqual(os.path.basename(sample["output_dir"]), "outputs_refined")
 
+    def test_prepare_input_accepts_clip_package_directory(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        config = OmegaConf.create(
+            {"runtime": {"output_dir": "./outputs_refined"}, "debug": {"save_metrics": False}}
+        )
+        app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+
+        with make_workspace_tempdir() as tmpdir:
+            clip_dir = os.path.join(tmpdir, "sampleuuid_face01_seg001")
+            os.makedirs(clip_dir, exist_ok=True)
+
+            writer = cv2.VideoWriter(
+                os.path.join(clip_dir, "clip.mp4"),
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                2.0,
+                (8, 8),
+            )
+            self.assertTrue(writer.isOpened())
+            try:
+                for _ in range(2):
+                    writer.write(np.zeros((8, 8, 3), dtype=np.uint8))
+            finally:
+                writer.release()
+
+            with open(os.path.join(clip_dir, "meta.json"), "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "clip_id": "sampleuuid_face01_seg001",
+                        "sample_uuid": "sampleuuid",
+                        "source_path": "/dataset/source/demo.mp4",
+                        "start_frame": 0,
+                        "end_frame": 1,
+                        "fps": 2.0,
+                        "frame_count": 2,
+                    },
+                    handle,
+                )
+            with open(os.path.join(clip_dir, "track.json"), "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "clip_id": "sampleuuid_face01_seg001",
+                        "records": [
+                            {
+                                "frame_index_in_source": 0,
+                                "frame_index_in_clip": 0,
+                                "timestamp_seconds": 0.0,
+                                "bbox_xyxy": [1, 1, 4, 4],
+                                "landmarks": [],
+                                "score": 0.9,
+                            },
+                            {
+                                "frame_index_in_source": 1,
+                                "frame_index_in_clip": 1,
+                                "timestamp_seconds": 0.5,
+                                "bbox_xyxy": [1, 1, 4, 4],
+                                "landmarks": [],
+                                "score": 0.9,
+                            },
+                        ],
+                    },
+                    handle,
+                )
+
+            sample = app.prepare_input(clip_dir, None, False)
+
+        self.assertEqual(sample["input_type"], "clip_package")
+        self.assertEqual(sample["clip_id"], "sampleuuid_face01_seg001")
+        self.assertEqual(sample["sample_uuid"], "sampleuuid")
+        self.assertTrue(sample["input_video"].endswith("clip.mp4"))
+        self.assertEqual(sample["frame_count"], 2)
+        self.assertEqual(len(sample["clip_track_records"]), 2)
+
     def test_run_refined_pipeline_passes_none_output_dir_to_preserve_default_sample_subdir_behavior(self):
         import scripts.offline_app_refined as offline_app_refined
 
@@ -555,6 +629,69 @@ class RefinedCliTests(unittest.TestCase):
         self.assertEqual(predictor.add_new_points_or_box.call_count, 3)
         for call in predictor.add_new_points_or_box.call_args_list:
             self.assertEqual(call.kwargs["frame_idx"], 2)
+
+    def test_detect_initial_targets_uses_face_guided_single_target_binding_for_clip_package(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        config = OmegaConf.create(
+            {
+                "runtime": {"output_dir": "./outputs_refined"},
+                "detector": {"bbox_thresh": 0.35, "iou_thresh": 0.5},
+                "batch": {"initial_search_frames": 12},
+                "debug": {"save_metrics": False},
+            }
+        )
+        app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+        app.sample_state = {
+            "input_video": "clip.mp4",
+            "input_type": "clip_package",
+            "source_frames": None,
+            "frames": ["00000000", "00000001", "00000002"],
+            "frame_count": 3,
+            "output_dir": "./outputs_refined",
+            "clip_id": "sampleuuid_face01_seg001",
+            "sample_uuid": "sampleuuid",
+            "clip_track_records": [
+                {"frame_index_in_clip": 0, "bbox_xyxy": [1, 1, 3, 3]},
+                {"frame_index_in_clip": 1, "bbox_xyxy": [1, 1, 3, 3]},
+                {"frame_index_in_clip": 2, "bbox_xyxy": [1, 1, 3, 3]},
+            ],
+        }
+        app._load_source_frame = unittest.mock.MagicMock(
+            side_effect=[np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(3)]
+        )
+        app._detect_frame_candidates = unittest.mock.MagicMock(
+            side_effect=[
+                [
+                    {"bbox": [0.0, 0.0, 4.0, 6.0]},
+                    {"bbox": [4.0, 0.0, 7.0, 6.0]},
+                ],
+                [
+                    {"bbox": [0.0, 0.0, 4.0, 6.0]},
+                    {"bbox": [4.0, 0.0, 7.0, 6.0]},
+                ],
+                [
+                    {"bbox": [0.0, 0.0, 4.0, 6.0]},
+                    {"bbox": [4.0, 0.0, 7.0, 6.0]},
+                ],
+            ]
+        )
+
+        predictor = unittest.mock.MagicMock()
+        predictor.init_state.return_value = {"video_height": 8, "video_width": 8}
+        predictor.add_new_points_or_box.return_value = (None, [1], None, None)
+        runtime_app = unittest.mock.MagicMock()
+        runtime_app.predictor = predictor
+        runtime_app.RUNTIME = {}
+        runtime_app.sam3_3d_body_model = unittest.mock.MagicMock()
+
+        with patch.object(app, "_ensure_base_app", return_value=runtime_app, create=True):
+            targets = app.detect_initial_targets(app.sample_state)
+
+        self.assertEqual(targets["obj_ids"], [1])
+        self.assertEqual(targets["start_frame_idx"], 0)
+        self.assertEqual(targets["boxes_xyxy"], [[0.0, 0.0, 4.0, 6.0]])
+        predictor.add_new_points_or_box.assert_called_once()
 
     def test_detect_initial_targets_limits_to_max_targets_by_score(self):
         from scripts.offline_app_refined import RefinedOfflineApp

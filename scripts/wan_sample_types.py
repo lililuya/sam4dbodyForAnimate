@@ -29,6 +29,10 @@ class WanExportConfig:
     enable: bool = False
     output_dir: str | None = None
     metadata_output_dir: str | None = None
+    face_clip_enable: bool = False
+    face_clip_output_dir: str | None = None
+    face_clip_min_clip_seconds: float = 5.0
+    face_clip_debug_save_face_crop_video: bool = False
     fps: int = 25
     resolution_area: tuple[int, int] = (512, 768)
     face_resolution: tuple[int, int] = (512, 512)
@@ -51,11 +55,20 @@ class WanExportConfig:
     @classmethod
     def from_runtime(cls, runtime: Mapping[str, Any] | None) -> "WanExportConfig":
         payload = dict(runtime or {})
+        face_clip = dict(payload.get("face_clip") or {})
         return cls(
             enable=_coerce_bool(payload.get("enable", False)),
             output_dir=None if payload.get("output_dir") in {None, ""} else str(payload.get("output_dir")),
             metadata_output_dir=(
                 None if payload.get("metadata_output_dir") in {None, ""} else str(payload.get("metadata_output_dir"))
+            ),
+            face_clip_enable=_coerce_bool(face_clip.get("enable", False)),
+            face_clip_output_dir=(
+                None if face_clip.get("output_dir") in {None, ""} else str(face_clip.get("output_dir"))
+            ),
+            face_clip_min_clip_seconds=float(face_clip.get("min_clip_seconds", 5.0)),
+            face_clip_debug_save_face_crop_video=_coerce_bool(
+                face_clip.get("debug_save_face_crop_video", False)
             ),
             fps=int(payload.get("fps", 25)),
             resolution_area=_coerce_pair(payload.get("resolution_area"), (512, 768), "resolution_area"),

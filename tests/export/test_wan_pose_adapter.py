@@ -116,6 +116,38 @@ class WanPoseAdapterTests(unittest.TestCase):
         self.assertGreater(int(pose_frame.sum()), 0)
         self.assertGreater(int(patch.sum()), 0)
 
+    def test_render_wan_pose_frame_matches_wananimate_body_and_hand_palette(self):
+        from scripts.wan_pose_adapter import render_wan_pose_frame
+
+        body = np.zeros((20, 3), dtype=np.float32)
+        body[0] = [0.50, 0.35, 1.0]  # nose
+        body[1] = [0.50, 0.50, 1.0]  # neck
+        body[2] = [0.70, 0.50, 1.0]  # right shoulder
+
+        left_hand = np.zeros((21, 3), dtype=np.float32)
+        left_hand[0] = [0.20, 0.20, 1.0]
+        left_hand[1] = [0.30, 0.20, 1.0]
+
+        pose_meta = {
+            "image_id": "00000000.jpg",
+            "track_id": 1,
+            "width": 100,
+            "height": 100,
+            "category_id": 1,
+            "keypoints_body": body.tolist(),
+            "keypoints_left_hand": left_hand.tolist(),
+            "keypoints_right_hand": np.zeros((21, 3), dtype=np.float32).tolist(),
+            "keypoints_face": [],
+        }
+
+        pose_frame = render_wan_pose_frame(pose_meta, canvas_shape=(100, 100, 3))
+
+        self.assertTrue(np.array_equal(pose_frame[35, 50], np.array([255, 0, 0], dtype=np.uint8)))
+        self.assertTrue(np.array_equal(pose_frame[50, 50], np.array([255, 85, 0], dtype=np.uint8)))
+        self.assertTrue(np.array_equal(pose_frame[50, 60], np.array([153, 0, 0], dtype=np.uint8)))
+        self.assertTrue(np.array_equal(pose_frame[20, 20], np.array([0, 0, 255], dtype=np.uint8)))
+        self.assertTrue(np.array_equal(pose_frame[20, 25], np.array([255, 0, 0], dtype=np.uint8)))
+
 
 if __name__ == "__main__":
     unittest.main()

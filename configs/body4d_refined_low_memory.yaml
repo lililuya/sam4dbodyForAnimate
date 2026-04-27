@@ -36,6 +36,11 @@ runtime:
 wan_export:
   # Optional WanAnimate-style per-track export from the refined offline batch path.
   enable: false
+  face_clip:
+    enable: false
+    output_dir: ""
+    min_clip_seconds: 5.0
+    debug_save_face_crop_video: false
   # Optional independent parent directory for source_uuid_map / summary / skipped / issue ledger metadata.
   # Leave empty to reuse wan_export.output_dir.
   metadata_output_dir: ""

@@ -296,6 +296,9 @@ class OfflineApp:
                 masks_dir=os.path.join(self.OUTPUT_DIR, "masks"),
                 source_video_path=video_path,
                 config=wan_cfg,
+                sample_uuid=wan_cfg.get("sample_uuid"),
+                clip_id=wan_cfg.get("clip_id"),
+                source_reference=wan_cfg.get("source_path"),
             )
         frame_writer = None
         if pose_writer is not None or wan_writer is not None:

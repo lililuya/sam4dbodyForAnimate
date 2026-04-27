@@ -259,6 +259,9 @@ class WanSampleExporter:
         source_video_path: str | None,
         config,
         face_backend=None,
+        sample_uuid: str | None = None,
+        clip_id: str | None = None,
+        source_reference: str | None = None,
     ):
         self.sample_id = str(sample_id)
         self.output_dir = output_dir
@@ -273,8 +276,13 @@ class WanSampleExporter:
             if self.config.metadata_output_dir
             else self.export_root
         )
-        self.source_reference = resolve_wan_source_path(source_video_path, images_dir)
-        self.sample_uuid = None
+        self.source_reference = (
+            os.path.abspath(str(source_reference))
+            if source_reference not in {None, ""}
+            else resolve_wan_source_path(source_video_path, images_dir)
+        )
+        self.sample_uuid = None if sample_uuid in {None, ""} else str(sample_uuid)
+        self.clip_id = None if clip_id in {None, ""} else str(clip_id)
         self.face_backend = face_backend or InsightFaceBackend()
         self._records: list[dict] = []
         self.finalized_targets: list[dict] = []
@@ -306,16 +314,16 @@ class WanSampleExporter:
             writer.release()
 
     def _resolve_sample_dir(self, track_id: int) -> str:
-        sample_uuid = self._ensure_sample_uuid()
-        if self.export_root and sample_uuid:
-            return os.path.join(self.export_root, f"{sample_uuid}_target{int(track_id)}")
+        sample_identity = self._summary_identity()
+        if self.export_root and sample_identity:
+            return os.path.join(self.export_root, f"{sample_identity}_target{int(track_id)}")
         return os.path.join(self.working_output_dir, "wan_export", f"{self.sample_id}_track_{track_id}")
 
     def _ensure_sample_uuid(self) -> str | None:
-        if not self.metadata_root:
-            return None
         if self.sample_uuid:
             return self.sample_uuid
+        if not self.metadata_root:
+            return None
         self.sample_uuid = resolve_or_create_wan_sample_uuid(
             self.metadata_root,
             self.source_reference,
@@ -323,6 +331,11 @@ class WanSampleExporter:
             working_output_dir=self.working_output_dir,
         )
         return self.sample_uuid
+
+    def _summary_identity(self) -> str | None:
+        if self.clip_id:
+            return self.clip_id
+        return self._ensure_sample_uuid()
 
     def finalize(self) -> list[str]:
         if not self._records:
@@ -550,6 +563,7 @@ class WanSampleExporter:
                     {
                         "sample_id": self.sample_id,
                         "sample_uuid": self.sample_uuid,
+                        "clip_id": self.clip_id,
                         "track_id": int(track_id),
                         "source_path": self.source_reference,
                         "fps": int(self.config.fps),
@@ -573,12 +587,15 @@ class WanSampleExporter:
             self.finalized_targets.append(dict(written_targets[-1]))
 
         sample_uuid = self._ensure_sample_uuid()
-        if self.metadata_root and sample_uuid:
+        summary_identity = self._summary_identity()
+        if self.metadata_root and summary_identity:
             update_wan_sample_summary(
                 self.metadata_root,
-                sample_uuid,
+                summary_identity,
                 {
                     "sample_id": self.sample_id,
+                    "sample_uuid": sample_uuid,
+                    "clip_id": self.clip_id,
                     "source_path": self.source_reference,
                     "working_output_dir": self.working_output_dir,
                     "export_root": self.export_root,
@@ -590,9 +607,11 @@ class WanSampleExporter:
             )
             write_wan_skipped_report(
                 self.metadata_root,
-                sample_uuid,
+                summary_identity,
                 {
                     "sample_id": self.sample_id,
+                    "sample_uuid": sample_uuid,
+                    "clip_id": self.clip_id,
                     "source_path": self.source_reference,
                     "skipped_targets": skipped_targets,
                 },
@@ -609,6 +628,7 @@ class WanSampleExporter:
                             "source_path": self.source_reference,
                             "sample_id": self.sample_id,
                             "sample_uuid": sample_uuid,
+                            "clip_id": self.clip_id,
                             "working_output_dir": self.working_output_dir,
                             "runtime_profile": None,
                             "details": dict(skipped_target),

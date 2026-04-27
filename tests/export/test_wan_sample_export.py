@@ -3,6 +3,8 @@ import os
 import shutil
 import tempfile
 import unittest
+import uuid
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -11,6 +13,19 @@ import numpy as np
 
 from scripts.wan_face_export import WanFaceDetection
 from scripts.offline_app_refined import save_indexed_mask
+
+
+@contextmanager
+def make_workspace_tempdir():
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    base_dir = os.path.join(repo_root, ".tmp_wan_export_tests")
+    os.makedirs(base_dir, exist_ok=True)
+    temp_dir = os.path.join(base_dir, f"run_{uuid.uuid4().hex}")
+    os.makedirs(temp_dir, exist_ok=True)
+    try:
+        yield temp_dir
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 class _FakeFaceBackend:
@@ -23,6 +38,67 @@ class _FakeFaceBackend:
 
 
 class WanSampleExportTests(unittest.TestCase):
+    def test_finalize_reuses_pre_resolved_clip_identity_for_target_directory(self):
+        from scripts.wan_sample_export import WanSampleExporter
+        from scripts.wan_sample_types import WanExportConfig
+
+        with make_workspace_tempdir() as temp_dir:
+            image_dir = os.path.join(temp_dir, "images")
+            mask_dir = os.path.join(temp_dir, "masks")
+            export_root = os.path.join(temp_dir, "WanExport")
+            os.makedirs(image_dir, exist_ok=True)
+            os.makedirs(mask_dir, exist_ok=True)
+
+            frame = np.full((64, 48, 3), 180, dtype=np.uint8)
+            mask = np.zeros((64, 48), dtype=np.uint8)
+            mask[8:40, 10:30] = 1
+            for index in range(3):
+                frame_stem = f"{index:08d}"
+                cv2.imwrite(os.path.join(image_dir, f"{frame_stem}.jpg"), frame)
+                save_indexed_mask(mask, os.path.join(mask_dir, f"{frame_stem}.png"))
+
+            exporter = WanSampleExporter(
+                sample_id="demo_clip",
+                output_dir=temp_dir,
+                images_dir=image_dir,
+                masks_dir=mask_dir,
+                source_video_path="/dataset/source/demo_clip.mp4",
+                config=WanExportConfig(
+                    enable=True,
+                    min_track_frames=1,
+                    output_dir=export_root,
+                    save_pose_meta_json=False,
+                ),
+                face_backend=_FakeFaceBackend(
+                    [
+                        WanFaceDetection(
+                            bbox=(12, 10, 28, 28),
+                            landmarks=np.zeros((5, 3), dtype=np.float32),
+                            score=0.9,
+                        )
+                    ]
+                ),
+                sample_uuid="sampleuuid123",
+                clip_id="sampleuuid123_face01_seg001",
+            )
+
+            person_output = {
+                "pred_keypoints_2d": np.zeros((70, 2), dtype=np.float32),
+                "pred_keypoints_3d": np.zeros((70, 3), dtype=np.float32),
+            }
+            for index in range(3):
+                image_path = os.path.join(image_dir, f"{index:08d}.jpg")
+                exporter(image_path, [person_output], [1])
+
+            sample_dirs = exporter.finalize()
+
+            self.assertEqual(sample_dirs, [os.path.join(export_root, "sampleuuid123_face01_seg001_target1")])
+            self.assertFalse(os.path.isfile(os.path.join(export_root, "source_uuid_map.json")))
+            with open(os.path.join(sample_dirs[0], "meta.json"), "r", encoding="utf-8") as handle:
+                meta = json.load(handle)
+            self.assertEqual(meta["sample_uuid"], "sampleuuid123")
+            self.assertEqual(meta["clip_id"], "sampleuuid123_face01_seg001")
+
     def test_finalize_exports_to_external_uuid_target_directory_and_writes_mapping(self):
         from scripts.wan_sample_export import WanSampleExporter
         from scripts.wan_sample_types import WanExportConfig
