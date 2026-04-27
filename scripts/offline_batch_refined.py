@@ -11,10 +11,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.append(ROOT)
 
-from scripts.face_clip_pipeline import extract_face_clips_from_video
+from scripts.face_clip_pipeline import extract_face_clips_from_video, update_face_clip_batch_summary
 from scripts.offline_app_refined import RefinedOfflineApp, apply_runtime_overrides, load_refined_config
 from scripts.offline_batch_helpers import build_retry_profiles, discover_samples
 from scripts.wan_sample_types import WanExportConfig
+from scripts.wan_sample_export import resolve_or_create_wan_sample_uuid
 
 
 def build_batch_parser() -> argparse.ArgumentParser:
@@ -120,6 +121,40 @@ def extract_face_first_clip_samples(app, sample, cfg, batch_output_dir):
 
     wan_cfg = _resolve_wan_export_config(cfg)
     clip_output_root = _resolve_face_clip_output_root(cfg, batch_output_dir)
+    sample_probe = app.prepare_input(input_path, None, False)
+    face_presence = app._probe_sample_face_presence(sample_probe)
+    if app._should_skip_sample_for_face_presence(face_presence):
+        sample_uuid = resolve_or_create_wan_sample_uuid(
+            clip_output_root,
+            input_path,
+            sample_id=sample["sample_id"],
+            working_output_dir=None,
+        )
+        update_face_clip_batch_summary(
+            clip_output_root,
+            input_video=input_path,
+            item={
+                "sample_uuid": sample_uuid,
+                "source_path": input_path,
+                "status": "skipped_no_face_precheck",
+                "kept_clip_count": 0,
+                "clip_ids": [],
+                "dropped_segment_count": 0,
+                "drop_reasons": ["face_presence_below_threshold"],
+                "face_presence": dict(face_presence),
+            },
+        )
+        record = _build_sample_result_base(sample, clip_output_root, stage="face_clip_extraction")
+        record.update(
+            {
+                "status": "skipped_no_face_precheck",
+                "kept_clip_count": 0,
+                "clip_ids": [],
+                "face_presence": dict(face_presence),
+            }
+        )
+        return [], record
+
     clip_dirs = extract_face_clips_from_video(
         input_video=input_path,
         output_root=clip_output_root,
@@ -144,6 +179,7 @@ def extract_face_first_clip_samples(app, sample, cfg, batch_output_dir):
             "status": "completed" if clip_dirs else "completed_no_clips",
             "kept_clip_count": len(clip_dirs),
             "clip_ids": clip_ids,
+            "face_presence": dict(face_presence),
         }
     )
     return clip_samples, record

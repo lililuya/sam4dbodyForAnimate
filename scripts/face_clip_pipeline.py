@@ -284,7 +284,7 @@ def _serialize_record(record: FaceClipRecord, *, clip_frame_index: int, fps: flo
     }
 
 
-def _update_batch_summary(output_root: str, *, input_video: str, item: dict) -> None:
+def update_face_clip_batch_summary(output_root: str, *, input_video: str, item: dict) -> None:
     summary_path = os.path.join(output_root, "batch_summary.json")
     current = _read_json_dict(summary_path)
     items = [existing for existing in list(current.get("items") or []) if isinstance(existing, dict)]
@@ -418,7 +418,7 @@ def extract_face_clips_from_video(
         _write_json(os.path.join(clip_dir, "meta.json"), meta)
         clip_dirs.append(clip_dir)
 
-    _update_batch_summary(
+    update_face_clip_batch_summary(
         output_root,
         input_video=input_video,
         item={
