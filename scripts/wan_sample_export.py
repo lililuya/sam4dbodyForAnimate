@@ -475,6 +475,16 @@ class WanSampleExporter:
                     best_ref_score = ref_score
 
             valid_face_ratio = float(valid_face_count) / float(max(len(target_frames), 1))
+            if valid_face_count <= 0:
+                skipped_targets.append(
+                    {
+                        "track_id": int(track_id),
+                        "reason": "no_valid_face_detected",
+                        "valid_face_ratio": valid_face_ratio,
+                        "frame_count": len(target_frames),
+                    }
+                )
+                continue
             if valid_face_ratio < float(self.config.min_valid_face_ratio):
                 skipped_targets.append(
                     {

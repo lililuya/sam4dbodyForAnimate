@@ -49,6 +49,25 @@ class WanFaceExportTests(unittest.TestCase):
 
         self.assertEqual(selected.bbox, (10, 8, 22, 20))
 
+    def test_select_target_face_returns_none_when_only_detected_face_belongs_to_other_person(self):
+        from scripts.wan_face_export import WanFaceDetection, select_target_face
+
+        target_mask = np.zeros((64, 64), dtype=np.uint8)
+        target_mask[10:40, 40:60] = 1
+        body_keypoints = np.zeros((20, 3), dtype=np.float32)
+        body_keypoints[0] = [0.78, 0.25, 1.0]
+        detections = [
+            WanFaceDetection(
+                bbox=(8, 8, 28, 28),
+                landmarks=np.zeros((5, 3), dtype=np.float32),
+                score=0.95,
+            ),
+        ]
+
+        selected = select_target_face(detections, target_mask, body_keypoints, previous_bbox=None)
+
+        self.assertIsNone(selected)
+
     def test_fill_face_gaps_reuses_previous_box_for_short_missing_span(self):
         from scripts.wan_face_export import WanFaceDetection, fill_face_gaps
 

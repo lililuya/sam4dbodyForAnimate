@@ -5,6 +5,9 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+MAX_FACE_CENTER_DISTANCE = 0.30
+MIN_FACE_CONTINUITY_IOU = 0.05
+
 
 @dataclass(frozen=True)
 class WanFaceDetection:
@@ -87,6 +90,14 @@ def _resolve_head_anchor(target_mask: np.ndarray, body_keypoints: np.ndarray) ->
     return np.array([target_mask.shape[1] / 2.0, target_mask.shape[0] / 2.0], dtype=np.float32)
 
 
+def _is_plausible_target_face(*, overlap_score: float, continuity_score: float, distance_score: float) -> bool:
+    if overlap_score > 0.0:
+        return True
+    if continuity_score >= MIN_FACE_CONTINUITY_IOU:
+        return True
+    return distance_score <= MAX_FACE_CENTER_DISTANCE
+
+
 def select_target_face(detections, target_mask: np.ndarray, body_keypoints: np.ndarray, previous_bbox=None):
     if not detections:
         return None
@@ -102,6 +113,12 @@ def select_target_face(detections, target_mask: np.ndarray, body_keypoints: np.n
         overlap_score = _mask_overlap(target_mask, detection.bbox)
         continuity_score = 0.0 if previous_bbox is None else _bbox_iou(detection.bbox, previous_bbox)
         distance_score = float(np.linalg.norm(center - head_anchor)) / float(max(target_mask.shape))
+        if not _is_plausible_target_face(
+            overlap_score=overlap_score,
+            continuity_score=continuity_score,
+            distance_score=distance_score,
+        ):
+            continue
         score = overlap_score * 5.0 + continuity_score * 2.0 + float(detection.score) * 0.1 - distance_score
         if best_detection is None or score > best_score:
             best_detection = detection
