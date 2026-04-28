@@ -61,10 +61,10 @@ def _read_json_dict(path: str) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def _write_json(path: str, payload: dict) -> None:
+def _write_json(path: str, payload: dict, *, indent: int | None = 2) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
+        json.dump(payload, handle, indent=indent)
 
 
 def _to_json_safe(value):
@@ -87,6 +87,18 @@ def _sanitize_smpl_sequence_person_output(person_output):
         for key, value in person_output.items()
         if str(key) != "mask"
     }
+
+
+def _round_json_floats(value, *, decimals: int):
+    if isinstance(value, float):
+        return round(value, int(decimals))
+    if isinstance(value, dict):
+        return {str(key): _round_json_floats(item, decimals=decimals) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_round_json_floats(item, decimals=decimals) for item in value]
+    if isinstance(value, tuple):
+        return [_round_json_floats(item, decimals=decimals) for item in value]
+    return value
 
 
 def _merge_dicts(base: dict, updates: dict) -> dict:
@@ -427,6 +439,7 @@ class WanSampleExporter:
                         "frame_stem": record["frame_stem"],
                         "frame_rgb": resized_rgb,
                         "mask_rgb": mask_rgb,
+                        "detail_mask_rgb": np.stack([target_mask * 255, target_mask * 255, target_mask * 255], axis=2).astype(np.uint8),
                         "bg_rgb": bg_rgb,
                         "target_mask": target_mask,
                         "person_output": scaled_person_output,
@@ -451,6 +464,7 @@ class WanSampleExporter:
             face_frames = []
             bg_frames = []
             mask_frames = []
+            detail_mask_frames = []
             pose_meta_records = []
             valid_face_count = 0
             best_ref_frame = None
@@ -471,6 +485,7 @@ class WanSampleExporter:
                 pose_frames.append(render_wan_pose_frame(pose_meta, target_frame.shape))
                 bg_frames.append(payload["bg_rgb"])
                 mask_frames.append(payload["mask_rgb"])
+                detail_mask_frames.append(payload["detail_mask_rgb"])
 
                 if face_detection is not None:
                     valid_face_count += 1
@@ -553,13 +568,17 @@ class WanSampleExporter:
                         "records": [
                             {
                                 "frame_stem": payload["frame_stem"],
-                                "person_output": _to_json_safe(
-                                    _sanitize_smpl_sequence_person_output(payload["raw_person_output"])
+                                "person_output": _round_json_floats(
+                                    _to_json_safe(
+                                        _sanitize_smpl_sequence_person_output(payload["raw_person_output"])
+                                    ),
+                                    decimals=6,
                                 ),
                             }
                             for payload in frame_payloads
                         ],
                     },
+                    indent=None,
                 )
 
             self._write_mp4(target_frames, os.path.join(sample_dir, "target.mp4"), self.config.fps)
@@ -567,6 +586,7 @@ class WanSampleExporter:
             self._write_mp4(face_frames, os.path.join(sample_dir, "src_face.mp4"), self.config.fps)
             self._write_mp4(bg_frames, os.path.join(sample_dir, "src_bg.mp4"), self.config.fps)
             self._write_mp4(mask_frames, os.path.join(sample_dir, "src_mask.mp4"), self.config.fps)
+            self._write_mp4(detail_mask_frames, os.path.join(sample_dir, "src_mask_detail.mp4"), self.config.fps)
             if best_ref_frame is not None:
                 Image.fromarray(best_ref_frame).save(os.path.join(sample_dir, "src_ref.png"))
 

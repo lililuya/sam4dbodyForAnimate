@@ -29,8 +29,8 @@ def build_bg_and_mask_frame(
         h_len=int(config.mask_h_len),
     ).astype(np.uint8)
 
-    # Keep non-target people/background intact in multi-person scenes.
-    bg_rgb = np.asarray(frame_rgb, dtype=np.uint8) * (1 - target_mask[:, :, None])
+    # Keep src_bg aligned with the exported src_mask so masked regions are removed consistently.
+    bg_rgb = np.asarray(frame_rgb, dtype=np.uint8) * (1 - aug_mask[:, :, None])
     mask_rgb = np.stack([aug_mask * 255, aug_mask * 255, aug_mask * 255], axis=2).astype(np.uint8)
     return mask_rgb, bg_rgb.astype(np.uint8), target_mask
 

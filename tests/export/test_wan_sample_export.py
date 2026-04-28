@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import cv2
 import numpy as np
+from PIL import Image
 
 from scripts.wan_face_export import WanFaceDetection
 from scripts.offline_app_refined import save_indexed_mask
@@ -565,6 +566,82 @@ class WanSampleExportTests(unittest.TestCase):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def test_finalize_writes_smpl_sequence_without_indent_and_rounds_floats_to_six_decimals(self):
+        from scripts.wan_sample_export import WanSampleExporter
+        from scripts.wan_sample_types import WanExportConfig
+
+        temp_dir = tempfile.mkdtemp(prefix="wan_export_smpl_rounding_")
+        try:
+            image_dir = os.path.join(temp_dir, "images")
+            mask_dir = os.path.join(temp_dir, "masks")
+            os.makedirs(image_dir, exist_ok=True)
+            os.makedirs(mask_dir, exist_ok=True)
+
+            frame = np.full((64, 48, 3), 120, dtype=np.uint8)
+            mask = np.zeros((64, 48), dtype=np.uint8)
+            mask[8:40, 10:30] = 1
+            frame_stem = "00000000"
+            Image.fromarray(frame).save(os.path.join(image_dir, f"{frame_stem}.jpg"))
+            save_indexed_mask(mask, os.path.join(mask_dir, f"{frame_stem}.png"))
+
+            exporter = WanSampleExporter(
+                sample_id="demo_precision",
+                output_dir=os.path.join(temp_dir, "working"),
+                images_dir=image_dir,
+                masks_dir=mask_dir,
+                source_video_path=None,
+                config=WanExportConfig(
+                    enable=True,
+                    output_dir=os.path.join(temp_dir, "wan_export"),
+                    fps=25,
+                    resolution_area=[48, 64],
+                    face_resolution=[32, 32],
+                    min_track_frames=1,
+                    min_valid_face_ratio=0.0,
+                    save_pose_meta_json=False,
+                    save_smpl_sequence_json=True,
+                ),
+                face_backend=_FakeFaceBackend(
+                    [
+                        WanFaceDetection(
+                            bbox=(8, 8, 20, 20),
+                            landmarks=np.zeros((5, 2), dtype=np.float32),
+                            score=0.99,
+                        )
+                    ]
+                ),
+            )
+
+            person_output = {
+                "pred_keypoints_2d": np.array([[0.123456789, 1.987654321]], dtype=np.float32),
+                "pred_keypoints_3d": np.array([[0.2565191686153412, -1.5157936811447144, -0.092339888215065]], dtype=np.float32),
+                "bbox": np.array([10.123456789, 8.987654321, 30.111111111, 40.999999999], dtype=np.float32),
+            }
+            exporter(os.path.join(image_dir, f"{frame_stem}.jpg"), [person_output], [1])
+
+            with patch("scripts.wan_sample_export.uuid.uuid4", return_value=SimpleNamespace(hex="rounduuid123456")):
+                sample_dirs = exporter.finalize()
+
+            sample_dir = sample_dirs[0]
+            smpl_sequence_path = os.path.join(sample_dir, "smpl_sequence.json")
+            with open(smpl_sequence_path, "r", encoding="utf-8") as handle:
+                raw_text = handle.read()
+            with open(smpl_sequence_path, "r", encoding="utf-8") as handle:
+                smpl_sequence = json.load(handle)
+
+            self.assertNotIn("\n  ", raw_text)
+            self.assertIn('"frame_count": 1', raw_text)
+            person_output_payload = smpl_sequence["records"][0]["person_output"]
+            self.assertEqual(person_output_payload["pred_keypoints_2d"][0][0], 0.123457)
+            self.assertEqual(person_output_payload["pred_keypoints_2d"][0][1], 1.987654)
+            self.assertEqual(person_output_payload["pred_keypoints_3d"][0][0], 0.256519)
+            self.assertEqual(person_output_payload["pred_keypoints_3d"][0][1], -1.515794)
+            self.assertEqual(person_output_payload["pred_keypoints_3d"][0][2], -0.09234)
+            self.assertEqual(person_output_payload["bbox"][0], 10.123457)
+            self.assertEqual(person_output_payload["bbox"][1], 8.987655)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
     def test_finalize_preserves_target_labels_from_paletted_png_masks(self):
         from scripts.wan_sample_export import WanSampleExporter
         from scripts.wan_sample_types import WanExportConfig
@@ -621,6 +698,83 @@ class WanSampleExportTests(unittest.TestCase):
                 capture.release()
             self.assertTrue(ok)
             self.assertGreater(int(frame_bgr.sum()), 0)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_finalize_writes_src_mask_detail_from_original_target_mask(self):
+        from scripts.wan_sample_export import WanSampleExporter
+        from scripts.wan_sample_types import WanExportConfig
+
+        temp_dir = tempfile.mkdtemp(prefix="wan_export_mask_detail_")
+        try:
+            image_dir = os.path.join(temp_dir, "images")
+            mask_dir = os.path.join(temp_dir, "masks")
+            os.makedirs(image_dir, exist_ok=True)
+            os.makedirs(mask_dir, exist_ok=True)
+
+            frame = np.full((48, 48, 3), 160, dtype=np.uint8)
+            indexed_mask = np.zeros((48, 48), dtype=np.uint8)
+            indexed_mask[24, 24] = 1
+            frame_stem = "00000000"
+            cv2.imwrite(os.path.join(image_dir, f"{frame_stem}.jpg"), frame)
+            save_indexed_mask(indexed_mask, os.path.join(mask_dir, f"{frame_stem}.png"))
+
+            exporter = WanSampleExporter(
+                sample_id="demo_mask_detail",
+                output_dir=temp_dir,
+                images_dir=image_dir,
+                masks_dir=mask_dir,
+                source_video_path=None,
+                config=WanExportConfig(
+                    enable=True,
+                    min_track_frames=1,
+                    min_valid_face_ratio=0.0,
+                    mask_kernel_size=3,
+                    mask_iterations=1,
+                    mask_w_len=99,
+                    mask_h_len=99,
+                ),
+                face_backend=_FakeFaceBackend(
+                    [
+                        WanFaceDetection(
+                            bbox=(16, 12, 32, 32),
+                            landmarks=np.zeros((5, 3), dtype=np.float32),
+                            score=0.9,
+                        )
+                    ]
+                ),
+            )
+
+            person_output = {
+                "pred_keypoints_2d": np.zeros((70, 2), dtype=np.float32),
+                "pred_keypoints_3d": np.zeros((70, 3), dtype=np.float32),
+            }
+            exporter(os.path.join(image_dir, f"{frame_stem}.jpg"), [person_output], [1])
+
+            sample_dirs = exporter.finalize()
+
+            self.assertEqual(len(sample_dirs), 1)
+            sample_dir = sample_dirs[0]
+            src_mask_detail_path = os.path.join(sample_dir, "src_mask_detail.mp4")
+            src_mask_path = os.path.join(sample_dir, "src_mask.mp4")
+            self.assertTrue(os.path.isfile(src_mask_path))
+            self.assertTrue(os.path.isfile(src_mask_detail_path))
+
+            mask_capture = cv2.VideoCapture(src_mask_path)
+            try:
+                ok_mask, mask_frame_bgr = mask_capture.read()
+            finally:
+                mask_capture.release()
+
+            detail_capture = cv2.VideoCapture(src_mask_detail_path)
+            try:
+                ok_detail, detail_frame_bgr = detail_capture.read()
+            finally:
+                detail_capture.release()
+
+            self.assertTrue(ok_mask)
+            self.assertTrue(ok_detail)
+            self.assertGreater(int(mask_frame_bgr.sum()), int(detail_frame_bgr.sum()))
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
