@@ -114,13 +114,103 @@ def _build_sample_result_base(sample: Dict[str, str], output_dir: str, *, stage:
     return record
 
 
-def extract_face_first_clip_samples(app, sample, cfg, batch_output_dir):
+def _read_json_dict(path: str) -> Dict[str, object]:
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _build_clip_samples_from_ids(
+    sample: Dict[str, str],
+    clip_output_root: str,
+    clip_ids: List[str],
+) -> List[Dict[str, str]] | None:
+    clip_samples: List[Dict[str, str]] = []
+    for raw_clip_id in clip_ids:
+        clip_id = str(raw_clip_id or "").strip()
+        if not clip_id:
+            return None
+        clip_dir = os.path.join(clip_output_root, "clips", clip_id)
+        required_paths = (
+            os.path.join(clip_dir, "clip.mp4"),
+            os.path.join(clip_dir, "track.json"),
+            os.path.join(clip_dir, "meta.json"),
+        )
+        if not all(os.path.isfile(path) for path in required_paths):
+            return None
+        clip_samples.append(
+            {
+                "input": clip_dir,
+                "sample_id": clip_id,
+                "clip_id": clip_id,
+                "source_sample_id": sample["sample_id"],
+                "source_input": sample["input"],
+            }
+        )
+    return clip_samples
+
+
+def _reuse_existing_face_clip_samples(
+    sample: Dict[str, str],
+    cfg,
+    batch_output_dir: str,
+) -> tuple[List[Dict[str, str]], Dict[str, object]] | None:
+    clip_output_root = _resolve_face_clip_output_root(cfg, batch_output_dir)
+    summary = _read_json_dict(os.path.join(clip_output_root, "batch_summary.json"))
+    items = list(summary.get("items") or [])
+    input_path = os.path.abspath(str(sample["input"]))
+
+    matched_item = None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        source_path = os.path.abspath(str(item.get("source_path") or ""))
+        if source_path == input_path:
+            matched_item = item
+            break
+
+    if matched_item is None:
+        return None
+
+    existing_status = str(matched_item.get("status") or "").strip()
+    clip_ids = [str(value).strip() for value in list(matched_item.get("clip_ids") or []) if str(value).strip()]
+    if existing_status not in {"completed", "completed_no_clips", "skipped_no_face_precheck"}:
+        return None
+
+    clip_samples = _build_clip_samples_from_ids(sample, clip_output_root, clip_ids)
+    if clip_samples is None:
+        return None
+
+    record = _build_sample_result_base(sample, clip_output_root, stage="face_clip_extraction")
+    record.update(
+        {
+            "status": "skipped_existing",
+            "existing_status": existing_status,
+            "kept_clip_count": len(clip_samples),
+            "clip_ids": [clip_sample["clip_id"] for clip_sample in clip_samples],
+        }
+    )
+    if "face_presence" in matched_item and isinstance(matched_item["face_presence"], dict):
+        record["face_presence"] = dict(matched_item["face_presence"])
+    return clip_samples, record
+
+
+def extract_face_first_clip_samples(app, sample, cfg, batch_output_dir, *, skip_existing: bool = False):
     input_path = str(sample["input"])
     if not input_path.lower().endswith(".mp4"):
         raise ValueError("face-first clip mode only supports .mp4 video inputs")
 
     wan_cfg = _resolve_wan_export_config(cfg)
     clip_output_root = _resolve_face_clip_output_root(cfg, batch_output_dir)
+    if skip_existing:
+        reused = _reuse_existing_face_clip_samples(sample, cfg, batch_output_dir)
+        if reused is not None:
+            return reused
     sample_probe = app.prepare_input(input_path, None, False)
     face_presence = app._probe_sample_face_presence(sample_probe)
     if app._should_skip_sample_for_face_presence(face_presence):
@@ -161,6 +251,7 @@ def extract_face_first_clip_samples(app, sample, cfg, batch_output_dir):
         min_clip_seconds=float(wan_cfg.face_clip_min_clip_seconds),
         face_backend=app._ensure_face_backend(),
         sample_id=sample["sample_id"],
+        target_fps=float(wan_cfg.fps),
     )
     clip_ids = [os.path.basename(os.path.abspath(path)) for path in clip_dirs]
     clip_samples = [
@@ -274,6 +365,7 @@ def run_batch(args):
                     sample,
                     cfg,
                     args.output_dir,
+                    skip_existing=args.skip_existing,
                 )
             except Exception as exc:  # noqa: BLE001 - batch runner records stage-1 failures explicitly
                 extraction_record = _build_sample_result_base(

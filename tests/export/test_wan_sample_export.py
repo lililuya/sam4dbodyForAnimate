@@ -404,6 +404,7 @@ class WanSampleExportTests(unittest.TestCase):
                 "pred_keypoints_2d": np.zeros((70, 2), dtype=np.float32),
                 "pred_keypoints_3d": np.zeros((70, 3), dtype=np.float32),
                 "bbox": np.array([10.0, 8.0, 30.0, 40.0], dtype=np.float32),
+                "mask": np.zeros((64, 48, 1), dtype=np.uint8),
             }
             for index in range(3):
                 image_path = os.path.join(image_dir, f"{index:08d}.jpg")
@@ -525,6 +526,7 @@ class WanSampleExportTests(unittest.TestCase):
                 "pred_keypoints_2d": np.zeros((70, 2), dtype=np.float32),
                 "pred_keypoints_3d": np.zeros((70, 3), dtype=np.float32),
                 "bbox": np.array([10.0, 8.0, 30.0, 40.0], dtype=np.float32),
+                "mask": np.zeros((64, 48, 1), dtype=np.uint8),
             }
             for index in range(3):
                 image_path = os.path.join(image_dir, f"{index:08d}.jpg")
@@ -559,6 +561,7 @@ class WanSampleExportTests(unittest.TestCase):
             self.assertEqual(len(smpl_sequence["records"]), 3)
             self.assertIsInstance(smpl_sequence["records"][0]["person_output"]["pred_keypoints_2d"], list)
             self.assertIsInstance(smpl_sequence["records"][0]["person_output"]["bbox"], list)
+            self.assertNotIn("mask", smpl_sequence["records"][0]["person_output"])
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 

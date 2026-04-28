@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from scripts.wan_face_export import WanFaceDetection, _bbox_iou
+from scripts.wan_reference_compat import compute_sample_indices
 from scripts.wan_sample_export import resolve_or_create_wan_sample_uuid
 
 
@@ -284,6 +285,46 @@ def _serialize_record(record: FaceClipRecord, *, clip_frame_index: int, fps: flo
     }
 
 
+def _resample_segment_records(
+    records: list[FaceClipRecord],
+    *,
+    source_fps: float,
+    target_fps: float | None,
+) -> list[FaceClipRecord]:
+    if not records:
+        return []
+    if target_fps is None or float(target_fps) <= 0 or abs(float(target_fps) - float(source_fps)) < 1e-6:
+        return list(records)
+    sampled_indices = compute_sample_indices(
+        num_frames=len(records),
+        source_fps=float(source_fps),
+        target_fps=float(target_fps),
+    )
+    if not sampled_indices:
+        return [records[0]]
+    return [records[int(index)] for index in sampled_indices]
+
+
+def _resample_segment_frames(
+    frames_bgr: list[np.ndarray],
+    *,
+    source_fps: float,
+    target_fps: float | None,
+) -> list[np.ndarray]:
+    if not frames_bgr:
+        return []
+    if target_fps is None or float(target_fps) <= 0 or abs(float(target_fps) - float(source_fps)) < 1e-6:
+        return list(frames_bgr)
+    sampled_indices = compute_sample_indices(
+        num_frames=len(frames_bgr),
+        source_fps=float(source_fps),
+        target_fps=float(target_fps),
+    )
+    if not sampled_indices:
+        return [frames_bgr[0]]
+    return [frames_bgr[int(index)] for index in sampled_indices]
+
+
 def update_face_clip_batch_summary(output_root: str, *, input_video: str, item: dict) -> None:
     summary_path = os.path.join(output_root, "batch_summary.json")
     current = _read_json_dict(summary_path)
@@ -346,6 +387,7 @@ def extract_face_clips_from_video(
     min_clip_seconds: float,
     face_backend,
     sample_id: str | None = None,
+    target_fps: float | None = None,
 ) -> list[str]:
     input_video = os.path.abspath(str(input_video))
     output_root = os.path.abspath(str(output_root))
@@ -386,32 +428,53 @@ def extract_face_clips_from_video(
             segment_index=int(segment.segment_index),
         )
         clip_dir = os.path.join(output_root, "clips", clip_id)
-        segment_frames = frames_bgr[int(segment.start_frame) : int(segment.end_frame) + 1]
+        source_segment_frames = frames_bgr[int(segment.start_frame) : int(segment.end_frame) + 1]
+        clip_records = _resample_segment_records(
+            segment.records,
+            source_fps=float(fps),
+            target_fps=target_fps,
+        )
+        clip_frames = _resample_segment_frames(
+            source_segment_frames,
+            source_fps=float(fps),
+            target_fps=target_fps,
+        )
+        clip_fps = float(target_fps) if target_fps is not None and float(target_fps) > 0 else float(fps)
         track_records = [
-            _serialize_record(record, clip_frame_index=idx, fps=float(fps))
-            for idx, record in enumerate(segment.records)
+            _serialize_record(record, clip_frame_index=idx, fps=clip_fps)
+            for idx, record in enumerate(clip_records)
         ]
+        source_start_frame = int(segment.records[0].frame_index_in_source)
+        source_end_frame = int(segment.records[-1].frame_index_in_source)
+        clip_start_frame = int(clip_records[0].frame_index_in_source) if clip_records else source_start_frame
+        clip_end_frame = int(clip_records[-1].frame_index_in_source) if clip_records else source_end_frame
         meta = {
             "clip_id": clip_id,
             "sample_uuid": sample_uuid,
             "source_path": input_video,
-            "start_frame": int(segment.start_frame),
-            "end_frame": int(segment.end_frame),
-            "fps": float(fps),
-            "frame_count": len(segment.records),
-            "duration_seconds": float(len(segment.records)) / float(max(fps, 1e-6)),
+            "source_start_frame": source_start_frame,
+            "source_end_frame": source_end_frame,
+            "source_fps": float(fps),
+            "source_frame_count": len(segment.records),
+            "start_frame": clip_start_frame,
+            "end_frame": clip_end_frame,
+            "fps": clip_fps,
+            "frame_count": len(clip_records),
+            "duration_seconds": float(len(clip_records)) / float(max(clip_fps, 1e-6)),
             "clip_path": os.path.join(clip_dir, "clip.mp4"),
             "track_json_path": os.path.join(clip_dir, "track.json"),
         }
 
-        _write_mp4(os.path.join(clip_dir, "clip.mp4"), segment_frames, fps=float(fps))
+        _write_mp4(os.path.join(clip_dir, "clip.mp4"), clip_frames, fps=clip_fps)
         _write_json(
             os.path.join(clip_dir, "track.json"),
             {
                 "clip_id": clip_id,
                 "sample_uuid": sample_uuid,
                 "source_path": input_video,
-                "fps": float(fps),
+                "source_fps": float(fps),
+                "source_frame_count": len(segment.records),
+                "fps": clip_fps,
                 "records": track_records,
             },
         )

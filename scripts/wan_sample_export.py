@@ -79,6 +79,16 @@ def _to_json_safe(value):
     return value
 
 
+def _sanitize_smpl_sequence_person_output(person_output):
+    if not isinstance(person_output, dict):
+        return person_output
+    return {
+        key: value
+        for key, value in person_output.items()
+        if str(key) != "mask"
+    }
+
+
 def _merge_dicts(base: dict, updates: dict) -> dict:
     merged = dict(base)
     for key, value in updates.items():
@@ -543,7 +553,9 @@ class WanSampleExporter:
                         "records": [
                             {
                                 "frame_stem": payload["frame_stem"],
-                                "person_output": _to_json_safe(payload["raw_person_output"]),
+                                "person_output": _to_json_safe(
+                                    _sanitize_smpl_sequence_person_output(payload["raw_person_output"])
+                                ),
                             }
                             for payload in frame_payloads
                         ],

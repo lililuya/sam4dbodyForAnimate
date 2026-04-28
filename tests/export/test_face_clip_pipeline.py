@@ -171,6 +171,73 @@ class FaceClipSegmentationTests(unittest.TestCase):
                 track = json.load(handle)
             self.assertEqual(len(track["records"]), 4)
 
+    def test_extract_face_clips_from_video_can_normalize_clip_package_fps_before_sam4d(self):
+        from scripts.face_clip_pipeline import extract_face_clips_from_video
+
+        with make_workspace_tempdir() as temp_dir:
+            input_video = os.path.join(temp_dir, "input.mp4")
+            output_root = os.path.join(temp_dir, "face_clips")
+
+            writer = cv2.VideoWriter(
+                input_video,
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                2.0,
+                (32, 32),
+            )
+            self.assertTrue(writer.isOpened())
+            try:
+                for value in (40, 60, 80, 100):
+                    frame = np.full((32, 32, 3), value, dtype=np.uint8)
+                    writer.write(frame)
+            finally:
+                writer.release()
+
+            clip_dirs = extract_face_clips_from_video(
+                input_video=input_video,
+                output_root=output_root,
+                min_clip_seconds=2.0,
+                face_backend=_SequenceFaceBackend(
+                    [
+                        [_det((8, 8, 20, 20))],
+                        [_det((9, 8, 21, 20))],
+                        [_det((10, 8, 22, 20))],
+                        [_det((11, 8, 23, 20))],
+                    ]
+                ),
+                target_fps=1.0,
+            )
+
+            self.assertEqual(len(clip_dirs), 1)
+            clip_dir = clip_dirs[0]
+
+            with open(os.path.join(clip_dir, "meta.json"), "r", encoding="utf-8") as handle:
+                meta = json.load(handle)
+            self.assertEqual(meta["source_fps"], 2.0)
+            self.assertEqual(meta["fps"], 1.0)
+            self.assertEqual(meta["source_frame_count"], 4)
+            self.assertEqual(meta["frame_count"], 2)
+
+            with open(os.path.join(clip_dir, "track.json"), "r", encoding="utf-8") as handle:
+                track = json.load(handle)
+            self.assertEqual(track["source_fps"], 2.0)
+            self.assertEqual(track["fps"], 1.0)
+            self.assertEqual(len(track["records"]), 2)
+            self.assertEqual(track["records"][0]["frame_index_in_source"], 0)
+            self.assertEqual(track["records"][1]["frame_index_in_source"], 2)
+            self.assertEqual(track["records"][0]["frame_index_in_clip"], 0)
+            self.assertEqual(track["records"][1]["frame_index_in_clip"], 1)
+            self.assertEqual(track["records"][1]["timestamp_seconds"], 1.0)
+
+            capture = cv2.VideoCapture(os.path.join(clip_dir, "clip.mp4"))
+            try:
+                self.assertTrue(capture.isOpened())
+                frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+            finally:
+                capture.release()
+            self.assertEqual(frame_count, 2)
+            self.assertGreaterEqual(fps, 0.5)
+
     def test_extract_face_clips_from_video_accumulates_batch_summary_across_sources(self):
         from scripts.face_clip_pipeline import extract_face_clips_from_video
 
