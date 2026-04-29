@@ -1,0 +1,127 @@
+paths:
+  ckpt_root: "path to global checkpoint root"
+
+sam3:
+  ckpt_path: ${paths.ckpt_root}/sam3/sam3.pt
+
+sam_3d_body:
+  ckpt_path: ${paths.ckpt_root}/sam-3d-body-dinov3/model.ckpt
+  mhr_path: ${paths.ckpt_root}/sam-3d-body-dinov3/assets/mhr_model.pt
+  fov_path: ${paths.ckpt_root}/moge-2-vitl-normal/model.pt
+  batch_size: 32
+  detector_path: ""
+  segmentor_path: ""
+
+runtime:
+  output_dir: ./outputs_refined_fast_80g
+  continue_on_error: false
+  # Pose json exports written per-frame and per-person.
+  # Supported: openpose, smpl, coco17, coco_wholebody
+  pose_exports: [openpose, smpl, coco17, coco_wholebody]
+  # Keep the final 4D mp4 even when rendered JPG directories are disabled.
+  save_rendered_video: true
+  # Direct inline mp4 writing trades memory for convenience; leave it off unless you explicitly need it.
+  save_rendered_video_direct: false
+  # Optional 4D artifacts. Keep these on for full outputs, or disable selected ones for faster IO.
+  save_rendered_frames: true
+  save_rendered_frames_individual: true
+  save_mesh_4d_individual: true
+  save_focal_4d_individual: true
+
+wan_export:
+  # Optional WanAnimate-style per-track export from the refined offline batch path.
+  enable: false
+  face_clip:
+    enable: false
+    output_dir: ""
+    min_clip_seconds: 5.0
+    debug_save_face_crop_video: false
+  # Optional independent parent directory for source_uuid_map / summary / skipped / issue ledger metadata.
+  # Leave empty to reuse wan_export.output_dir.
+  metadata_output_dir: ""
+  # WanAnimate-compatible sampling/output fps.
+  fps: 25
+  # Resize each exported frame by target area and keep the final canvas 16-aligned.
+  resolution_area: [512, 768]
+  # Face crops are written as square clips.
+  face_resolution: [512, 512]
+  # Skip short tracks to avoid low-value training samples.
+  min_track_frames: 16
+  # Require enough usable face detections after temporal gap fill.
+  min_valid_face_ratio: 0.60
+  # Expand the detected face crop roughly in line with WanAnimate preprocessing.
+  face_expand: 1.30
+  # Fill short face-detection gaps with the previous valid target face box.
+  face_gap: 8
+  # Skip samples early when sampled frames contain too few detectable faces.
+  skip_sample_without_face: true
+  # Check face presence on every Nth frame before refined tracking begins.
+  face_presence_stride: 5
+  # Skip when the sampled no-face ratio reaches or exceeds this threshold.
+  max_no_face_ratio: 0.80
+  # Copy the final rendered 4D video into each exported target directory.
+  copy_rendered_4d_to_targets: true
+  # Remove heavy refined intermediates after successful Wan export packaging.
+  cleanup_sample_workdir_after_export: true
+  # Mask augmentation settings for src_mask.mp4. Background export still only removes the raw target body region.
+  mask_kernel_size: 7
+  mask_iterations: 3
+  mask_w_len: 10
+  mask_h_len: 20
+  # Save per-frame Wan pose metadata jsons alongside the videos.
+  save_pose_meta_json: true
+  # Raw SMPL per-frame bundles are very large; keep disabled unless explicitly needed for debugging.
+  save_smpl_sequence_json: false
+
+completion:
+  # Speed-priority profile for large-memory GPUs:
+  # keep completion enabled, but raise temporal throughput.
+  enable: true
+  detection_resolution: [192, 384]
+  completion_resolution: [256, 512]
+  batch_size: 4
+  decode_chunk_size: 4
+  model_path_mask: ${paths.ckpt_root}/diffusion-vas-amodal-segmentation
+  model_path_rgb: ${paths.ckpt_root}/diffusion-vas-content-completion
+  model_path_depth: ${paths.ckpt_root}/depth_anything_v2_vitl.pth
+  depth_encoder: vitl
+  max_occ_len: 6
+
+detector:
+  backend: yolo
+  # For YOLO, weights_path can be a local .pt file or a model name like yolo11m.pt.
+  # Leave it empty to auto-download the default yolo11n.pt on first use.
+  weights_path: ""
+  # Overlap-friendly defaults carried over from the low-memory refined profile.
+  bbox_thresh: 0.20
+  iou_thresh: 0.70
+  max_det: 20
+  # Keep this at 0 to avoid silently dropping extra people.
+  # If your batch is always a fixed small number of people, lowering this can speed up 4D.
+  max_targets: 0
+
+tracking:
+  chunk_size: 180
+
+refine:
+  enable: true
+
+batch:
+  # Speed-priority batch policy:
+  # shorten initial search and skip expensive automatic retries.
+  initial_search_frames: 12
+  retry_mode: never
+  retry_chunk_sizes: [120, 96]
+  retry_batch_sizes: [24, 16]
+
+reprompt:
+  # Current reprompt is diagnostic-only, so disable it in the speed profile.
+  enable: false
+  empty_mask_patience: 5
+  area_drop_ratio: 0.20
+  edge_touch_ratio: 0.40
+  iou_low_threshold: 0.35
+
+debug:
+  # Keep debug summaries so batch skip/resume still works cleanly.
+  save_metrics: true

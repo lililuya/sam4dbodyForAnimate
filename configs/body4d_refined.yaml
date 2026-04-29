@@ -15,6 +15,45 @@ sam_3d_body:
 runtime:
   output_dir: ./outputs_refined
   continue_on_error: false
+  # Pose json exports written per-frame and per-person.
+  # Supported: openpose, smpl, coco17, coco_wholebody
+  pose_exports: [openpose, smpl, coco17, coco_wholebody]
+  # Keep the final 4D mp4 even if per-frame rendered JPGs are disabled.
+  save_rendered_video: true
+  # Direct inline mp4 writing forces per-frame rendering in the main loop, so keep it off unless needed.
+  save_rendered_video_direct: false
+  # Optional 4D artifacts. Turn off the ones you do not need to reduce IO and disk usage.
+  save_rendered_frames: true
+  save_rendered_frames_individual: true
+  save_mesh_4d_individual: true
+  save_focal_4d_individual: true
+
+wan_export:
+  enable: false
+  face_clip:
+    enable: false
+    output_dir: ""
+    min_clip_seconds: 5.0
+    debug_save_face_crop_video: false
+  metadata_output_dir: ""
+  fps: 25
+  resolution_area: [512, 768]
+  face_resolution: [512, 512]
+  min_track_frames: 16
+  min_valid_face_ratio: 0.60
+  face_expand: 1.30
+  face_gap: 8
+  skip_sample_without_face: true
+  face_presence_stride: 5
+  max_no_face_ratio: 0.80
+  copy_rendered_4d_to_targets: true
+  cleanup_sample_workdir_after_export: true
+  mask_kernel_size: 7
+  mask_iterations: 3
+  mask_w_len: 10
+  mask_h_len: 20
+  save_pose_meta_json: true
+  save_smpl_sequence_json: false
 
 completion:
   enable: true
@@ -31,12 +70,19 @@ detector:
   # For YOLO, weights_path can be a local .pt file or a model name like yolo11m.pt.
   # Leave it empty to auto-download the default yolo11n.pt on first use.
   weights_path: ""
-  bbox_thresh: 0.35
-  iou_thresh: 0.50
-  max_det: 20
+  # Leave these as null to use official backend defaults:
+  # yolo/yolo11 -> bbox_thresh 0.25, iou_thresh 0.70, max_det 300
+  # vitdet -> bbox_thresh 0.05, iou_thresh 0.50
+  bbox_thresh: null
+  iou_thresh: null
+  max_det: null
+  max_targets: 0
 
 tracking:
   chunk_size: 180
+
+refine:
+  enable: true
 
 batch:
   initial_search_frames: 24

@@ -5,8 +5,9 @@ import json
 import os
 import shutil
 import sys
+import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from contextlib import nullcontext
 from typing import Dict, Iterable, List, Optional
 
@@ -24,6 +25,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.append(ROOT)
 
+from scripts.detector_defaults import resolve_detector_runtime_options, run_human_detection_compat
 from scripts.offline_reprompt import match_detection_to_track, should_trigger_reprompt
 
 
@@ -105,6 +107,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--detector_backend", type=str, default=None)
     parser.add_argument("--track_chunk_size", type=int, default=None)
+    parser.add_argument("--max_targets", type=int, default=None)
+    parser.add_argument("--disable_mask_refine", action="store_true")
     parser.add_argument("--disable_auto_reprompt", action="store_true")
     parser.add_argument("--save_debug_metrics", action="store_true")
     parser.add_argument("--skip_existing", action="store_true")
@@ -127,8 +131,14 @@ def apply_runtime_overrides(args, cfg):
         cfg.runtime.output_dir = args.output_dir
     if args.detector_backend is not None:
         cfg.detector.backend = args.detector_backend
+    if getattr(args, "max_targets", None) is not None:
+        cfg.detector.max_targets = int(args.max_targets)
     if args.track_chunk_size is not None:
         cfg.tracking.chunk_size = args.track_chunk_size
+    if getattr(args, "disable_mask_refine", False):
+        if not hasattr(cfg, "refine") or cfg.refine is None:
+            cfg.refine = OmegaConf.create({})
+        cfg.refine.enable = False
     if args.disable_auto_reprompt:
         cfg.reprompt.enable = False
     if args.save_debug_metrics:
@@ -145,21 +155,50 @@ def build_reprompt_thresholds(cfg) -> Dict[str, float]:
     }
 
 
-def prepare_output_dirs(output_dir: str, obj_ids: Iterable[int], save_debug_metrics: bool) -> Dict[str, str]:
+def build_runtime_storage_options(cfg) -> Dict[str, object]:
+    return {
+        "save_rendered_video": bool(cfg_get(cfg, "runtime.save_rendered_video", True)),
+        "save_rendered_video_direct": bool(cfg_get(cfg, "runtime.save_rendered_video_direct", False)),
+        "save_rendered_frames": bool(cfg_get(cfg, "runtime.save_rendered_frames", True)),
+        "save_rendered_frames_individual": bool(cfg_get(cfg, "runtime.save_rendered_frames_individual", True)),
+        "save_mesh_4d_individual": bool(cfg_get(cfg, "runtime.save_mesh_4d_individual", True)),
+        "save_focal_4d_individual": bool(cfg_get(cfg, "runtime.save_focal_4d_individual", True)),
+        "render_mode": str(cfg_get(cfg, "runtime.render_mode", "normal")),
+        "render_scene_bg_color": list(cfg_get(cfg, "runtime.render_scene_bg_color", [0, 0, 0]) or [0, 0, 0]),
+        "pose_exports": list(cfg_get(cfg, "runtime.pose_exports", []) or []),
+        "wan_export": to_plain_runtime_dict(cfg_get(cfg, "wan_export", {})),
+    }
+
+
+def prepare_output_dirs(
+    output_dir: str,
+    obj_ids: Iterable[int],
+    save_debug_metrics: bool,
+    storage_options: Optional[dict] = None,
+) -> Dict[str, str]:
+    storage_options = dict(storage_options or {})
+    save_rendered_frames = bool(storage_options.get("save_rendered_frames", True))
+    save_rendered_frames_individual = bool(storage_options.get("save_rendered_frames_individual", True))
+    save_mesh_4d_individual = bool(storage_options.get("save_mesh_4d_individual", True))
+    save_focal_4d_individual = bool(storage_options.get("save_focal_4d_individual", True))
     paths = {
         "images": os.path.join(output_dir, "images"),
         "masks_raw": os.path.join(output_dir, "masks_raw"),
         "masks_refined": os.path.join(output_dir, "masks_refined"),
         "completion_images": os.path.join(output_dir, "completion_refined", "images"),
         "completion_masks": os.path.join(output_dir, "completion_refined", "masks"),
-        "rendered_frames": os.path.join(output_dir, "rendered_frames"),
     }
+    if save_rendered_frames:
+        paths["rendered_frames"] = os.path.join(output_dir, "rendered_frames")
     for path in paths.values():
         os.makedirs(path, exist_ok=True)
     for obj_id in obj_ids:
-        os.makedirs(os.path.join(output_dir, "mesh_4d_individual", str(obj_id)), exist_ok=True)
-        os.makedirs(os.path.join(output_dir, "focal_4d_individual", str(obj_id)), exist_ok=True)
-        os.makedirs(os.path.join(output_dir, "rendered_frames_individual", str(obj_id)), exist_ok=True)
+        if save_mesh_4d_individual:
+            os.makedirs(os.path.join(output_dir, "mesh_4d_individual", str(obj_id)), exist_ok=True)
+        if save_focal_4d_individual:
+            os.makedirs(os.path.join(output_dir, "focal_4d_individual", str(obj_id)), exist_ok=True)
+        if save_rendered_frames_individual:
+            os.makedirs(os.path.join(output_dir, "rendered_frames_individual", str(obj_id)), exist_ok=True)
     if save_debug_metrics:
         debug_dir = os.path.join(output_dir, "debug_metrics")
         os.makedirs(debug_dir, exist_ok=True)
@@ -195,6 +234,14 @@ def write_debug_json(debug_dir: str, filename: str, payload) -> None:
 
 def clone_runtime_config(cfg):
     return OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+
+
+def to_plain_runtime_dict(value) -> dict:
+    if value is None:
+        return {}
+    if OmegaConf.is_config(value):
+        return OmegaConf.to_container(value, resolve=False) or {}
+    return dict(value)
 
 
 def apply_sample_runtime_profile(cfg, runtime_profile: Optional[dict]) -> dict:
@@ -233,6 +280,22 @@ def count_video_frames(video_path: str) -> int:
     finally:
         capture.release()
     return frame_count
+
+
+def load_json_file(path: str):
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def resolve_video_fps(video_path: str) -> Optional[float]:
+    capture = cv2.VideoCapture(video_path)
+    try:
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+    finally:
+        capture.release()
+    if fps > 0:
+        return fps
+    return None
 
 
 def build_frame_stems(frame_count: int) -> List[str]:
@@ -295,6 +358,93 @@ def mask_bbox_xyxy(binary_mask: np.ndarray):
     return [float(x_min), float(y_min), float(x_max), float(y_max)]
 
 
+def bbox_iou_xyxy(a, b) -> float:
+    if a is None or b is None:
+        return 0.0
+
+    ax1, ay1, ax2, ay2 = (float(value) for value in a[:4])
+    bx1, by1, bx2, by2 = (float(value) for value in b[:4])
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter_area
+    if union <= 0.0:
+        return 0.0
+    return float(inter_area / union)
+
+
+def normalize_detection_outputs(outputs) -> Optional[List[dict]]:
+    if outputs is None:
+        return None
+
+    if isinstance(outputs, np.ndarray):
+        array = np.asarray(outputs, dtype=np.float32)
+        if array.size == 0:
+            return []
+        if array.ndim == 1:
+            array = array.reshape(1, -1)
+        if array.ndim != 2 or array.shape[1] < 4:
+            return None
+        normalized = []
+        for row in array:
+            score = float(row[4]) if row.shape[0] > 4 else None
+            normalized.append(
+                {
+                    "bbox": [float(value) for value in row[:4]],
+                    "score": score,
+                }
+            )
+        return normalized
+
+    if not isinstance(outputs, (list, tuple)):
+        return None
+
+    normalized = []
+    for output in outputs:
+        if isinstance(output, dict):
+            bbox = output.get("bbox")
+            score = output.get("score")
+        else:
+            bbox = output
+            score = None
+
+        if bbox is None:
+            return None
+
+        bbox_array = np.asarray(bbox, dtype=np.float32).reshape(-1)
+        if bbox_array.size < 4:
+            return None
+
+        normalized.append(
+            {
+                "bbox": [float(value) for value in bbox_array[:4]],
+                "score": None if score is None else float(score),
+            }
+        )
+
+    return normalized
+
+
+def limit_detection_outputs(outputs: List[dict], max_targets: int) -> List[dict]:
+    if int(max_targets) <= 0 or len(outputs) <= int(max_targets):
+        return list(outputs)
+
+    if any(output.get("score") is None for output in outputs):
+        return list(outputs[: int(max_targets)])
+
+    ranked_outputs = sorted(
+        enumerate(outputs),
+        key=lambda item: (-float(item[1]["score"]), item[0]),
+    )
+    return [output for _, output in ranked_outputs[: int(max_targets)]]
+
+
 class RefinedOfflineApp:
     def __init__(self, config_path: str, config=None):
         self.config_path = config_path
@@ -305,6 +455,7 @@ class RefinedOfflineApp:
         self._base_module = None
         self._base_app = None
         self._detector_signature = None
+        self._face_backend = None
         self.reset_sample_state()
 
     def reset_sample_state(self):
@@ -323,11 +474,19 @@ class RefinedOfflineApp:
         self._last_track_boxes = {}
 
     def prepare_sample_output(self, output_dir: str, obj_ids: Iterable[int]):
+        output_dir = os.path.abspath(output_dir)
+        self.OUTPUT_DIR = output_dir
+        if self.sample_state:
+            self.sample_state["output_dir"] = output_dir
+            self.sample_state["output_dir_ready"] = True
+        if self._base_app is not None:
+            self._sync_base_app_runtime(self._base_app, output_dir)
         self.chunk_records = []
         self.output_paths = prepare_output_dirs(
             output_dir,
             obj_ids,
             save_debug_metrics=bool(self.CONFIG.debug.save_metrics),
+            storage_options=build_runtime_storage_options(self.CONFIG),
         )
         return self.output_paths
 
@@ -344,11 +503,505 @@ class RefinedOfflineApp:
         if self.reprompt_events:
             write_debug_json(debug_dir, "reprompt_events.json", self.reprompt_events)
 
+    def _build_sample_fps_summary(self, sample: dict) -> dict:
+        input_type = str(sample.get("input_type") or "")
+        source_fps = None
+        source_fps_source = "unavailable"
+        if input_type in {"video", "clip_package"}:
+            source_fps = resolve_video_fps(str(sample.get("input_video") or ""))
+            source_fps_source = "video_metadata" if source_fps is not None else "unavailable"
+        elif input_type == "images":
+            source_fps_source = "image_sequence"
+
+        wan_export_cfg = to_plain_runtime_dict(cfg_get(self.CONFIG, "wan_export", {}))
+        wan_target_fps = None
+        if bool(wan_export_cfg.get("enable", False)):
+            wan_target_fps = int(wan_export_cfg.get("fps", 25))
+
+        return {
+            "source_fps": source_fps,
+            "source_fps_source": source_fps_source,
+            "rendered_4d_fps": float(getattr(self, "RUNTIME", {}).get("video_fps", 25) or 25),
+            "wan_target_fps": wan_target_fps,
+        }
+
+    def _resolve_sample_identity(self, sample: Optional[dict] = None, input_video: Optional[str] = None) -> dict:
+        sample = dict(sample or {})
+        source_path = os.path.abspath(
+            str(
+                sample.get("source_path")
+                or self.sample_state.get("source_path")
+                or sample.get("input_video")
+                or input_video
+                or self.sample_state.get("input_video")
+                or ""
+            )
+        )
+        working_output_dir = sample.get("output_dir") or self.sample_state.get("output_dir")
+        sample_id = os.path.splitext(os.path.basename(source_path))[0] or os.path.basename(
+            os.path.abspath(str(working_output_dir or "sample"))
+        )
+        return {
+            "sample_id": sample_id,
+            "source_path": source_path,
+            "working_output_dir": None if not working_output_dir else os.path.abspath(str(working_output_dir)),
+        }
+
+    def _resolve_issue_ledger_root(self, sample: Optional[dict] = None) -> str:
+        from scripts.wan_sample_types import WanExportConfig
+
+        wan_cfg = WanExportConfig.from_runtime(cfg_get(self.CONFIG, "wan_export", {}))
+        metadata_root = str(wan_cfg.metadata_output_dir or wan_cfg.output_dir or "").strip()
+        if metadata_root:
+            return os.path.abspath(metadata_root)
+
+        configured_output_root = os.path.abspath(
+            str(cfg_get(self.CONFIG, "runtime.output_dir", os.path.join(ROOT, "outputs_refined")))
+        )
+        planned_output_dir = None if not sample else sample.get("output_dir")
+        if planned_output_dir:
+            planned_output_dir_abs = os.path.abspath(str(planned_output_dir))
+            if planned_output_dir_abs == configured_output_root:
+                return configured_output_root
+            return os.path.dirname(planned_output_dir_abs) or configured_output_root
+        return configured_output_root
+
+    def _append_issue_ledger_record(self, record: dict, sample: Optional[dict] = None) -> None:
+        from scripts.wan_sample_export import append_wan_issue_records
+
+        append_wan_issue_records(self._resolve_issue_ledger_root(sample), [record])
+
+    def _build_issue_ledger_record(
+        self,
+        *,
+        event_type: str,
+        status: str,
+        reason: str,
+        sample: Optional[dict] = None,
+        sample_uuid: Optional[str] = None,
+        runtime_profile: Optional[dict] = None,
+        details: Optional[dict] = None,
+        input_video: Optional[str] = None,
+    ) -> dict:
+        identity = self._resolve_sample_identity(sample, input_video=input_video)
+        return {
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "event_type": str(event_type),
+            "status": str(status),
+            "reason": str(reason),
+            "source_path": identity["source_path"],
+            "sample_id": identity["sample_id"],
+            "sample_uuid": None if not sample_uuid else str(sample_uuid),
+            "working_output_dir": identity["working_output_dir"],
+            "runtime_profile": None if runtime_profile is None else copy.deepcopy(runtime_profile),
+            "details": dict(details or {}),
+        }
+
+    def _ensure_face_backend(self):
+        if self._face_backend is None:
+            from scripts.wan_face_export import InsightFaceBackend
+
+            self._face_backend = InsightFaceBackend()
+        return self._face_backend
+
+    def _probe_sample_face_presence(self, sample: dict) -> dict:
+        from scripts.wan_sample_types import WanExportConfig
+
+        wan_cfg = WanExportConfig.from_runtime(cfg_get(self.CONFIG, "wan_export", {}))
+        stride = max(1, int(wan_cfg.face_presence_stride))
+        summary = {
+            "checked_frame_count": 0,
+            "face_detected_frame_count": 0,
+            "no_face_frame_count": 0,
+            "no_face_ratio": 0.0,
+            "face_presence_stride": stride,
+            "max_no_face_ratio": float(wan_cfg.max_no_face_ratio),
+            "skip_sample_without_face": bool(wan_cfg.skip_sample_without_face),
+            "probe_executed": False,
+        }
+        if not bool(wan_cfg.enable) or not bool(wan_cfg.skip_sample_without_face):
+            return summary
+
+        frame_count = int(sample.get("frame_count", 0) or 0)
+        if frame_count <= 0:
+            return summary
+
+        frame_indices = list(range(0, frame_count, stride))
+        if not frame_indices:
+            frame_indices = [0]
+
+        backend = self._ensure_face_backend()
+        face_detected_frame_count = 0
+        for frame_idx in frame_indices:
+            frame_rgb = self._load_source_frame(sample, frame_idx)
+            detections = backend.detect(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+            if detections:
+                face_detected_frame_count += 1
+
+        checked_frame_count = len(frame_indices)
+        no_face_frame_count = max(0, checked_frame_count - face_detected_frame_count)
+        no_face_ratio = float(no_face_frame_count) / float(max(checked_frame_count, 1))
+        summary.update(
+            {
+                "checked_frame_count": checked_frame_count,
+                "face_detected_frame_count": face_detected_frame_count,
+                "no_face_frame_count": no_face_frame_count,
+                "no_face_ratio": no_face_ratio,
+                "probe_executed": True,
+            }
+        )
+        return summary
+
+    def _should_skip_sample_for_face_presence(self, face_presence: dict) -> bool:
+        from scripts.wan_sample_types import WanExportConfig
+
+        wan_cfg = WanExportConfig.from_runtime(cfg_get(self.CONFIG, "wan_export", {}))
+        if not bool(wan_cfg.enable) or not bool(wan_cfg.skip_sample_without_face):
+            return False
+        checked_frame_count = int(face_presence.get("checked_frame_count", 0) or 0)
+        if checked_frame_count <= 0:
+            return False
+        return float(face_presence.get("no_face_ratio", 0.0) or 0.0) >= float(wan_cfg.max_no_face_ratio)
+
+    def _ensure_wan_sample_summary(self, sample: dict) -> tuple[Optional[str], Optional[str]]:
+        from scripts.wan_sample_types import WanExportConfig
+
+        wan_cfg = WanExportConfig.from_runtime(cfg_get(self.CONFIG, "wan_export", {}))
+        if not bool(wan_cfg.enable):
+            return None, None
+
+        metadata_root = str(wan_cfg.metadata_output_dir or wan_cfg.output_dir or "").strip()
+        if not metadata_root:
+            return None, None
+
+        export_root = None if not wan_cfg.output_dir else os.path.abspath(str(wan_cfg.output_dir))
+        metadata_root = os.path.abspath(metadata_root)
+
+        from scripts.wan_sample_export import resolve_or_create_wan_sample_uuid, update_wan_sample_summary
+
+        identity = self._resolve_sample_identity(sample)
+        source_path = identity["source_path"]
+        sample_id = identity["sample_id"]
+        sample_output_dir = identity["working_output_dir"]
+        sample_uuid = str(sample.get("sample_uuid") or "").strip()
+        if not sample_uuid:
+            sample_uuid = resolve_or_create_wan_sample_uuid(
+                metadata_root,
+                source_path,
+                sample_id=sample_id,
+                working_output_dir=sample_output_dir,
+            )
+        summary_identity = str(sample.get("clip_id") or sample_uuid).strip()
+        update_wan_sample_summary(
+            metadata_root,
+            summary_identity,
+            {
+                "sample_id": sample_id,
+                "sample_uuid": sample_uuid,
+                "clip_id": sample.get("clip_id"),
+                "source_path": source_path,
+                "working_output_dir": None if not sample_output_dir else os.path.abspath(sample_output_dir),
+                "export_root": export_root,
+                "metadata_root": metadata_root,
+            },
+        )
+        self.sample_summary["sample_uuid"] = sample_uuid
+        if sample.get("clip_id"):
+            self.sample_summary["clip_id"] = str(sample.get("clip_id"))
+        self.sample_summary["wan_summary_key"] = summary_identity
+        return sample_uuid, metadata_root
+
+    def _load_wan_exported_target_records(self, summary_identity: Optional[str], wan_export_root: Optional[str]) -> list[dict]:
+        if not summary_identity or not wan_export_root:
+            return []
+
+        from scripts.wan_sample_export import get_wan_summary_path
+
+        summary_path = get_wan_summary_path(wan_export_root, summary_identity)
+        if not os.path.isfile(summary_path):
+            return []
+
+        with open(summary_path, "r", encoding="utf-8") as handle:
+            try:
+                payload = json.load(handle)
+            except json.JSONDecodeError:
+                return []
+
+        exported_targets = payload.get("exported_targets")
+        if not isinstance(exported_targets, list):
+            return []
+
+        target_records: list[dict] = []
+        for target in exported_targets:
+            if not isinstance(target, dict):
+                continue
+            sample_dir = str(target.get("sample_dir", "")).strip()
+            if not sample_dir:
+                continue
+            normalized = dict(target)
+            normalized["sample_dir"] = os.path.abspath(sample_dir)
+            target_records.append(normalized)
+        return target_records
+
+    def _load_video_info(self, video_path: str) -> Optional[dict]:
+        capture = cv2.VideoCapture(video_path)
+        try:
+            if not capture.isOpened():
+                return None
+            width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+            frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        finally:
+            capture.release()
+        return {
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "frame_count": frame_count,
+        }
+
+    def _find_rendered_frame_path(self, rendered_frames_dir: str, frame_stem: str) -> Optional[str]:
+        for extension in VALID_IMAGE_EXTENSIONS:
+            candidate = os.path.join(rendered_frames_dir, f"{frame_stem}{extension}")
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    def _parse_frame_stem_index(self, frame_stem: str) -> int:
+        normalized = os.path.splitext(os.path.basename(str(frame_stem)))[0]
+        try:
+            return int(normalized)
+        except ValueError as exc:
+            raise ValueError(f"frame_stem is not a numeric frame index: {frame_stem}") from exc
+
+    def _open_video_writer(self, output_path: str, width: int, height: int, fps: float):
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        writer = cv2.VideoWriter(
+            output_path,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            float(fps),
+            (int(width), int(height)),
+        )
+        if hasattr(writer, "isOpened") and not writer.isOpened():
+            raise RuntimeError(f"failed to open video writer: {output_path}")
+        return writer
+
+    def _extract_video_frame_by_index(self, capture, frame_index: int, cache: dict[int, np.ndarray]) -> np.ndarray:
+        if int(frame_index) in cache:
+            return np.array(cache[int(frame_index)], copy=True)
+
+        capture.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+        ok, frame_bgr = capture.read()
+        if not ok or frame_bgr is None:
+            raise RuntimeError(f"failed to read 4D frame at index {frame_index}")
+        cache[int(frame_index)] = np.array(frame_bgr, copy=True)
+        return frame_bgr
+
+    def _write_target_aligned_4d_video(
+        self,
+        *,
+        sample_output_dir: Optional[str],
+        final_4d_path: Optional[str],
+        target_record: dict,
+    ) -> None:
+        target_dir = os.path.abspath(str(target_record.get("sample_dir", "")).strip())
+        if not target_dir:
+            return
+
+        frame_stems = [str(item) for item in list(target_record.get("frame_stems") or []) if str(item).strip()]
+        output_path = os.path.join(target_dir, "4d.mp4")
+        target_video_path = os.path.join(target_dir, "target.mp4")
+
+        if not frame_stems:
+            if final_4d_path and os.path.isfile(final_4d_path):
+                os.makedirs(target_dir, exist_ok=True)
+                shutil.copy2(final_4d_path, output_path)
+            return
+
+        target_info = self._load_video_info(target_video_path)
+        if target_info is None:
+            raise FileNotFoundError(f"missing target video for aligned 4D export: {target_video_path}")
+        target_width = int(target_info["width"] or 0)
+        target_height = int(target_info["height"] or 0)
+        target_fps = float(target_info["fps"] or 0.0)
+        target_frame_count = int(target_info["frame_count"] or 0)
+        if target_width <= 0 or target_height <= 0:
+            raise RuntimeError(f"invalid target video resolution: {target_video_path}")
+        if target_fps <= 0:
+            target_fps = float(target_record.get("fps", 25) or 25)
+        if target_frame_count > 0 and target_frame_count != len(frame_stems):
+            raise RuntimeError(
+                f"target frame count mismatch for {target_dir}: target.mp4 has {target_frame_count} frames "
+                f"but exported target metadata expects {len(frame_stems)}"
+            )
+
+        rendered_frames_dir = None
+        if sample_output_dir:
+            candidate_dir = os.path.join(sample_output_dir, "rendered_frames")
+            if os.path.isdir(candidate_dir):
+                rendered_frames_dir = candidate_dir
+
+        writer = self._open_video_writer(output_path, target_width, target_height, target_fps)
+        frames_written = 0
+        try:
+            if rendered_frames_dir:
+                for frame_stem in frame_stems:
+                    frame_path = self._find_rendered_frame_path(rendered_frames_dir, frame_stem)
+                    if not frame_path:
+                        raise FileNotFoundError(
+                            f"missing rendered 4D frame for target-aligned export: {frame_stem} under {rendered_frames_dir}"
+                        )
+                    frame_bgr = cv2.imread(frame_path, cv2.IMREAD_COLOR)
+                    if frame_bgr is None:
+                        raise RuntimeError(f"failed to read rendered 4D frame: {frame_path}")
+                    if frame_bgr.shape[1] != target_width or frame_bgr.shape[0] != target_height:
+                        frame_bgr = cv2.resize(frame_bgr, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+                    writer.write(frame_bgr)
+                    frames_written += 1
+            else:
+                if not final_4d_path or not os.path.isfile(final_4d_path):
+                    raise FileNotFoundError(
+                        f"unable to build target-aligned 4D video for {target_dir}: missing rendered_frames and final 4D video"
+                    )
+                capture = cv2.VideoCapture(final_4d_path)
+                frame_cache: dict[int, np.ndarray] = {}
+                try:
+                    if not capture.isOpened():
+                        raise RuntimeError(f"failed to open 4D video for target-aligned export: {final_4d_path}")
+                    for frame_stem in frame_stems:
+                        frame_index = self._parse_frame_stem_index(frame_stem)
+                        frame_bgr = self._extract_video_frame_by_index(capture, frame_index, frame_cache)
+                        if frame_bgr.shape[1] != target_width or frame_bgr.shape[0] != target_height:
+                            frame_bgr = cv2.resize(frame_bgr, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+                        writer.write(frame_bgr)
+                        frames_written += 1
+                finally:
+                    capture.release()
+        finally:
+            writer.release()
+
+        if frames_written != len(frame_stems):
+            raise RuntimeError(
+                f"aligned 4D export wrote {frames_written} frames for {target_dir}, expected {len(frame_stems)}"
+            )
+
+    def _copy_rendered_4d_to_wan_targets(
+        self,
+        final_4d_path: Optional[str],
+        target_records: list[dict],
+        sample_output_dir: Optional[str],
+    ) -> None:
+        if not target_records:
+            return
+        for target_record in target_records:
+            self._write_target_aligned_4d_video(
+                sample_output_dir=sample_output_dir,
+                final_4d_path=final_4d_path,
+                target_record=target_record,
+            )
+
+    def _cleanup_sample_workdir_after_export(self, sample_output_dir: Optional[str]) -> None:
+        if not sample_output_dir or not os.path.isdir(sample_output_dir):
+            return
+
+        removable_dirs = [
+            "images",
+            "masks",
+            "masks_raw",
+            "masks_refined",
+            "rendered_frames",
+            "rendered_frames_individual",
+            "mesh_4d_individual",
+            "focal_4d_individual",
+            "completion_refined",
+            "wan_export",
+        ]
+        for dirname in removable_dirs:
+            path = os.path.join(sample_output_dir, dirname)
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+
+        for video_path in glob.glob(os.path.join(sample_output_dir, "4d_*.mp4")):
+            if os.path.isfile(video_path):
+                os.remove(video_path)
+
+    def _package_successful_wan_export_outputs(
+        self,
+        *,
+        sample_output_dir: Optional[str],
+        summary_identity: Optional[str],
+        wan_export_root: Optional[str],
+        final_4d_path: Optional[str],
+    ) -> list[str]:
+        from scripts.wan_sample_types import WanExportConfig
+
+        wan_cfg = WanExportConfig.from_runtime(cfg_get(self.CONFIG, "wan_export", {}))
+        if not bool(wan_cfg.enable):
+            return []
+
+        target_records = self._load_wan_exported_target_records(summary_identity, wan_export_root)
+        if not target_records:
+            return []
+
+        if bool(wan_cfg.copy_rendered_4d_to_targets):
+            self._copy_rendered_4d_to_wan_targets(
+                final_4d_path,
+                target_records,
+                sample_output_dir=sample_output_dir,
+            )
+        if bool(wan_cfg.cleanup_sample_workdir_after_export):
+            self._cleanup_sample_workdir_after_export(sample_output_dir)
+        return [str(record["sample_dir"]) for record in target_records]
+
+    def _persist_sample_runtime(
+        self,
+        *,
+        start_time: float,
+        sample_output_dir: Optional[str],
+        runtime_profile: Optional[dict],
+        sample_uuid: Optional[str],
+        summary_identity: Optional[str],
+        wan_export_root: Optional[str],
+    ) -> dict:
+        pipeline_seconds = max(0.0, float(time.perf_counter() - start_time))
+        runtime_payload = {
+            "status": self.sample_summary.get("status", "unknown"),
+            "pipeline_seconds": pipeline_seconds,
+        }
+        if runtime_profile is not None:
+            runtime_payload["runtime_profile"] = runtime_profile
+        if sample_uuid:
+            runtime_payload["sample_uuid"] = sample_uuid
+        runtime_payload["fps_summary"] = copy.deepcopy(self.sample_summary.get("fps_summary", {}))
+
+        self.sample_summary["pipeline_runtime"] = runtime_payload
+        if sample_output_dir and os.path.isdir(sample_output_dir):
+            with open(os.path.join(sample_output_dir, "sample_runtime.json"), "w", encoding="utf-8") as handle:
+                json.dump(runtime_payload, handle, indent=2)
+
+        if summary_identity and wan_export_root:
+            from scripts.wan_sample_export import update_wan_sample_summary
+
+            update_wan_sample_summary(
+                wan_export_root,
+                summary_identity,
+                {
+                    "pipeline_runtime": runtime_payload,
+                    "fps_summary": copy.deepcopy(self.sample_summary.get("fps_summary", {})),
+                },
+            )
+        return runtime_payload
+
     def _ensure_base_app(self):
         if self._base_app is None:
             self._base_module = load_base_offline_module()
-            self._base_app = self._base_module.OfflineApp(config_path=self.config_path)
-        self._sync_base_app_runtime(self._base_app, self.sample_state.get("output_dir"))
+            self._base_app = self._base_module.OfflineApp(
+                config_path=self.config_path,
+                load_default_detector=False,
+            )
+        output_dir = self.sample_state.get("output_dir") if self.sample_state.get("output_dir_ready") else None
+        self._sync_base_app_runtime(self._base_app, output_dir)
         return self._base_app
 
     def _sync_base_app_runtime(self, runtime_app, output_dir: Optional[str] = None):
@@ -375,6 +1028,65 @@ class RefinedOfflineApp:
         )
         runtime_app.RUNTIME["smpl_export"] = bool(
             cfg_get(self.CONFIG, "runtime.smpl_export", runtime_app.RUNTIME.get("smpl_export", False))
+        )
+        runtime_app.RUNTIME["pose_exports"] = list(
+            cfg_get(self.CONFIG, "runtime.pose_exports", runtime_app.RUNTIME.get("pose_exports", [])) or []
+        )
+        runtime_app.RUNTIME["wan_export"] = to_plain_runtime_dict(
+            cfg_get(self.CONFIG, "wan_export", runtime_app.RUNTIME.get("wan_export", {}))
+        )
+        if self.sample_state.get("input_type") == "clip_package":
+            runtime_app.RUNTIME["wan_export"]["sample_uuid"] = self.sample_state.get("sample_uuid")
+            runtime_app.RUNTIME["wan_export"]["clip_id"] = self.sample_state.get("clip_id")
+            runtime_app.RUNTIME["wan_export"]["source_path"] = self.sample_state.get("source_path")
+        else:
+            runtime_app.RUNTIME["wan_export"].pop("sample_uuid", None)
+            runtime_app.RUNTIME["wan_export"].pop("clip_id", None)
+            runtime_app.RUNTIME["wan_export"].pop("source_path", None)
+        runtime_app.RUNTIME["save_rendered_video"] = bool(
+            cfg_get(self.CONFIG, "runtime.save_rendered_video", runtime_app.RUNTIME.get("save_rendered_video", True))
+        )
+        runtime_app.RUNTIME["save_rendered_video_direct"] = bool(
+            cfg_get(
+                self.CONFIG,
+                "runtime.save_rendered_video_direct",
+                runtime_app.RUNTIME.get("save_rendered_video_direct", False),
+            )
+        )
+        runtime_app.RUNTIME["save_rendered_frames"] = bool(
+            cfg_get(self.CONFIG, "runtime.save_rendered_frames", runtime_app.RUNTIME.get("save_rendered_frames", True))
+        )
+        runtime_app.RUNTIME["save_rendered_frames_individual"] = bool(
+            cfg_get(
+                self.CONFIG,
+                "runtime.save_rendered_frames_individual",
+                runtime_app.RUNTIME.get("save_rendered_frames_individual", True),
+            )
+        )
+        runtime_app.RUNTIME["save_mesh_4d_individual"] = bool(
+            cfg_get(
+                self.CONFIG,
+                "runtime.save_mesh_4d_individual",
+                runtime_app.RUNTIME.get("save_mesh_4d_individual", True),
+            )
+        )
+        runtime_app.RUNTIME["save_focal_4d_individual"] = bool(
+            cfg_get(
+                self.CONFIG,
+                "runtime.save_focal_4d_individual",
+                runtime_app.RUNTIME.get("save_focal_4d_individual", True),
+            )
+        )
+        runtime_app.RUNTIME["render_mode"] = str(
+            cfg_get(self.CONFIG, "runtime.render_mode", runtime_app.RUNTIME.get("render_mode", "normal"))
+        )
+        runtime_app.RUNTIME["render_scene_bg_color"] = list(
+            cfg_get(
+                self.CONFIG,
+                "runtime.render_scene_bg_color",
+                runtime_app.RUNTIME.get("render_scene_bg_color", [0, 0, 0]),
+            )
+            or [0, 0, 0]
         )
         self._configure_detector(runtime_app)
         self.OUTPUT_DIR = runtime_app.OUTPUT_DIR
@@ -409,8 +1121,51 @@ class RefinedOfflineApp:
         )
         self._detector_signature = signature
 
+    def _detect_frame_candidates(self, runtime_app, frame_rgb: np.ndarray, bbox_thr: float, nms_thr: float) -> List[dict]:
+        model = getattr(runtime_app, "sam3_3d_body_model", None)
+        detector = getattr(model, "detector", None)
+        detector_outputs = None
+        backend = str(cfg_get(self.CONFIG, "detector.backend", "vitdet")).lower()
+        resolved = resolve_detector_runtime_options(
+            backend,
+            bbox_thresh=bbox_thr,
+            iou_thresh=nms_thr,
+            max_det=cfg_get(self.CONFIG, "detector.max_det", None),
+        )
+
+        if detector is not None and hasattr(detector, "run_human_detection"):
+            detector_kwargs = {
+                "det_cat_id": 0,
+                "bbox_thr": resolved["bbox_thresh"],
+                "nms_thr": resolved["iou_thresh"],
+                "default_to_full_image": False,
+                "return_scores": True,
+            }
+            if resolved["max_det"] is not None:
+                detector_kwargs["max_det"] = int(resolved["max_det"])
+
+            detector_outputs = run_human_detection_compat(
+                detector,
+                cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR),
+                detector_kwargs,
+            )
+
+            normalized_outputs = normalize_detection_outputs(detector_outputs)
+            if normalized_outputs is not None:
+                return normalized_outputs
+
+        frame_outputs = model.process_one_image(
+            frame_rgb,
+            bbox_thr=bbox_thr,
+            nms_thr=nms_thr,
+        )
+        normalized_outputs = normalize_detection_outputs(frame_outputs)
+        if normalized_outputs is None:
+            return []
+        return normalized_outputs
+
     def _load_source_frame(self, sample: dict, frame_idx: int) -> np.ndarray:
-        if sample["input_type"] == "video":
+        if sample["input_type"] in {"video", "clip_package"}:
             capture = cv2.VideoCapture(sample["input_video"])
             try:
                 capture.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
@@ -465,9 +1220,37 @@ class RefinedOfflineApp:
         self.CONFIG = sample_cfg
         self.sample_config = sample_cfg
         self.sample_summary = {"status": "running", "runtime_profile": resolved_runtime_profile}
+        pipeline_start = time.perf_counter()
+        sample = None
+        sample_output_dir = None
+        sample_uuid = None
+        summary_identity = None
+        wan_export_root = None
 
         try:
             sample = self.prepare_input(input_video, output_dir, skip_existing)
+            sample_output_dir = sample.get("output_dir")
+            self.sample_summary["fps_summary"] = self._build_sample_fps_summary(sample)
+            face_presence = self._probe_sample_face_presence(sample)
+            self.sample_summary["face_presence"] = face_presence
+            if self._should_skip_sample_for_face_presence(face_presence):
+                self.sample_summary["status"] = "skipped"
+                self.sample_summary["skip_reason"] = "face_presence_below_threshold"
+                self._append_issue_ledger_record(
+                    self._build_issue_ledger_record(
+                        event_type="sample_skipped_no_face",
+                        status="skipped",
+                        reason="face_presence_below_threshold",
+                        sample=sample,
+                        runtime_profile=resolved_runtime_profile,
+                        details=face_presence,
+                    ),
+                    sample=sample,
+                )
+                return self.sample_summary
+
+            sample_uuid, wan_export_root = self._ensure_wan_sample_summary(sample)
+            summary_identity = str(self.sample_summary.get("wan_summary_key") or sample_uuid or "").strip() or None
             initial_targets = self.detect_initial_targets(sample)
             self.prepare_sample_output(sample["output_dir"], initial_targets["obj_ids"])
 
@@ -477,12 +1260,44 @@ class RefinedOfflineApp:
                 final_chunk = self.maybe_reprompt_chunk(chunk, refined_chunk, initial_targets)
                 self.write_chunk_outputs(chunk, raw_chunk, final_chunk)
 
-            self.run_refined_4d_generation()
+            final_4d_path = self.run_refined_4d_generation()
+            target_dirs = self._package_successful_wan_export_outputs(
+                sample_output_dir=sample_output_dir,
+                summary_identity=summary_identity,
+                wan_export_root=wan_export_root,
+                final_4d_path=final_4d_path,
+            )
+            if target_dirs:
+                self.sample_summary["exported_target_dirs"] = list(target_dirs)
             self.sample_summary["status"] = "completed"
-        except Exception:
+        except Exception as exc:
             self.sample_summary["status"] = "failed"
+            self._append_issue_ledger_record(
+                self._build_issue_ledger_record(
+                    event_type="sample_failed",
+                    status="failed",
+                    reason="pipeline_exception",
+                    sample=sample,
+                    sample_uuid=sample_uuid,
+                    runtime_profile=resolved_runtime_profile,
+                    details={
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                    },
+                    input_video=input_video,
+                ),
+                sample=sample,
+            )
             raise
         finally:
+            self._persist_sample_runtime(
+                start_time=pipeline_start,
+                sample_output_dir=sample_output_dir,
+                runtime_profile=resolved_runtime_profile,
+                sample_uuid=sample_uuid,
+                summary_identity=summary_identity,
+                wan_export_root=wan_export_root,
+            )
             try:
                 self.finalize_sample()
             finally:
@@ -510,16 +1325,43 @@ class RefinedOfflineApp:
                 "frame_count": frame_count,
             }
         elif os.path.isdir(input_path):
-            source_frames = list_input_frames(input_path)
-            if not source_frames:
-                raise ValueError(f"input directory contains no image frames: {input_video}")
-            sample = {
-                "input_video": input_path,
-                "input_type": "images",
-                "source_frames": source_frames,
-                "frames": build_frame_stems(len(source_frames)),
-                "frame_count": len(source_frames),
-            }
+            clip_video_path = os.path.join(input_path, "clip.mp4")
+            clip_meta_path = os.path.join(input_path, "meta.json")
+            clip_track_path = os.path.join(input_path, "track.json")
+            if (
+                os.path.isfile(clip_video_path)
+                and os.path.isfile(clip_meta_path)
+                and os.path.isfile(clip_track_path)
+            ):
+                clip_meta = dict(load_json_file(clip_meta_path) or {})
+                clip_track = dict(load_json_file(clip_track_path) or {})
+                frame_count = count_video_frames(clip_video_path)
+                if frame_count <= 0:
+                    raise ValueError(f"unable to count frames for clip package video: {clip_video_path}")
+                sample = {
+                    "input_video": os.path.abspath(clip_video_path),
+                    "input_type": "clip_package",
+                    "source_frames": None,
+                    "frames": build_frame_stems(frame_count),
+                    "frame_count": frame_count,
+                    "clip_dir": input_path,
+                    "clip_id": str(clip_meta.get("clip_id", "")).strip(),
+                    "sample_uuid": str(clip_meta.get("sample_uuid", "")).strip(),
+                    "source_path": str(clip_meta.get("source_path") or clip_video_path),
+                    "clip_meta": clip_meta,
+                    "clip_track_records": list(clip_track.get("records") or []),
+                }
+            else:
+                source_frames = list_input_frames(input_path)
+                if not source_frames:
+                    raise ValueError(f"input directory contains no image frames: {input_video}")
+                sample = {
+                    "input_video": input_path,
+                    "input_type": "images",
+                    "source_frames": source_frames,
+                    "frames": build_frame_stems(len(source_frames)),
+                    "frame_count": len(source_frames),
+                }
         else:
             raise ValueError(f"unsupported input path: {input_video}")
 
@@ -527,51 +1369,194 @@ class RefinedOfflineApp:
             output_dir,
             cfg_get(self.CONFIG, "runtime.output_dir", os.path.join(ROOT, "outputs_refined")),
         )
-        os.makedirs(resolved_output_dir, exist_ok=True)
         sample["output_dir"] = resolved_output_dir
+        sample["output_dir_ready"] = False
 
         self.sample_state = dict(sample)
         self.OUTPUT_DIR = resolved_output_dir
-        if self._base_app is not None:
-            self._sync_base_app_runtime(self._base_app, resolved_output_dir)
         return dict(sample)
 
-    def detect_initial_targets(self, sample: dict) -> dict:
-        runtime_app = self._ensure_base_app()
-        self.sample_state = dict(sample)
+    def _build_face_guided_body_binding(self, sample: dict, runtime_app, bbox_thr: float, nms_thr: float):
+        track_records = list(sample.get("clip_track_records") or [])
+        if not track_records:
+            raise RuntimeError(f"clip package is missing face-track records: {sample.get('input_video')}")
 
         search_frames = min(
             int(cfg_get(self.CONFIG, "batch.initial_search_frames", 24)),
             int(sample["frame_count"]),
+            max(len(track_records), 1),
         )
-        bbox_thr = float(cfg_get(self.CONFIG, "detector.bbox_thresh", 0.35))
-        nms_thr = float(cfg_get(self.CONFIG, "detector.iou_thresh", 0.50))
-
-        outputs = []
-        start_frame_idx = None
+        candidate_clusters: list[dict] = []
         width = height = None
-        max_detection_count = 0
+        ambiguous_frame_count = 0
+        matched_frame_count = 0
+
         for frame_idx in range(search_frames):
+            frame_record = next(
+                (
+                    record
+                    for record in track_records
+                    if int(record.get("frame_index_in_clip", -1)) == int(frame_idx)
+                ),
+                None,
+            )
+            if frame_record is None:
+                continue
+
             frame_rgb = self._load_source_frame(sample, frame_idx)
             frame_height, frame_width = frame_rgb.shape[:2]
-            frame_outputs = runtime_app.sam3_3d_body_model.process_one_image(
-                frame_rgb,
-                bbox_thr=bbox_thr,
-                nms_thr=nms_thr,
-            )
-            detection_count = len(frame_outputs)
-            if detection_count > max_detection_count:
-                outputs = frame_outputs
-                start_frame_idx = frame_idx
-                height, width = frame_height, frame_width
-                max_detection_count = detection_count
+            frame_outputs = self._detect_frame_candidates(runtime_app, frame_rgb, bbox_thr, nms_thr)
+            face_bbox = [float(value) for value in frame_record.get("bbox_xyxy", [])[:4]]
+            if len(face_bbox) != 4:
+                continue
+            face_center_x = (face_bbox[0] + face_bbox[2]) / 2.0
+            face_center_y = (face_bbox[1] + face_bbox[3]) / 2.0
 
-        if start_frame_idx is None or not outputs:
-            raise RuntimeError(
-                f"no humans detected within the first {search_frames} frames for {sample['input_video']}"
-            )
+            matching_candidates = []
+            for output in frame_outputs:
+                bbox = [float(value) for value in output["bbox"]]
+                if len(bbox) != 4:
+                    continue
+                if not (bbox[0] <= face_center_x <= bbox[2] and bbox[1] <= face_center_y <= bbox[3]):
+                    continue
+                box_width = max(float(bbox[2] - bbox[0]), 1e-6)
+                box_height = max(float(bbox[3] - bbox[1]), 1e-6)
+                upper_body_ratio = (face_center_y - bbox[1]) / box_height
+                upper_body_limit = bbox[1] + box_height * 0.75
+                if face_center_y > upper_body_limit:
+                    continue
+                body_center_x = (bbox[0] + bbox[2]) / 2.0
+                body_center_y = (bbox[1] + bbox[3]) / 2.0
+                normalized_center_distance = float(
+                    (
+                        ((face_center_x - body_center_x) / box_width) ** 2
+                        + ((face_center_y - body_center_y) / box_height) ** 2
+                    )
+                    ** 0.5
+                )
+                detector_score = float(output.get("score") or 0.0)
+                binding_score = (
+                    3.0 * max(0.0, 1.0 - min(normalized_center_distance, 1.0))
+                    + max(0.0, 1.0 - min(upper_body_ratio / 0.75, 1.0))
+                    + 0.25 * detector_score
+                )
+                matching_candidates.append(
+                    {
+                        "frame_idx": int(frame_idx),
+                        "bbox": bbox,
+                        "detector_score": detector_score,
+                        "normalized_center_distance": normalized_center_distance,
+                        "upper_body_ratio": float(upper_body_ratio),
+                        "binding_score": float(binding_score),
+                    }
+                )
 
-        if sample["input_type"] == "video":
+            if not matching_candidates:
+                continue
+
+            matched_frame_count += 1
+            matching_candidates.sort(
+                key=lambda candidate: (
+                    -float(candidate["binding_score"]),
+                    float(candidate["normalized_center_distance"]),
+                    float(candidate["upper_body_ratio"]),
+                    -float(candidate["detector_score"]),
+                    tuple(float(value) for value in candidate["bbox"]),
+                )
+            )
+            chosen_candidate = matching_candidates[0]
+            if len(matching_candidates) > 1:
+                runner_up = matching_candidates[1]
+                score_gap = float(chosen_candidate["binding_score"]) - float(runner_up["binding_score"])
+                distance_gap = float(runner_up["normalized_center_distance"]) - float(
+                    chosen_candidate["normalized_center_distance"]
+                )
+                detector_gap = abs(
+                    float(chosen_candidate["detector_score"]) - float(runner_up["detector_score"])
+                )
+                if score_gap <= 0.05 and distance_gap <= 0.03 and detector_gap <= 0.05:
+                    ambiguous_frame_count += 1
+                    continue
+
+            best_cluster = None
+            best_iou = 0.0
+            for cluster in candidate_clusters:
+                cluster_iou = bbox_iou_xyxy(cluster.get("reference_bbox"), chosen_candidate["bbox"])
+                if cluster_iou > best_iou:
+                    best_iou = cluster_iou
+                    best_cluster = cluster
+
+            if best_cluster is None or best_iou < 0.35:
+                best_cluster = {
+                    "votes": 0,
+                    "score_total": 0.0,
+                    "detector_score_total": 0.0,
+                    "reference_bbox": list(chosen_candidate["bbox"]),
+                    "best_bbox": list(chosen_candidate["bbox"]),
+                    "best_binding_score": float(chosen_candidate["binding_score"]),
+                    "frame_candidates": {},
+                    "first_frame_idx": int(frame_idx),
+                }
+                candidate_clusters.append(best_cluster)
+
+            best_cluster["votes"] += 1
+            best_cluster["score_total"] += float(chosen_candidate["binding_score"])
+            best_cluster["detector_score_total"] += float(chosen_candidate["detector_score"])
+            best_cluster["reference_bbox"] = list(chosen_candidate["bbox"])
+            best_cluster["frame_candidates"][int(frame_idx)] = dict(chosen_candidate)
+            best_cluster["first_frame_idx"] = min(
+                int(best_cluster["first_frame_idx"]),
+                int(frame_idx),
+            )
+            if float(chosen_candidate["binding_score"]) > float(best_cluster["best_binding_score"]):
+                best_cluster["best_binding_score"] = float(chosen_candidate["binding_score"])
+                best_cluster["best_bbox"] = list(chosen_candidate["bbox"])
+            width = frame_width
+            height = frame_height
+
+        if not candidate_clusters or width is None or height is None:
+            if matched_frame_count > 0 and ambiguous_frame_count > 0:
+                raise RuntimeError(f"ambiguous face-guided body binding for clip package: {sample['input_video']}")
+            raise RuntimeError(f"unable to bind face-guided body target for clip package: {sample['input_video']}")
+
+        ranked_clusters = sorted(
+            candidate_clusters,
+            key=lambda cluster: (
+                -int(cluster["votes"]),
+                -float(cluster["score_total"]),
+                -float(cluster["detector_score_total"]),
+                int(cluster["first_frame_idx"]),
+                tuple(float(value) for value in cluster["best_bbox"]),
+            ),
+        )
+        if len(ranked_clusters) > 1:
+            top_cluster = ranked_clusters[0]
+            runner_up_cluster = ranked_clusters[1]
+            same_votes = int(top_cluster["votes"]) == int(runner_up_cluster["votes"])
+            close_score = (
+                abs(float(top_cluster["score_total"]) - float(runner_up_cluster["score_total"])) <= 0.1
+            )
+            close_detector_score = (
+                abs(
+                    float(top_cluster["detector_score_total"])
+                    - float(runner_up_cluster["detector_score_total"])
+                )
+                <= 0.05
+            )
+            if same_votes and close_score and close_detector_score:
+                raise RuntimeError(f"ambiguous face-guided body binding for clip package: {sample['input_video']}")
+
+        selected_cluster = ranked_clusters[0]
+        start_frame_idx = int(selected_cluster["first_frame_idx"])
+        selected_frame_candidate = selected_cluster["frame_candidates"].get(start_frame_idx)
+        if selected_frame_candidate is None:
+            raise RuntimeError(f"ambiguous face-guided body binding for clip package: {sample['input_video']}")
+
+        selected_bbox = list(selected_frame_candidate["bbox"])
+        return selected_bbox, int(start_frame_idx), int(width), int(height)
+
+    def _initialize_tracker_targets(self, sample: dict, runtime_app, outputs: list[dict], start_frame_idx: int, width: int, height: int) -> dict:
+        if sample["input_type"] in {"video", "clip_package"}:
             inference_state = runtime_app.predictor.init_state(video_path=sample["input_video"])
         else:
             inference_state = runtime_app.predictor.init_state(video_path=sample["source_frames"])
@@ -585,7 +1570,7 @@ class RefinedOfflineApp:
             rel_box = np.array([[xmin / width, ymin / height, xmax / width, ymax / height]], dtype=np.float32)
             _, runtime_app.RUNTIME["out_obj_ids"], _, _ = runtime_app.predictor.add_new_points_or_box(
                 inference_state=runtime_app.RUNTIME["inference_state"],
-                frame_idx=start_frame_idx,
+                frame_idx=int(start_frame_idx),
                 obj_id=obj_index,
                 box=rel_box,
             )
@@ -602,6 +1587,72 @@ class RefinedOfflineApp:
             "start_frame_idx": int(start_frame_idx),
         }
         return dict(self.initial_targets)
+
+    def detect_initial_targets(self, sample: dict) -> dict:
+        runtime_app = self._ensure_base_app()
+        self.sample_state = dict(sample)
+
+        search_frames = min(
+            int(cfg_get(self.CONFIG, "batch.initial_search_frames", 24)),
+            int(sample["frame_count"]),
+        )
+        resolved_detector = resolve_detector_runtime_options(
+            cfg_get(self.CONFIG, "detector.backend", "vitdet"),
+            bbox_thresh=cfg_get(self.CONFIG, "detector.bbox_thresh", None),
+            iou_thresh=cfg_get(self.CONFIG, "detector.iou_thresh", None),
+            max_det=cfg_get(self.CONFIG, "detector.max_det", None),
+        )
+        bbox_thr = resolved_detector["bbox_thresh"]
+        nms_thr = resolved_detector["iou_thresh"]
+
+        if sample.get("input_type") == "clip_package":
+            selected_bbox, start_frame_idx, width, height = self._build_face_guided_body_binding(
+                sample,
+                runtime_app,
+                bbox_thr,
+                nms_thr,
+            )
+            return self._initialize_tracker_targets(
+                sample,
+                runtime_app,
+                [{"bbox": selected_bbox}],
+                start_frame_idx=int(start_frame_idx),
+                width=width,
+                height=height,
+            )
+
+        outputs = []
+        start_frame_idx = None
+        width = height = None
+        max_detection_count = 0
+        for frame_idx in range(search_frames):
+            frame_rgb = self._load_source_frame(sample, frame_idx)
+            frame_height, frame_width = frame_rgb.shape[:2]
+            frame_outputs = self._detect_frame_candidates(runtime_app, frame_rgb, bbox_thr, nms_thr)
+            detection_count = len(frame_outputs)
+            if detection_count > max_detection_count:
+                outputs = frame_outputs
+                start_frame_idx = frame_idx
+                height, width = frame_height, frame_width
+                max_detection_count = detection_count
+
+        if start_frame_idx is None or not outputs:
+            raise RuntimeError(
+                f"no humans detected within the first {search_frames} frames for {sample['input_video']}"
+            )
+
+        outputs = limit_detection_outputs(
+            outputs,
+            int(cfg_get(self.CONFIG, "detector.max_targets", 0)),
+        )
+        return self._initialize_tracker_targets(
+            sample,
+            runtime_app,
+            outputs,
+            start_frame_idx=int(start_frame_idx),
+            width=int(width),
+            height=int(height),
+        )
 
     def iter_chunks(self, frames: List[str], chunk_size: int):
         if int(chunk_size) <= 0:
@@ -647,6 +1698,9 @@ class RefinedOfflineApp:
         }
 
     def refine_chunk_masks(self, raw_chunk: dict) -> dict:
+        if not bool(cfg_get(self.CONFIG, "refine.enable", True)):
+            return self._passthrough_chunk_masks(raw_chunk)
+
         obj_ids = list(self.initial_targets.get("obj_ids", []))
         refined_masks = []
         frame_metrics = []
@@ -707,6 +1761,62 @@ class RefinedOfflineApp:
         return {
             "frame_stems": list(raw_chunk["frame_stems"]),
             "refined_masks": refined_masks,
+            "frame_metrics": frame_metrics,
+        }
+
+    def _passthrough_chunk_masks(self, raw_chunk: dict) -> dict:
+        obj_ids = list(self.initial_targets.get("obj_ids", []))
+        passthrough_masks = []
+        frame_metrics = []
+
+        for frame_idx, frame_stem, raw_mask in zip(
+            raw_chunk["frame_indices"],
+            raw_chunk["frame_stems"],
+            raw_chunk["raw_masks"],
+        ):
+            passthrough_mask = np.asarray(raw_mask, dtype=np.uint8).copy()
+            track_metrics = {}
+
+            for obj_id in obj_ids:
+                binary = (passthrough_mask == int(obj_id)).astype(np.uint8)
+                previous_binary = self._last_binary_masks.get(obj_id)
+                previous_area = int(previous_binary.sum()) if previous_binary is not None else int(binary.sum())
+                current_area = int(binary.sum())
+                empty_mask_count = self._empty_mask_counts.get(obj_id, 0)
+
+                if current_area == 0:
+                    empty_mask_count += 1
+                else:
+                    empty_mask_count = 0
+                    self._last_binary_masks[obj_id] = binary.copy()
+                    bbox_xyxy = mask_bbox_xyxy(binary)
+                    if bbox_xyxy is not None:
+                        self._last_track_boxes[obj_id] = bbox_xyxy
+
+                self._empty_mask_counts[obj_id] = empty_mask_count
+                iou_value = 1.0 if previous_binary is None else mask_iou(previous_binary, binary)
+                area_ratio = 1.0 if previous_area <= 0 else float(current_area) / float(previous_area)
+                track_metrics[str(obj_id)] = {
+                    "empty_mask_count": empty_mask_count,
+                    "area_ratio": area_ratio,
+                    "edge_touch_ratio": edge_touch_ratio(binary),
+                    "mask_iou": iou_value,
+                    "refined_from_previous": False,
+                    "bbox_xyxy": self._last_track_boxes.get(obj_id),
+                }
+
+            passthrough_masks.append(passthrough_mask)
+            frame_metrics.append(
+                {
+                    "frame_idx": int(frame_idx),
+                    "frame_stem": frame_stem,
+                    "track_metrics": track_metrics,
+                }
+            )
+
+        return {
+            "frame_stems": list(raw_chunk["frame_stems"]),
+            "refined_masks": passthrough_masks,
             "frame_metrics": frame_metrics,
         }
 
@@ -788,25 +1898,7 @@ def run_refined_pipeline(args) -> None:
     print(f"Loaded refined config for detector backend: {cfg.detector.backend}")
     app = RefinedOfflineApp(args.config, config=cfg)
     app.reprompt_thresholds = build_reprompt_thresholds(cfg)
-    app.sample_summary = {"status": "running", "runtime_profile": {}}
-    try:
-        sample = app.prepare_input(args.input_video, args.output_dir, args.skip_existing)
-        initial_targets = app.detect_initial_targets(sample)
-        app.prepare_sample_output(sample["output_dir"], initial_targets["obj_ids"])
-
-        for chunk in app.iter_chunks(sample["frames"], cfg.tracking.chunk_size):
-            raw_chunk = app.track_chunk(chunk, initial_targets)
-            refined_chunk = app.refine_chunk_masks(raw_chunk)
-            final_chunk = app.maybe_reprompt_chunk(chunk, refined_chunk, initial_targets)
-            app.write_chunk_outputs(chunk, raw_chunk, final_chunk)
-
-        app.run_refined_4d_generation()
-        app.sample_summary["status"] = "completed"
-    except Exception:
-        app.sample_summary["status"] = "failed"
-        raise
-    finally:
-        app.finalize_sample()
+    app.run_sample(args.input_video, args.output_dir, args.skip_existing, runtime_profile=None)
     return cfg
 
 

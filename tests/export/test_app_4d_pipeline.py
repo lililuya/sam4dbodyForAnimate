@@ -1,12 +1,17 @@
+import importlib.util
 import os
 import shutil
 import unittest
 import uuid
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 from PIL import Image
+
+
+HAS_TORCH = importlib.util.find_spec("torch") is not None
 
 
 @contextmanager
@@ -23,6 +28,77 @@ def make_workspace_tempdir():
 
 
 class App4DPipelineTests(unittest.TestCase):
+    def test_normalize_scene_bg_color_accepts_runtime_list_values(self):
+        from scripts.app_4d_pipeline import _normalize_scene_bg_color
+
+        self.assertEqual(_normalize_scene_bg_color([0, 0, 0]), (0.0, 0.0, 0.0))
+        normalized = _normalize_scene_bg_color([255, 128, 0])
+        self.assertEqual(normalized[0], 1.0)
+        self.assertAlmostEqual(normalized[1], 128.0 / 255.0, places=6)
+        self.assertEqual(normalized[2], 0.0)
+
+    def test_run_4d_pipeline_defaults_to_normal_render_mode_with_black_background(self):
+        from scripts.app_4d_pipeline import build_4d_context, run_4d_pipeline_from_context
+
+        with make_workspace_tempdir() as tmpdir:
+            input_dir = os.path.join(tmpdir, "cache")
+            output_dir = os.path.join(tmpdir, "outputs_4d", "demo")
+            os.makedirs(os.path.join(input_dir, "images"), exist_ok=True)
+            os.makedirs(os.path.join(input_dir, "masks"), exist_ok=True)
+            Image.fromarray(np.zeros((4, 4, 3), dtype=np.uint8)).save(
+                os.path.join(input_dir, "images", "00000000.jpg")
+            )
+            Image.fromarray(np.ones((4, 4), dtype=np.uint8)).save(
+                os.path.join(input_dir, "masks", "00000000.png")
+            )
+
+            runtime = {
+                "out_obj_ids": [3],
+                "batch_size": 1,
+                "detection_resolution": [256, 512],
+                "completion_resolution": [512, 1024],
+                "smpl_export": False,
+                "video_fps": 24.0,
+            }
+            context = build_4d_context(
+                input_dir=input_dir,
+                output_dir=output_dir,
+                runtime=runtime,
+                sam3_3d_body_model=MagicMock(faces=np.array([[0, 1, 2]], dtype=np.int32)),
+                pipeline_mask=None,
+                pipeline_rgb=None,
+                depth_model=None,
+                predictor=MagicMock(),
+                generator=None,
+            )
+
+            with patch(
+                "scripts.app_4d_pipeline.process_image_with_mask",
+                return_value=([[{"bbox": np.zeros((4,), dtype=np.float32)}]], [[3]], []),
+            ), patch(
+                "scripts.app_4d_pipeline.visualize_sample_together",
+                return_value=np.zeros((4, 4, 3), dtype=np.uint8),
+            ) as mock_together, patch(
+                "scripts.app_4d_pipeline.visualize_sample",
+                return_value=[np.zeros((4, 4, 3), dtype=np.uint8)],
+            ) as mock_individual, patch(
+                "scripts.app_4d_pipeline.save_mesh_results",
+            ), patch(
+                "scripts.app_4d_pipeline.jpg_folder_to_mp4",
+            ), patch(
+                "scripts.app_4d_pipeline.cv2.imread",
+                return_value=np.zeros((4, 4, 3), dtype=np.uint8),
+            ), patch(
+                "scripts.app_4d_pipeline.cv2.imwrite",
+                return_value=True,
+            ):
+                run_4d_pipeline_from_context(context)
+
+            self.assertEqual(mock_together.call_args.kwargs["render_mode"], "normal")
+            self.assertEqual(mock_together.call_args.kwargs["scene_bg_color"], (0.0, 0.0, 0.0))
+            self.assertEqual(mock_individual.call_args.kwargs["render_mode"], "normal")
+            self.assertEqual(mock_individual.call_args.kwargs["scene_bg_color"], (0.0, 0.0, 0.0))
+
     def test_run_4d_pipeline_uses_explicit_input_and_output_dirs(self):
         from scripts.app_4d_pipeline import build_4d_context, run_4d_pipeline_from_context
 
@@ -84,6 +160,657 @@ class App4DPipelineTests(unittest.TestCase):
                 self.assertTrue(os.path.isdir(os.path.join(output_dir, "rendered_frames")))
                 self.assertTrue(os.path.isdir(os.path.join(output_dir, "mesh_4d_individual", "1")))
                 self.assertFalse(os.path.isdir(os.path.join(input_dir, "rendered_frames")))
+
+    def test_run_4d_pipeline_uses_completion_batch_size_when_completion_is_enabled(self):
+        from scripts.app_4d_pipeline import build_4d_context, run_4d_pipeline_from_context
+
+        with make_workspace_tempdir() as tmpdir:
+            input_dir = os.path.join(tmpdir, "cache")
+            output_dir = os.path.join(tmpdir, "outputs_4d", "demo")
+            os.makedirs(os.path.join(input_dir, "images"), exist_ok=True)
+            os.makedirs(os.path.join(input_dir, "masks"), exist_ok=True)
+            for frame_stem in ("00000000", "00000001"):
+                Image.fromarray(np.zeros((4, 4, 3), dtype=np.uint8)).save(
+                    os.path.join(input_dir, "images", f"{frame_stem}.jpg")
+                )
+                Image.fromarray(np.zeros((4, 4), dtype=np.uint8)).save(
+                    os.path.join(input_dir, "masks", f"{frame_stem}.png")
+                )
+
+            runtime = {
+                "out_obj_ids": [1],
+                "batch_size": 8,
+                "completion_batch_size": 1,
+                "completion_decode_chunk_size": 2,
+                "max_occ_len": 8,
+                "detection_resolution": [192, 384],
+                "completion_resolution": [256, 512],
+                "smpl_export": False,
+                "video_fps": 24.0,
+            }
+
+            pipeline_mask = MagicMock(
+                side_effect=lambda *args, **kwargs: SimpleNamespace(
+                    frames=[
+                        [
+                            Image.fromarray(np.zeros((2, 2, 3), dtype=np.uint8))
+                            for _ in range(kwargs["num_frames"])
+                        ]
+                    ]
+                )
+            )
+            context = build_4d_context(
+                input_dir=input_dir,
+                output_dir=output_dir,
+                runtime=runtime,
+                sam3_3d_body_model=MagicMock(faces=np.array([[0, 1, 2]], dtype=np.int32)),
+                pipeline_mask=pipeline_mask,
+                pipeline_rgb=MagicMock(),
+                depth_model=MagicMock(),
+                predictor=MagicMock(),
+                generator=None,
+            )
+
+            fake_modal_pixels = np.zeros((1, 2, 3, 2, 2), dtype=np.float32)
+            fake_rgb_pixels = np.zeros((1, 2, 3, 2, 2), dtype=np.float32)
+            fake_depth_pixels = np.zeros((1, 2, 3, 2, 2), dtype=np.float32)
+            fake_process_image_with_mask = lambda *args, **kwargs: (
+                [[{"bbox": np.zeros((4,), dtype=np.float32)}] for _ in args[1]],
+                [[1] for _ in args[1]],
+                [],
+            )
+
+            with patch(
+                "scripts.app_4d_pipeline._load_runtime_utils",
+                return_value={
+                    "DAVIS_PALETTE": [0] * (256 * 3),
+                    "bbox_from_mask": lambda mask: [0.0, 0.0, 1.0, 1.0],
+                    "is_skinny_mask": lambda mask: False,
+                    "is_super_long_or_wide": lambda mask, obj_id: False,
+                    "keep_largest_component": lambda mask: mask,
+                    "resize_mask_with_unique_label": lambda mask, h, w, obj_id: mask,
+                },
+            ), patch(
+                "scripts.app_4d_pipeline.load_and_transform_masks",
+                return_value=(fake_modal_pixels, (4, 4)),
+            ), patch(
+                "scripts.app_4d_pipeline.load_and_transform_rgbs",
+                return_value=(fake_rgb_pixels, (4, 4), None),
+            ), patch(
+                "scripts.app_4d_pipeline.rgb_to_depth",
+                return_value=fake_depth_pixels,
+            ), patch(
+                "scripts.app_4d_pipeline.process_image_with_mask",
+                side_effect=fake_process_image_with_mask,
+            ), patch(
+                "scripts.app_4d_pipeline.visualize_sample_together",
+                return_value=np.zeros((4, 4, 3), dtype=np.uint8),
+            ), patch(
+                "scripts.app_4d_pipeline.visualize_sample",
+                return_value=[],
+            ), patch(
+                "scripts.app_4d_pipeline.save_mesh_results",
+            ), patch(
+                "scripts.app_4d_pipeline.jpg_folder_to_mp4",
+            ), patch(
+                "scripts.app_4d_pipeline.cv2.imread",
+                return_value=np.zeros((4, 4, 3), dtype=np.uint8),
+            ), patch(
+                "scripts.app_4d_pipeline.cv2.imwrite",
+                return_value=True,
+            ), patch(
+                "scripts.app_4d_pipeline._open_video_writer",
+                return_value=MagicMock(),
+            ):
+                run_4d_pipeline_from_context(context)
+
+        self.assertEqual(pipeline_mask.call_count, 2)
+
+    def test_run_4d_pipeline_skips_optional_storage_outputs_when_disabled(self):
+        from scripts.app_4d_pipeline import build_4d_context, run_4d_pipeline_from_context
+
+        with make_workspace_tempdir() as tmpdir:
+            input_dir = os.path.join(tmpdir, "cache")
+            output_dir = os.path.join(tmpdir, "outputs_4d", "demo")
+            os.makedirs(os.path.join(input_dir, "images"), exist_ok=True)
+            os.makedirs(os.path.join(input_dir, "masks"), exist_ok=True)
+            Image.fromarray(np.zeros((4, 4, 3), dtype=np.uint8)).save(
+                os.path.join(input_dir, "images", "00000000.jpg")
+            )
+            Image.fromarray(np.ones((4, 4), dtype=np.uint8)).save(
+                os.path.join(input_dir, "masks", "00000000.png")
+            )
+
+            runtime = {
+                "out_obj_ids": [7],
+                "batch_size": 1,
+                "detection_resolution": [256, 512],
+                "completion_resolution": [512, 1024],
+                "smpl_export": False,
+                "video_fps": 24.0,
+                "save_rendered_video": False,
+                "save_rendered_frames": False,
+                "save_rendered_frames_individual": False,
+                "save_mesh_4d_individual": False,
+                "save_focal_4d_individual": False,
+            }
+            frame_writer = MagicMock(return_value={"coco17": []})
+            context = build_4d_context(
+                input_dir=input_dir,
+                output_dir=output_dir,
+                runtime=runtime,
+                sam3_3d_body_model=MagicMock(faces=np.array([[0, 1, 2]], dtype=np.int32)),
+                pipeline_mask=None,
+                pipeline_rgb=None,
+                depth_model=None,
+                predictor=MagicMock(),
+                generator=None,
+                frame_writer=frame_writer,
+            )
+
+            with patch(
+                "scripts.app_4d_pipeline.process_image_with_mask",
+                return_value=([[{"bbox": np.zeros((4,), dtype=np.float32)}]], [[7]], []),
+            ), patch(
+                "scripts.app_4d_pipeline.visualize_sample_together",
+                return_value=np.zeros((4, 4, 3), dtype=np.uint8),
+            ), patch(
+                "scripts.app_4d_pipeline.visualize_sample",
+                return_value=[np.zeros((4, 4, 3), dtype=np.uint8)],
+            ), patch(
+                "scripts.app_4d_pipeline.save_mesh_results",
+            ) as mock_save_mesh, patch(
+                "scripts.app_4d_pipeline.jpg_folder_to_mp4",
+            ) as mock_video, patch(
+                "scripts.app_4d_pipeline.cv2.imread",
+                return_value=np.zeros((4, 4, 3), dtype=np.uint8),
+            ), patch(
+                "scripts.app_4d_pipeline.cv2.imwrite",
+                return_value=True,
+            ) as mock_imwrite:
+                out_path = run_4d_pipeline_from_context(context)
+
+        self.assertIsNone(out_path)
+        frame_writer.assert_called_once()
+        mock_save_mesh.assert_not_called()
+        mock_video.assert_not_called()
+        mock_imwrite.assert_not_called()
+        self.assertFalse(os.path.isdir(os.path.join(output_dir, "rendered_frames")))
+        self.assertFalse(os.path.isdir(os.path.join(output_dir, "rendered_frames_individual")))
+        self.assertFalse(os.path.isdir(os.path.join(output_dir, "mesh_4d_individual")))
+        self.assertFalse(os.path.isdir(os.path.join(output_dir, "focal_4d_individual")))
+
+    def test_run_4d_pipeline_skips_final_video_when_rendered_frames_are_disabled_by_default(self):
+        from scripts.app_4d_pipeline import build_4d_context, run_4d_pipeline_from_context
+
+        with make_workspace_tempdir() as tmpdir:
+            input_dir = os.path.join(tmpdir, "cache")
+            output_dir = os.path.join(tmpdir, "outputs_4d", "demo")
+            os.makedirs(os.path.join(input_dir, "images"), exist_ok=True)
+            os.makedirs(os.path.join(input_dir, "masks"), exist_ok=True)
+            Image.fromarray(np.zeros((4, 4, 3), dtype=np.uint8)).save(
+                os.path.join(input_dir, "images", "00000000.jpg")
+            )
+            Image.fromarray(np.ones((4, 4), dtype=np.uint8)).save(
+                os.path.join(input_dir, "masks", "00000000.png")
+            )
+
+            runtime = {
+                "out_obj_ids": [7],
+                "batch_size": 1,
+                "detection_resolution": [256, 512],
+                "completion_resolution": [512, 1024],
+                "smpl_export": False,
+                "video_fps": 24.0,
+                "save_rendered_frames": False,
+                "save_rendered_frames_individual": False,
+                "save_mesh_4d_individual": False,
+                "save_focal_4d_individual": False,
+            }
+            context = build_4d_context(
+                input_dir=input_dir,
+                output_dir=output_dir,
+                runtime=runtime,
+                sam3_3d_body_model=MagicMock(faces=np.array([[0, 1, 2]], dtype=np.int32)),
+                pipeline_mask=None,
+                pipeline_rgb=None,
+                depth_model=None,
+                predictor=MagicMock(),
+                generator=None,
+            )
+
+            with patch(
+                "scripts.app_4d_pipeline.process_image_with_mask",
+                return_value=([[{"bbox": np.zeros((4,), dtype=np.float32)}]], [[7]], []),
+            ), patch(
+                "scripts.app_4d_pipeline.visualize_sample_together",
+                return_value=np.zeros((4, 4, 3), dtype=np.uint8),
+            ), patch(
+                "scripts.app_4d_pipeline.save_mesh_results",
+            ) as mock_save_mesh, patch(
+                "scripts.app_4d_pipeline.jpg_folder_to_mp4",
+            ) as mock_jpg_to_mp4, patch(
+                "scripts.app_4d_pipeline.cv2.imread",
+                return_value=np.zeros((4, 4, 3), dtype=np.uint8),
+            ), patch(
+                "scripts.app_4d_pipeline.cv2.imwrite",
+                return_value=True,
+            ) as mock_imwrite, patch(
+                "scripts.app_4d_pipeline._open_video_writer",
+            ) as mock_open_video_writer:
+                out_path = run_4d_pipeline_from_context(context)
+
+        self.assertIsNone(out_path)
+        self.assertFalse(os.path.isdir(os.path.join(output_dir, "rendered_frames")))
+        mock_save_mesh.assert_not_called()
+        mock_jpg_to_mp4.assert_not_called()
+        mock_imwrite.assert_not_called()
+        mock_open_video_writer.assert_not_called()
+
+    def test_run_4d_pipeline_can_direct_write_final_video_when_explicitly_enabled(self):
+        from scripts.app_4d_pipeline import build_4d_context, run_4d_pipeline_from_context
+
+        with make_workspace_tempdir() as tmpdir:
+            input_dir = os.path.join(tmpdir, "cache")
+            output_dir = os.path.join(tmpdir, "outputs_4d", "demo")
+            os.makedirs(os.path.join(input_dir, "images"), exist_ok=True)
+            os.makedirs(os.path.join(input_dir, "masks"), exist_ok=True)
+            Image.fromarray(np.zeros((4, 4, 3), dtype=np.uint8)).save(
+                os.path.join(input_dir, "images", "00000000.jpg")
+            )
+            Image.fromarray(np.ones((4, 4), dtype=np.uint8)).save(
+                os.path.join(input_dir, "masks", "00000000.png")
+            )
+
+            runtime = {
+                "out_obj_ids": [7],
+                "batch_size": 1,
+                "detection_resolution": [256, 512],
+                "completion_resolution": [512, 1024],
+                "smpl_export": False,
+                "video_fps": 24.0,
+                "save_rendered_video": True,
+                "save_rendered_video_direct": True,
+                "save_rendered_frames": False,
+                "save_rendered_frames_individual": False,
+                "save_mesh_4d_individual": False,
+                "save_focal_4d_individual": False,
+            }
+            context = build_4d_context(
+                input_dir=input_dir,
+                output_dir=output_dir,
+                runtime=runtime,
+                sam3_3d_body_model=MagicMock(faces=np.array([[0, 1, 2]], dtype=np.int32)),
+                pipeline_mask=None,
+                pipeline_rgb=None,
+                depth_model=None,
+                predictor=MagicMock(),
+                generator=None,
+            )
+
+            video_writer = MagicMock()
+            with patch(
+                "scripts.app_4d_pipeline.process_image_with_mask",
+                return_value=([[{"bbox": np.zeros((4,), dtype=np.float32)}]], [[7]], []),
+            ), patch(
+                "scripts.app_4d_pipeline.visualize_sample_together",
+                return_value=np.zeros((4, 4, 3), dtype=np.uint8),
+            ), patch(
+                "scripts.app_4d_pipeline.save_mesh_results",
+            ) as mock_save_mesh, patch(
+                "scripts.app_4d_pipeline.jpg_folder_to_mp4",
+            ) as mock_jpg_to_mp4, patch(
+                "scripts.app_4d_pipeline.cv2.imread",
+                return_value=np.zeros((4, 4, 3), dtype=np.uint8),
+            ), patch(
+                "scripts.app_4d_pipeline.cv2.imwrite",
+                return_value=True,
+            ) as mock_imwrite, patch(
+                "scripts.app_4d_pipeline._open_video_writer",
+                return_value=video_writer,
+            ) as mock_open_video_writer:
+                out_path = run_4d_pipeline_from_context(context)
+
+        self.assertIsNotNone(out_path)
+        self.assertEqual(os.path.dirname(out_path), output_dir)
+        self.assertFalse(os.path.isdir(os.path.join(output_dir, "rendered_frames")))
+        mock_save_mesh.assert_not_called()
+        mock_jpg_to_mp4.assert_not_called()
+        mock_imwrite.assert_not_called()
+        mock_open_video_writer.assert_called_once()
+        video_writer.write.assert_called_once()
+        video_writer.release.assert_called_once()
+
+    def test_open_video_writer_uses_browser_safe_ffmpeg_configuration(self):
+        from scripts.app_4d_pipeline import _open_video_writer
+
+        fake_writer = MagicMock()
+        fake_imageio = MagicMock()
+        fake_imageio.get_writer.return_value = fake_writer
+        with patch("scripts.app_4d_pipeline._get_imageio", return_value=fake_imageio):
+            writer = _open_video_writer("demo.mp4", (5, 7, 3), fps=24)
+
+        self.assertTrue(hasattr(writer, "write"))
+        self.assertTrue(hasattr(writer, "release"))
+        fake_imageio.get_writer.assert_called_once_with(
+            "demo.mp4",
+            fps=24,
+            format="FFMPEG",
+            codec="libx264",
+            pixelformat="yuv420p",
+        )
+
+    def test_run_4d_pipeline_passes_mesh_and_focal_storage_flags(self):
+        from scripts.app_4d_pipeline import build_4d_context, run_4d_pipeline_from_context
+
+        with make_workspace_tempdir() as tmpdir:
+            input_dir = os.path.join(tmpdir, "cache")
+            output_dir = os.path.join(tmpdir, "outputs_4d", "demo")
+            os.makedirs(os.path.join(input_dir, "images"), exist_ok=True)
+            os.makedirs(os.path.join(input_dir, "masks"), exist_ok=True)
+            Image.fromarray(np.zeros((4, 4, 3), dtype=np.uint8)).save(
+                os.path.join(input_dir, "images", "00000000.jpg")
+            )
+            Image.fromarray(np.ones((4, 4), dtype=np.uint8)).save(
+                os.path.join(input_dir, "masks", "00000000.png")
+            )
+
+            runtime = {
+                "out_obj_ids": [3],
+                "batch_size": 1,
+                "detection_resolution": [256, 512],
+                "completion_resolution": [512, 1024],
+                "smpl_export": False,
+                "video_fps": 24.0,
+                "save_rendered_frames": False,
+                "save_rendered_frames_individual": False,
+                "save_mesh_4d_individual": False,
+                "save_focal_4d_individual": True,
+            }
+            context = build_4d_context(
+                input_dir=input_dir,
+                output_dir=output_dir,
+                runtime=runtime,
+                sam3_3d_body_model=MagicMock(faces=np.array([[0, 1, 2]], dtype=np.int32)),
+                pipeline_mask=None,
+                pipeline_rgb=None,
+                depth_model=None,
+                predictor=MagicMock(),
+                generator=None,
+            )
+
+            with patch(
+                "scripts.app_4d_pipeline.process_image_with_mask",
+                return_value=([[{"bbox": np.zeros((4,), dtype=np.float32)}]], [[3]], []),
+            ), patch(
+                "scripts.app_4d_pipeline.visualize_sample_together",
+                return_value=np.zeros((4, 4, 3), dtype=np.uint8),
+            ), patch(
+                "scripts.app_4d_pipeline.visualize_sample",
+                return_value=[],
+            ), patch(
+                "scripts.app_4d_pipeline.save_mesh_results",
+            ) as mock_save_mesh, patch(
+                "scripts.app_4d_pipeline.jpg_folder_to_mp4",
+            ), patch(
+                "scripts.app_4d_pipeline.cv2.imread",
+                return_value=np.zeros((4, 4, 3), dtype=np.uint8),
+            ), patch(
+                "scripts.app_4d_pipeline.cv2.imwrite",
+                return_value=True,
+            ), patch(
+                "scripts.app_4d_pipeline._open_video_writer",
+                return_value=MagicMock(),
+            ):
+                run_4d_pipeline_from_context(context)
+
+                self.assertFalse(os.path.isdir(os.path.join(output_dir, "mesh_4d_individual")))
+                self.assertTrue(os.path.isdir(os.path.join(output_dir, "focal_4d_individual", "3")))
+
+        mock_save_mesh.assert_called_once()
+        self.assertEqual(mock_save_mesh.call_args.kwargs["save_mesh"], False)
+        self.assertEqual(mock_save_mesh.call_args.kwargs["save_focal"], True)
+
+    def test_run_4d_pipeline_prints_cam_int_cache_summary_and_updates_progress_postfix(self):
+        from scripts.app_4d_pipeline import build_4d_context, run_4d_pipeline_from_context
+
+        with make_workspace_tempdir() as tmpdir:
+            input_dir = os.path.join(tmpdir, "cache")
+            output_dir = os.path.join(tmpdir, "outputs_4d", "demo")
+            os.makedirs(os.path.join(input_dir, "images"), exist_ok=True)
+            os.makedirs(os.path.join(input_dir, "masks"), exist_ok=True)
+            Image.fromarray(np.zeros((4, 4, 3), dtype=np.uint8)).save(
+                os.path.join(input_dir, "images", "00000000.jpg")
+            )
+            Image.fromarray(np.ones((4, 4), dtype=np.uint8)).save(
+                os.path.join(input_dir, "masks", "00000000.png")
+            )
+
+            runtime = {
+                "out_obj_ids": [1],
+                "batch_size": 1,
+                "detection_resolution": [256, 512],
+                "completion_resolution": [512, 1024],
+                "smpl_export": False,
+                "video_fps": 24.0,
+                "save_rendered_frames": False,
+                "save_rendered_frames_individual": False,
+                "save_mesh_4d_individual": False,
+                "save_focal_4d_individual": False,
+            }
+            context = build_4d_context(
+                input_dir=input_dir,
+                output_dir=output_dir,
+                runtime=runtime,
+                sam3_3d_body_model=MagicMock(faces=np.array([[0, 1, 2]], dtype=np.int32)),
+                pipeline_mask=None,
+                pipeline_rgb=None,
+                depth_model=None,
+                predictor=MagicMock(),
+                generator=None,
+            )
+
+            progress_updates = []
+
+            class FakeProgress:
+                def __init__(self, iterable):
+                    self._items = list(iterable)
+
+                def __iter__(self):
+                    return iter(self._items)
+
+                def set_postfix_str(self, value):
+                    progress_updates.append(value)
+
+            def fake_process_image_with_mask(*args, **kwargs):
+                kwargs["cam_int_cache_stats"]["misses"] = 1
+                kwargs["cam_int_cache_stats"]["hits"] = 2
+                kwargs["cam_int_cache_stats"]["last_miss_frame"] = "00000000.jpg"
+                return ([[{"bbox": np.zeros((4,), dtype=np.float32)}]], [[1]], [])
+
+            with patch(
+                "scripts.app_4d_pipeline.process_image_with_mask",
+                side_effect=fake_process_image_with_mask,
+            ), patch(
+                "scripts.app_4d_pipeline.tqdm",
+                side_effect=lambda iterable: FakeProgress(iterable),
+            ), patch(
+                "scripts.app_4d_pipeline.visualize_sample_together",
+                return_value=np.zeros((4, 4, 3), dtype=np.uint8),
+            ), patch(
+                "scripts.app_4d_pipeline.visualize_sample",
+                return_value=[],
+            ), patch(
+                "scripts.app_4d_pipeline.save_mesh_results",
+            ), patch(
+                "scripts.app_4d_pipeline.jpg_folder_to_mp4",
+            ), patch(
+                "scripts.app_4d_pipeline.cv2.imread",
+                return_value=np.zeros((4, 4, 3), dtype=np.uint8),
+            ), patch(
+                "scripts.app_4d_pipeline.cv2.imwrite",
+                return_value=True,
+            ), patch(
+                "scripts.app_4d_pipeline._open_video_writer",
+                return_value=MagicMock(),
+            ), patch(
+                "builtins.print",
+            ) as mock_print:
+                run_4d_pipeline_from_context(context)
+
+        self.assertTrue(
+            any(
+                call.args and call.args[0] == "cam_int cache: 1 misses, 2 hits"
+                for call in mock_print.call_args_list
+            )
+        )
+        self.assertIn("cam_int=1m/2h miss=00000000.jpg", progress_updates)
+
+    @unittest.skipUnless(HAS_TORCH, "torch is required for completion caching test")
+    def test_run_4d_pipeline_caches_transforms_and_keeps_completion_artifacts_in_memory(self):
+        from scripts.app_4d_pipeline import build_4d_context, run_4d_pipeline_from_context
+        import torch
+
+        with make_workspace_tempdir() as tmpdir:
+            input_dir = os.path.join(tmpdir, "cache")
+            output_dir = os.path.join(tmpdir, "outputs_4d", "demo")
+            os.makedirs(os.path.join(input_dir, "images"), exist_ok=True)
+            os.makedirs(os.path.join(input_dir, "masks"), exist_ok=True)
+            for frame_stem in ("00000000", "00000001", "00000002", "00000003"):
+                Image.fromarray(np.zeros((4, 4, 3), dtype=np.uint8)).save(
+                    os.path.join(input_dir, "images", f"{frame_stem}.jpg")
+                )
+                mask = np.zeros((4, 4), dtype=np.uint8)
+                mask[:, :2] = 1
+                mask[:, 2:] = 2
+                Image.fromarray(mask).save(
+                    os.path.join(input_dir, "masks", f"{frame_stem}.png")
+                )
+
+            runtime = {
+                "out_obj_ids": [1, 2],
+                "batch_size": 8,
+                "completion_batch_size": 2,
+                "completion_decode_chunk_size": 2,
+                "max_occ_len": 8,
+                "detection_resolution": [192, 384],
+                "completion_resolution": [256, 512],
+                "smpl_export": False,
+                "video_fps": 24.0,
+            }
+
+            pipeline_mask = MagicMock(
+                side_effect=lambda *args, **kwargs: SimpleNamespace(
+                    frames=[
+                        [
+                            Image.fromarray(np.full((2, 2, 3), 255, dtype=np.uint8))
+                            for _ in range(kwargs["num_frames"])
+                        ]
+                    ]
+                )
+            )
+            pipeline_rgb = MagicMock(
+                side_effect=lambda *args, **kwargs: SimpleNamespace(
+                    frames=[
+                        [
+                            Image.fromarray(np.full((2, 2, 3), 127, dtype=np.uint8))
+                            for _ in range(kwargs["num_frames"])
+                        ]
+                    ]
+                )
+            )
+            context = build_4d_context(
+                input_dir=input_dir,
+                output_dir=output_dir,
+                runtime=runtime,
+                sam3_3d_body_model=MagicMock(faces=np.array([[0, 1, 2]], dtype=np.int32)),
+                pipeline_mask=pipeline_mask,
+                pipeline_rgb=pipeline_rgb,
+                depth_model=MagicMock(),
+                predictor=MagicMock(),
+                generator=None,
+            )
+
+            fake_modal_low = torch.zeros((1, 4, 3, 2, 2), dtype=torch.float32)
+            fake_modal_high = torch.ones((1, 4, 3, 2, 2), dtype=torch.float32)
+            fake_rgb_low = torch.zeros((1, 4, 3, 2, 2), dtype=torch.float32)
+            fake_rgb_high = torch.zeros((1, 4, 3, 2, 2), dtype=torch.float32)
+            fake_depth_pixels = torch.zeros((1, 4, 3, 2, 2), dtype=torch.float32)
+            captured_process_kwargs = {}
+
+            def fake_load_masks(*args, **kwargs):
+                resolution = tuple(kwargs["resolution"])
+                if resolution == (192, 384):
+                    return fake_modal_low, (4, 4)
+                return fake_modal_high, (4, 4)
+
+            def fake_load_rgbs(*args, **kwargs):
+                resolution = tuple(kwargs["resolution"])
+                if resolution == (192, 384):
+                    return fake_rgb_low, (4, 4), None
+                return fake_rgb_high, (4, 4), None
+
+            def fake_process_image_with_mask(*args, **kwargs):
+                captured_process_kwargs["idx_path"] = dict(args[3])
+                captured_process_kwargs["completion_cache"] = kwargs["completion_cache"]
+                batch_images = args[1]
+                return (
+                    [[{"bbox": np.zeros((4,), dtype=np.float32)}] for _ in batch_images],
+                    [[1] for _ in batch_images],
+                    [],
+                )
+
+            with patch(
+                "scripts.app_4d_pipeline._load_runtime_utils",
+                return_value={
+                    "DAVIS_PALETTE": [0] * (256 * 3),
+                    "bbox_from_mask": lambda mask: [0.0, 0.0, 1.0, 1.0],
+                    "is_skinny_mask": lambda mask: False,
+                    "is_super_long_or_wide": lambda mask, obj_id: False,
+                    "keep_largest_component": lambda mask: mask,
+                    "resize_mask_with_unique_label": lambda mask, h, w, obj_id: mask,
+                },
+            ), patch(
+                "scripts.app_4d_pipeline.load_and_transform_masks",
+                side_effect=fake_load_masks,
+            ) as mock_load_masks, patch(
+                "scripts.app_4d_pipeline.load_and_transform_rgbs",
+                side_effect=fake_load_rgbs,
+            ) as mock_load_rgbs, patch(
+                "scripts.app_4d_pipeline.rgb_to_depth",
+                return_value=fake_depth_pixels,
+            ), patch(
+                "scripts.app_4d_pipeline.build_completion_window_from_ious",
+                side_effect=lambda ious, padding=0, iou_threshold=0.7: ([0, 0], (0, 2)),
+            ), patch(
+                "scripts.app_4d_pipeline.process_image_with_mask",
+                side_effect=fake_process_image_with_mask,
+            ), patch(
+                "scripts.app_4d_pipeline.visualize_sample_together",
+                return_value=np.zeros((4, 4, 3), dtype=np.uint8),
+            ), patch(
+                "scripts.app_4d_pipeline.visualize_sample",
+                return_value=[],
+            ), patch(
+                "scripts.app_4d_pipeline.save_mesh_results",
+            ), patch(
+                "scripts.app_4d_pipeline.jpg_folder_to_mp4",
+            ), patch(
+                "scripts.app_4d_pipeline.cv2.imread",
+                return_value=np.zeros((4, 4, 3), dtype=np.uint8),
+            ), patch(
+                "scripts.app_4d_pipeline.cv2.imwrite",
+                return_value=True,
+            ):
+                run_4d_pipeline_from_context(context)
+
+        self.assertEqual(mock_load_masks.call_count, 4)
+        self.assertEqual(mock_load_rgbs.call_count, 2)
+        self.assertEqual(captured_process_kwargs["idx_path"], {})
+        self.assertIn(1, captured_process_kwargs["completion_cache"])
+        self.assertIn("images", captured_process_kwargs["completion_cache"][1])
+        self.assertIn("masks", captured_process_kwargs["completion_cache"][1])
+        self.assertFalse(os.path.exists(os.path.join(output_dir, "completion")))
 
 
 if __name__ == "__main__":

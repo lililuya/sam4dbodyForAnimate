@@ -422,6 +422,7 @@ class BatchRunnerTests(unittest.TestCase):
                 "configs/body4d_refined.yaml",
                 "--retry_mode",
                 "quality_safe",
+                "--disable_mask_refine",
                 "--skip_existing",
             ]
         )
@@ -430,6 +431,7 @@ class BatchRunnerTests(unittest.TestCase):
         self.assertEqual(args.output_dir, "./outputs_batch")
         self.assertEqual(args.config, "configs/body4d_refined.yaml")
         self.assertEqual(args.retry_mode, "quality_safe")
+        self.assertTrue(args.disable_mask_refine)
         self.assertTrue(args.skip_existing)
 
     def test_run_batch_calls_refined_app_once_per_sample(self):
@@ -579,6 +581,315 @@ class BatchRunnerTests(unittest.TestCase):
                             offline_batch_refined.run_batch(args)
 
                     app.run_sample.assert_not_called()
+
+    def test_run_batch_extracts_face_first_clip_packages_before_refined_processing(self):
+        import scripts.offline_batch_refined as offline_batch_refined
+
+        with make_workspace_tempdir() as tmpdir:
+            batch_output_dir = os.path.join(tmpdir, "outputs_batch")
+            face_clip_output_dir = os.path.join(tmpdir, "face_clips")
+            args = SimpleNamespace(
+                input_root="./inputs",
+                input_list="",
+                output_dir=batch_output_dir,
+                config="configs/body4d_refined.yaml",
+                detector_backend=None,
+                track_chunk_size=None,
+                continue_on_error=False,
+                save_debug_metrics=False,
+                skip_existing=False,
+                max_samples=None,
+                retry_mode="never",
+            )
+            cfg = OmegaConf.create(
+                {
+                    "runtime": {"output_dir": "./outputs_refined"},
+                    "detector": {"backend": "yolo"},
+                    "tracking": {"chunk_size": 180},
+                    "sam_3d_body": {"batch_size": 32},
+                    "batch": {
+                        "initial_search_frames": 24,
+                        "retry_mode": "quality_safe",
+                        "retry_chunk_sizes": [120, 96],
+                        "retry_batch_sizes": [24, 16],
+                    },
+                    "reprompt": {
+                        "enable": True,
+                        "empty_mask_patience": 3,
+                        "area_drop_ratio": 0.35,
+                        "edge_touch_ratio": 0.4,
+                        "iou_low_threshold": 0.55,
+                    },
+                    "debug": {"save_metrics": False},
+                    "wan_export": {
+                        "enable": True,
+                        "output_dir": os.path.join(tmpdir, "wan_export"),
+                        "face_clip": {
+                            "enable": True,
+                            "output_dir": face_clip_output_dir,
+                            "min_clip_seconds": 5.0,
+                        },
+                    },
+                }
+            )
+            samples = [{"input": "./inputs/source.mp4", "sample_id": "source"}]
+            app = MagicMock()
+            app.run_sample.return_value = {"status": "completed"}
+            app.prepare_input.return_value = {
+                "input_video": "./inputs/source.mp4",
+                "input_type": "video",
+                "frame_count": 100,
+                "frames": [f"{index:08d}" for index in range(100)],
+            }
+            app._probe_sample_face_presence.return_value = {
+                "checked_frame_count": 20,
+                "face_detected_frame_count": 5,
+                "no_face_frame_count": 15,
+                "no_face_ratio": 0.75,
+                "face_presence_stride": 5,
+                "max_no_face_ratio": 0.80,
+                "skip_sample_without_face": True,
+                "probe_executed": True,
+            }
+            app._should_skip_sample_for_face_presence.return_value = False
+            app._ensure_face_backend.return_value = object()
+            clip_dir = os.path.join(face_clip_output_dir, "clips", "clipuuid_face01_seg001")
+
+            with patch.object(offline_batch_refined, "load_refined_config", return_value=cfg), patch.object(
+                offline_batch_refined, "discover_samples", return_value=samples
+            ), patch.object(offline_batch_refined, "RefinedOfflineApp", return_value=app), patch.object(
+                offline_batch_refined,
+                "extract_face_clips_from_video",
+                return_value=[clip_dir],
+            ) as mock_extract_face_clips_from_video:
+                results = offline_batch_refined.run_batch(args)
+
+        mock_extract_face_clips_from_video.assert_called_once_with(
+            input_video="./inputs/source.mp4",
+            output_root=os.path.abspath(face_clip_output_dir),
+            min_clip_seconds=5.0,
+            face_backend=app._ensure_face_backend.return_value,
+            sample_id="source",
+            target_fps=25.0,
+        )
+        app.run_sample.assert_called_once_with(
+            input_video=clip_dir,
+            output_dir=os.path.join(batch_output_dir, "clipuuid_face01_seg001"),
+            skip_existing=False,
+            runtime_profile={
+                "retry_index": 0,
+                "reason": "base",
+                "tracking.chunk_size": 180,
+                "sam_3d_body.batch_size": 32,
+                "initial_search_frames": 24,
+            },
+        )
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0]["stage"], "face_clip_extraction")
+        self.assertEqual(results[1]["sample_id"], "clipuuid_face01_seg001")
+
+    def test_run_batch_skips_face_first_sample_before_full_extraction_when_no_face_precheck_fails(self):
+        import scripts.offline_batch_refined as offline_batch_refined
+
+        with make_workspace_tempdir() as tmpdir:
+            batch_output_dir = os.path.join(tmpdir, "outputs_batch")
+            face_clip_output_dir = os.path.join(tmpdir, "face_clips")
+            args = SimpleNamespace(
+                input_root="./inputs",
+                input_list="",
+                output_dir=batch_output_dir,
+                config="configs/body4d_refined.yaml",
+                detector_backend=None,
+                track_chunk_size=None,
+                continue_on_error=False,
+                save_debug_metrics=False,
+                skip_existing=False,
+                max_samples=None,
+                retry_mode="never",
+            )
+            cfg = OmegaConf.create(
+                {
+                    "runtime": {"output_dir": "./outputs_refined"},
+                    "detector": {"backend": "yolo"},
+                    "tracking": {"chunk_size": 180},
+                    "sam_3d_body": {"batch_size": 32},
+                    "batch": {
+                        "initial_search_frames": 24,
+                        "retry_mode": "quality_safe",
+                        "retry_chunk_sizes": [120, 96],
+                        "retry_batch_sizes": [24, 16],
+                    },
+                    "reprompt": {
+                        "enable": True,
+                        "empty_mask_patience": 3,
+                        "area_drop_ratio": 0.35,
+                        "edge_touch_ratio": 0.4,
+                        "iou_low_threshold": 0.55,
+                    },
+                    "debug": {"save_metrics": False},
+                    "wan_export": {
+                        "enable": True,
+                        "skip_sample_without_face": True,
+                        "face_presence_stride": 5,
+                        "max_no_face_ratio": 0.80,
+                        "output_dir": os.path.join(tmpdir, "wan_export"),
+                        "face_clip": {
+                            "enable": True,
+                            "output_dir": face_clip_output_dir,
+                            "min_clip_seconds": 5.0,
+                        },
+                    },
+                }
+            )
+            samples = [{"input": "./inputs/source.mp4", "sample_id": "source"}]
+            app = MagicMock()
+            app.prepare_input.return_value = {
+                "input_video": "./inputs/source.mp4",
+                "input_type": "video",
+                "frame_count": 100,
+                "frames": [f"{index:08d}" for index in range(100)],
+            }
+            app._probe_sample_face_presence.return_value = {
+                "checked_frame_count": 20,
+                "face_detected_frame_count": 0,
+                "no_face_frame_count": 20,
+                "no_face_ratio": 1.0,
+                "face_presence_stride": 5,
+                "max_no_face_ratio": 0.80,
+                "skip_sample_without_face": True,
+                "probe_executed": True,
+            }
+            app._should_skip_sample_for_face_presence.return_value = True
+
+            with patch.object(offline_batch_refined, "load_refined_config", return_value=cfg), patch.object(
+                offline_batch_refined, "discover_samples", return_value=samples
+            ), patch.object(offline_batch_refined, "RefinedOfflineApp", return_value=app), patch.object(
+                offline_batch_refined,
+                "extract_face_clips_from_video",
+            ) as mock_extract_face_clips_from_video:
+                records = offline_batch_refined.run_batch(args)
+
+            summary_path = os.path.join(face_clip_output_dir, "batch_summary.json")
+            with open(summary_path, "r", encoding="utf-8") as handle:
+                batch_summary = json.load(handle)
+
+        app.prepare_input.assert_called_once_with("./inputs/source.mp4", None, False)
+        app._probe_sample_face_presence.assert_called_once()
+        app._should_skip_sample_for_face_presence.assert_called_once()
+        app.run_sample.assert_not_called()
+        mock_extract_face_clips_from_video.assert_not_called()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["status"], "skipped_no_face_precheck")
+        self.assertEqual(records[0]["kept_clip_count"], 0)
+        self.assertEqual(records[0]["face_presence"]["no_face_ratio"], 1.0)
+        self.assertEqual(batch_summary["video_count_total"], 1)
+        self.assertEqual(batch_summary["clip_count_kept"], 0)
+        self.assertEqual(batch_summary["items"][0]["status"], "skipped_no_face_precheck")
+
+    def test_run_batch_reuses_existing_face_clip_packages_when_skip_existing_is_enabled(self):
+        import scripts.offline_batch_refined as offline_batch_refined
+
+        with make_workspace_tempdir() as tmpdir:
+            batch_output_dir = os.path.join(tmpdir, "outputs_batch")
+            face_clip_output_dir = os.path.join(tmpdir, "face_clips")
+            clip_id = "sampleuuid_face01_seg001"
+            clip_dir = os.path.join(face_clip_output_dir, "clips", clip_id)
+            os.makedirs(clip_dir, exist_ok=True)
+            for filename in ("clip.mp4", "track.json", "meta.json"):
+                with open(os.path.join(clip_dir, filename), "w", encoding="utf-8") as handle:
+                    handle.write("{}")
+
+            with open(os.path.join(face_clip_output_dir, "batch_summary.json"), "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "items": [
+                            {
+                                "sample_uuid": "sampleuuid",
+                                "source_path": os.path.abspath("./inputs/source.mp4"),
+                                "status": "completed",
+                                "kept_clip_count": 1,
+                                "clip_ids": [clip_id],
+                            }
+                        ]
+                    },
+                    handle,
+                )
+
+            summary_path = os.path.join(
+                batch_output_dir,
+                clip_id,
+                "debug_metrics",
+                "sample_summary.json",
+            )
+            os.makedirs(os.path.dirname(summary_path), exist_ok=True)
+            with open(summary_path, "w", encoding="utf-8") as handle:
+                json.dump({"status": "completed"}, handle)
+
+            args = SimpleNamespace(
+                input_root="./inputs",
+                input_list="",
+                output_dir=batch_output_dir,
+                config="configs/body4d_refined.yaml",
+                detector_backend=None,
+                track_chunk_size=None,
+                continue_on_error=False,
+                save_debug_metrics=False,
+                skip_existing=True,
+                max_samples=None,
+                retry_mode="never",
+            )
+            cfg = OmegaConf.create(
+                {
+                    "runtime": {"output_dir": "./outputs_refined"},
+                    "detector": {"backend": "yolo"},
+                    "tracking": {"chunk_size": 180},
+                    "sam_3d_body": {"batch_size": 32},
+                    "batch": {
+                        "initial_search_frames": 24,
+                        "retry_mode": "quality_safe",
+                        "retry_chunk_sizes": [120, 96],
+                        "retry_batch_sizes": [24, 16],
+                    },
+                    "reprompt": {
+                        "enable": True,
+                        "empty_mask_patience": 3,
+                        "area_drop_ratio": 0.35,
+                        "edge_touch_ratio": 0.4,
+                        "iou_low_threshold": 0.55,
+                    },
+                    "debug": {"save_metrics": False},
+                    "wan_export": {
+                        "enable": True,
+                        "output_dir": os.path.join(tmpdir, "wan_export"),
+                        "face_clip": {
+                            "enable": True,
+                            "output_dir": face_clip_output_dir,
+                            "min_clip_seconds": 5.0,
+                        },
+                    },
+                }
+            )
+            samples = [{"input": "./inputs/source.mp4", "sample_id": "source"}]
+            app = MagicMock()
+
+            with patch.object(offline_batch_refined, "load_refined_config", return_value=cfg), patch.object(
+                offline_batch_refined, "discover_samples", return_value=samples
+            ), patch.object(offline_batch_refined, "RefinedOfflineApp", return_value=app), patch.object(
+                offline_batch_refined,
+                "extract_face_clips_from_video",
+            ) as mock_extract_face_clips_from_video:
+                results = offline_batch_refined.run_batch(args)
+
+        mock_extract_face_clips_from_video.assert_not_called()
+        app.prepare_input.assert_not_called()
+        app.run_sample.assert_not_called()
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0]["stage"], "face_clip_extraction")
+        self.assertEqual(results[0]["status"], "skipped_existing")
+        self.assertEqual(results[0]["clip_ids"], [clip_id])
+        self.assertEqual(results[1]["stage"], "refined_pipeline")
+        self.assertEqual(results[1]["status"], "skipped")
+        self.assertEqual(results[1]["sample_id"], clip_id)
 
 
 class BatchRetryTests(unittest.TestCase):

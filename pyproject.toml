@@ -36,5 +36,11 @@ dependencies = [
     "MoGe @ git+https://github.com/microsoft/MoGe.git",
 ]
 
+[project.optional-dependencies]
+wan-export = [
+    "insightface~=0.7.3",
+    "onnxruntime-gpu~=1.20.0",
+]
+
 [tool.setuptools]
 packages = { find = { where = ["."] , include = ["models", "models.*"] } }

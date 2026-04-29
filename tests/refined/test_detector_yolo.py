@@ -70,6 +70,32 @@ class YoloDetectorTests(unittest.TestCase):
         expected = np.array([[0, 0, 50, 100], [20, 10, 40, 30]], dtype=np.float32)
         np.testing.assert_allclose(boxes, expected)
 
+    def test_extract_person_boxes_can_return_scored_detections(self):
+        from models.sam_3d_body.tools.build_detector_yolo import extract_person_boxes
+
+        class FakeBoxes:
+            def __init__(self):
+                self.xyxy = np.array(
+                    [[20, 10, 40, 30], [0, 0, 50, 100], [5, 5, 40, 90]],
+                    dtype=np.float32,
+                )
+                self.conf = np.array([0.90, 0.95, 0.20], dtype=np.float32)
+                self.cls = np.array([0, 0, 0], dtype=np.float32)
+
+        detections = extract_person_boxes(
+            FakeBoxes(),
+            bbox_thr=0.30,
+            det_cat_id=0,
+            return_scores=True,
+        )
+        self.assertEqual(
+            detections,
+            [
+                {"bbox": [0.0, 0.0, 50.0, 100.0], "score": 0.949999988079071},
+                {"bbox": [20.0, 10.0, 40.0, 30.0], "score": 0.8999999761581421},
+            ],
+        )
+
     def test_human_detector_yolo_threads_device_to_runner(self):
         import importlib
         import sys

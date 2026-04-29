@@ -1,6 +1,5 @@
 import glob
 import os
-import random
 import sys
 import time
 from types import SimpleNamespace
@@ -11,6 +10,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from scripts.offline_completion_indexing import build_completion_window_from_ious
+from scripts.completion_safety import build_completion_slice, resolve_completion_batch_size, resolve_decode_chunk_size
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -75,6 +75,77 @@ def jpg_folder_to_mp4(*args, **kwargs):
     return _jpg_folder_to_mp4(*args, **kwargs)
 
 
+def _get_imageio():
+    import imageio.v2 as imageio
+
+    return imageio
+
+
+class _BrowserSafeVideoWriter:
+    def __init__(self, output_path: str, frame_shape, fps: float):
+        self.output_path = output_path
+        self.height = int(frame_shape[0])
+        self.width = int(frame_shape[1])
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        self._writer = _get_imageio().get_writer(
+            output_path,
+            fps=int(fps),
+            format="FFMPEG",
+            codec="libx264",
+            pixelformat="yuv420p",
+        )
+
+    def write(self, frame_bgr: np.ndarray) -> None:
+        frame = np.asarray(frame_bgr)
+        if frame.ndim == 2:
+            frame = np.stack([frame] * 3, axis=-1)
+        if frame.shape[:2] != (self.height, self.width):
+            frame = cv2.resize(frame, (self.width, self.height))
+        if frame.shape[2] == 4:
+            frame = frame[:, :, :3]
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        self._writer.append_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+    def release(self) -> None:
+        self._writer.close()
+
+
+def _open_video_writer(output_path: str, frame_shape, fps: float):
+    return _BrowserSafeVideoWriter(output_path, frame_shape, fps)
+
+
+def _normalize_render_mode(render_mode) -> str:
+    normalized = str(render_mode or "normal").strip().lower()
+    if normalized in {"normal", "norm", "normals"}:
+        return "normal"
+    if normalized in {"mesh", "mesh_color", "color", "default"}:
+        return "mesh"
+    raise ValueError(f"unsupported render_mode: {render_mode}")
+
+
+def _normalize_scene_bg_color(scene_bg_color) -> tuple[float, float, float]:
+    if scene_bg_color is None or scene_bg_color == "":
+        return (0.0, 0.0, 0.0)
+    if isinstance(scene_bg_color, str):
+        normalized = scene_bg_color.strip().lower()
+        if normalized == "black":
+            return (0.0, 0.0, 0.0)
+        if normalized == "white":
+            return (1.0, 1.0, 1.0)
+        raise ValueError(f"unsupported scene background color: {scene_bg_color}")
+
+    values = tuple(float(value) for value in scene_bg_color)
+    if len(values) != 3:
+        raise ValueError("scene background color must contain exactly three values")
+    if max(values) > 1.0:
+        array = np.clip(np.asarray(values, dtype=np.float32) / 255.0, 0.0, 1.0)
+        return float(array[0]), float(array[1]), float(array[2])
+    return tuple(float(np.clip(value, 0.0, 1.0)) for value in values)
+
+
 def _load_runtime_utils():
     from utils import DAVIS_PALETTE
     from utils.mask_utils import (
@@ -100,6 +171,59 @@ def _list_input_images(input_dir):
     for pattern in IMAGE_PATTERNS:
         image_paths.extend(glob.glob(os.path.join(input_dir, pattern)))
     return sorted(image_paths)
+
+
+def _resolution_key(resolution):
+    return tuple(int(value) for value in resolution)
+
+
+def _load_modal_pixels_cached(cache, masks_dir, resolution, obj_id):
+    cache_key = ("mask", os.path.abspath(masks_dir), _resolution_key(resolution), int(obj_id))
+    if cache_key not in cache:
+        cache[cache_key] = load_and_transform_masks(
+            masks_dir,
+            resolution=resolution,
+            obj_id=obj_id,
+        )
+    return cache[cache_key]
+
+
+def _load_rgb_pixels_cached(cache, images_dir, resolution):
+    cache_key = ("rgb", os.path.abspath(images_dir), _resolution_key(resolution))
+    if cache_key not in cache:
+        cache[cache_key] = load_and_transform_rgbs(images_dir, resolution=resolution)
+    return cache[cache_key]
+
+
+def _load_indexed_mask_cached(cache, mask_path):
+    cache_key = os.path.abspath(mask_path)
+    if cache_key not in cache:
+        with Image.open(cache_key) as mask_image:
+            cache[cache_key] = np.array(mask_image.convert("P"))
+    return cache[cache_key]
+
+
+def _load_bgr_image_cached(cache, image_path):
+    cache_key = os.path.abspath(image_path)
+    if cache_key not in cache:
+        image_bgr = cv2.imread(cache_key)
+        if image_bgr is None:
+            raise FileNotFoundError(f"unable to read image: {image_path}")
+        cache[cache_key] = image_bgr
+    return cache[cache_key].copy()
+
+
+def _format_cam_int_progress_postfix(stats):
+    misses = int(stats.get("misses", 0))
+    hits = int(stats.get("hits", 0))
+    if misses <= 0 and hits <= 0:
+        return None
+
+    postfix = f"cam_int={misses}m/{hits}h"
+    last_miss_frame = stats.get("last_miss_frame")
+    if last_miss_frame:
+        postfix = f"{postfix} miss={last_miss_frame}"
+    return postfix
 
 
 def build_4d_context(
@@ -143,18 +267,46 @@ def run_4d_pipeline_from_context(context):
 
     output_dir = context.output_dir
     os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(os.path.join(output_dir, "rendered_frames"), exist_ok=True)
-    for obj_id in context.runtime["out_obj_ids"]:
-        os.makedirs(os.path.join(output_dir, "mesh_4d_individual", str(obj_id)), exist_ok=True)
-        os.makedirs(os.path.join(output_dir, "focal_4d_individual", str(obj_id)), exist_ok=True)
-        os.makedirs(os.path.join(output_dir, "rendered_frames_individual", str(obj_id)), exist_ok=True)
+    save_rendered_video = bool(context.runtime.get("save_rendered_video", True))
+    # Direct mp4 encoding forces per-frame full-scene rendering even when JPG outputs are disabled,
+    # so keep it opt-in to preserve the previous low-memory behavior.
+    save_rendered_video_direct = bool(context.runtime.get("save_rendered_video_direct", False))
+    save_rendered_frames = bool(context.runtime.get("save_rendered_frames", True))
+    save_rendered_frames_individual = bool(context.runtime.get("save_rendered_frames_individual", True))
+    save_mesh = bool(context.runtime.get("save_mesh_4d_individual", True))
+    save_focal = bool(context.runtime.get("save_focal_4d_individual", True))
+    render_mode = _normalize_render_mode(context.runtime.get("render_mode", "normal"))
+    scene_bg_color = _normalize_scene_bg_color(context.runtime.get("render_scene_bg_color", (0, 0, 0)))
+    write_rendered_video_direct = save_rendered_video and save_rendered_video_direct and not save_rendered_frames
+    out_4d_path = os.path.join(output_dir, f"4d_{time.time():.0f}.mp4") if save_rendered_video else None
+    direct_video_writer = None
 
-    batch_size = context.runtime["batch_size"]
+    if save_rendered_frames:
+        os.makedirs(os.path.join(output_dir, "rendered_frames"), exist_ok=True)
+    for obj_id in context.runtime["out_obj_ids"]:
+        if save_mesh:
+            os.makedirs(os.path.join(output_dir, "mesh_4d_individual", str(obj_id)), exist_ok=True)
+        if save_focal:
+            os.makedirs(os.path.join(output_dir, "focal_4d_individual", str(obj_id)), exist_ok=True)
+        if save_rendered_frames_individual:
+            os.makedirs(os.path.join(output_dir, "rendered_frames_individual", str(obj_id)), exist_ok=True)
+
+    hmr_batch_size = context.runtime["batch_size"]
+    completion_batch_size = resolve_completion_batch_size(context.runtime.get("completion_batch_size", 1))
+    batch_size = completion_batch_size if context.pipeline_mask is not None else hmr_batch_size
     n = len(images_list)
+    runtime_cache = {
+        "modal_pixels": {},
+        "rgb_pixels": {},
+        "mask_frames": {},
+        "image_frames": {},
+        "cam_int": {},
+        "cam_int_stats": {"hits": 0, "misses": 0},
+    }
 
     pred_res = context.runtime["detection_resolution"]
     pred_res_hi = context.runtime["completion_resolution"]
-    modal_pixels_list = []
+    modal_pixels_by_obj = {}
     if context.pipeline_mask is not None:
         runtime_utils = _load_runtime_utils()
         davis_palette = runtime_utils["DAVIS_PALETTE"]
@@ -165,39 +317,54 @@ def run_4d_pipeline_from_context(context):
         resize_mask_with_unique_label = runtime_utils["resize_mask_with_unique_label"]
 
         for obj_id in context.runtime["out_obj_ids"]:
-            modal_pixels, ori_shape = load_and_transform_masks(
+            modal_pixels, _ = _load_modal_pixels_cached(
+                runtime_cache["modal_pixels"],
                 input_masks_dir,
-                resolution=pred_res,
-                obj_id=obj_id,
+                pred_res,
+                obj_id,
             )
-            modal_pixels_list.append(modal_pixels)
-        rgb_pixels, _, _ = load_and_transform_rgbs(input_images_dir, resolution=pred_res)
+            modal_pixels_by_obj[obj_id] = modal_pixels
+        rgb_pixels, _, _ = _load_rgb_pixels_cached(
+            runtime_cache["rgb_pixels"],
+            input_images_dir,
+            pred_res,
+        )
         depth_pixels = rgb_to_depth(rgb_pixels, context.depth_model)
 
     mhr_shape_scale_dict = {}
     obj_ratio_dict = {}
 
-    for i in tqdm(range(0, n, batch_size)):
+    progress = tqdm(range(0, n, batch_size))
+    for i in progress:
         batch_images = images_list[i : i + batch_size]
         batch_masks = masks_list[i : i + batch_size]
-
-        with Image.open(batch_masks[0]) as first_mask_image:
-            width, height = first_mask_image.size
+        batch_mask_frames = [
+            _load_indexed_mask_cached(runtime_cache["mask_frames"], mask_path)
+            for mask_path in batch_masks
+        ]
+        height, width = batch_mask_frames[0].shape
 
         idx_dict = {}
         idx_path = {}
         occ_dict = {}
-        if len(modal_pixels_list) > 0:
+        completion_cache = {}
+        persist_completion_artifacts = bool(context.runtime.get("save_completion_artifacts", False))
+        if len(modal_pixels_by_obj) > 0:
             print("detect occlusions ...")
             pred_amodal_masks_dict = {}
-            for modal_pixels, obj_id in zip(modal_pixels_list, context.runtime["out_obj_ids"]):
+            for obj_id in context.runtime["out_obj_ids"]:
+                modal_pixels = modal_pixels_by_obj[obj_id]
+                decode_chunk_size = resolve_decode_chunk_size(
+                    context.runtime.get("completion_decode_chunk_size", 8),
+                    num_frames=modal_pixels[:, i : i + batch_size, :, :, :].shape[1],
+                )
                 pred_amodal_masks = context.pipeline_mask(
                     modal_pixels[:, i : i + batch_size, :, :, :],
                     depth_pixels[:, i : i + batch_size, :, :, :],
                     height=pred_res[0],
                     width=pred_res[1],
                     num_frames=modal_pixels[:, i : i + batch_size, :, :, :].shape[1],
-                    decode_chunk_size=8,
+                    decode_chunk_size=decode_chunk_size,
                     motion_bucket_id=127,
                     fps=8,
                     noise_aug_strength=0.02,
@@ -218,7 +385,7 @@ def run_4d_pipeline_from_context(context):
                 pred_amodal_masks = (pred_amodal_masks.sum(axis=-1) > 600).astype("uint8")
                 pred_amodal_masks = [keep_largest_component(mask_current) for mask_current in pred_amodal_masks]
 
-                masks = [(np.array(Image.open(mask_path).convert("P")) == obj_id).astype("uint8") for mask_path in batch_masks]
+                masks = [(mask_frame == obj_id).astype("uint8") for mask_frame in batch_mask_frames]
                 ious = []
                 masks_margin_shrink = [mask_current.copy() for mask_current in masks]
                 mask_height, mask_width = masks_margin_shrink[0].shape
@@ -280,36 +447,50 @@ def run_4d_pipeline_from_context(context):
                 pred_amodal_masks_dict[obj_id] = pred_amodal_masks_com
                 occ_dict[obj_id], completion_window = build_completion_window_from_ious(
                     ious,
-                    padding=2,
+                    padding=0,
                     iou_threshold=0.7,
                 )
 
                 if completion_window is not None:
-                    start, end = completion_window
+                    start, end = build_completion_slice(
+                        first_occ_idx=completion_window[0],
+                        last_occ_idx=completion_window[1] - 1,
+                        total_frames=modal_pixels[:, i : i + batch_size, :, :, :].shape[1],
+                        pad_before=2,
+                        pad_after=2,
+                        max_occ_len=context.runtime.get("max_occ_len", 0),
+                    )
+                    if end <= start:
+                        continue
                     idx_dict[obj_id] = (start, end)
-                    completion_path = "".join(random.choices("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", k=4))
-                    completion_image_path = os.path.join(output_dir, "completion", completion_path, "images")
-                    completion_masks_path = os.path.join(output_dir, "completion", completion_path, "masks")
-                    os.makedirs(completion_image_path, exist_ok=True)
-                    os.makedirs(completion_masks_path, exist_ok=True)
-                    idx_path[obj_id] = {"images": completion_image_path, "masks": completion_masks_path}
+                    completion_cache[obj_id] = {"images": {}, "masks": {}}
+                    if persist_completion_artifacts:
+                        batch_tag = f"batch_{i:08d}"
+                        completion_image_path = os.path.join(output_dir, "completion", str(obj_id), batch_tag, "images")
+                        completion_masks_path = os.path.join(output_dir, "completion", str(obj_id), batch_tag, "masks")
+                        os.makedirs(completion_image_path, exist_ok=True)
+                        os.makedirs(completion_masks_path, exist_ok=True)
+                        idx_path[obj_id] = {"images": completion_image_path, "masks": completion_masks_path}
                     for frame_index in range(start, end):
                         mask_idx = pred_amodal_masks[frame_index].copy()
                         mask_idx[mask_idx > 0] = obj_id
-                        mask_idx = Image.fromarray(mask_idx).convert("P")
-                        mask_idx.putpalette(davis_palette)
-                        mask_idx.save(os.path.join(completion_masks_path, f"{frame_index:08d}.png"))
+                        completion_cache[obj_id]["masks"][frame_index] = mask_idx.astype(np.uint8)
+                        if persist_completion_artifacts:
+                            mask_image = Image.fromarray(mask_idx).convert("P")
+                            mask_image.putpalette(davis_palette)
+                            mask_image.save(os.path.join(completion_masks_path, f"{frame_index:08d}.png"))
 
             for obj_id, (start, end) in idx_dict.items():
-                completion_image_path = idx_path[obj_id]["images"]
-                modal_pixels_current, ori_shape = load_and_transform_masks(
+                modal_pixels_current, ori_shape = _load_modal_pixels_cached(
+                    runtime_cache["modal_pixels"],
                     input_masks_dir,
-                    resolution=pred_res_hi,
-                    obj_id=obj_id,
+                    pred_res_hi,
+                    obj_id,
                 )
-                rgb_pixels_current, _, _ = load_and_transform_rgbs(
+                rgb_pixels_current, _, _ = _load_rgb_pixels_cached(
+                    runtime_cache["rgb_pixels"],
                     input_images_dir,
-                    resolution=pred_res_hi,
+                    pred_res_hi,
                 )
                 modal_pixels_current = modal_pixels_current[:, i : i + batch_size, :, :, :]
                 modal_pixels_current = modal_pixels_current[:, start:end]
@@ -332,13 +513,17 @@ def run_4d_pipeline_from_context(context):
                 modal_rgb_pixels = modal_rgb_pixels * 2 - 1
 
                 print("content completion by diffusion-vas ...")
+                decode_chunk_size = resolve_decode_chunk_size(
+                    context.runtime.get("completion_decode_chunk_size", 8),
+                    num_frames=max(1, end - start),
+                )
                 pred_amodal_rgb = context.pipeline_rgb(
                     modal_rgb_pixels,
                     pred_amodal_masks_tensor,
                     height=pred_res_hi[0],
                     width=pred_res_hi[1],
                     num_frames=end - start,
-                    decode_chunk_size=8,
+                    decode_chunk_size=decode_chunk_size,
                     motion_bucket_id=127,
                     fps=8,
                     noise_aug_strength=0.02,
@@ -355,13 +540,14 @@ def run_4d_pipeline_from_context(context):
                         for frame in pred_amodal_rgb
                     ]
                 )
-                frame_index = start
-                for image_rgb in pred_amodal_rgb_save:
-                    cv2.imwrite(
-                        os.path.join(completion_image_path, f"{frame_index:08d}.jpg"),
-                        cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR),
-                    )
-                    frame_index += 1
+                for frame_index, image_rgb in zip(range(start, end), pred_amodal_rgb_save):
+                    completion_cache[obj_id]["images"][frame_index] = image_rgb.copy()
+                    if persist_completion_artifacts:
+                        completion_image_path = idx_path[obj_id]["images"]
+                        cv2.imwrite(
+                            os.path.join(completion_image_path, f"{frame_index:08d}.jpg"),
+                            cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR),
+                        )
         else:
             for obj_id in context.runtime["out_obj_ids"]:
                 occ_dict[obj_id] = [1] * len(batch_masks)
@@ -374,7 +560,15 @@ def run_4d_pipeline_from_context(context):
             idx_dict,
             mhr_shape_scale_dict,
             occ_dict,
+            completion_cache=completion_cache,
+            mask_frames=batch_mask_frames,
+            image_cache=runtime_cache["image_frames"],
+            cam_int_cache=runtime_cache["cam_int"],
+            cam_int_cache_stats=runtime_cache["cam_int_stats"],
         )
+        progress_postfix = _format_cam_int_progress_postfix(runtime_cache["cam_int_stats"])
+        if progress_postfix:
+            progress.set_postfix_str(progress_postfix)
 
         num_empty_ids = 0
         for frame_id in range(len(batch_images)):
@@ -386,49 +580,100 @@ def run_4d_pipeline_from_context(context):
             else:
                 mask_output = mask_outputs[frame_id - num_empty_ids]
                 id_current = id_batch[frame_id - num_empty_ids]
-            image_bgr = cv2.imread(image_path)
-            render_all = visualize_sample_together(
-                image_bgr,
-                mask_output,
-                context.sam3_3d_body_model.faces,
-                id_current,
-            )
-            cv2.imwrite(
-                os.path.join(output_dir, "rendered_frames", f"{os.path.basename(image_path)[:-4]}.jpg"),
-                render_all.astype(np.uint8),
-            )
+            image_bgr = None
+            if save_rendered_frames or save_rendered_frames_individual or write_rendered_video_direct:
+                image_bgr = _load_bgr_image_cached(runtime_cache["image_frames"], image_path)
 
-            rendered_individual = visualize_sample(
-                image_bgr,
-                mask_output,
-                context.sam3_3d_body_model.faces,
-                id_current,
-            )
-            for render_index, rendered_image in enumerate(rendered_individual):
-                cv2.imwrite(
-                    os.path.join(
-                        output_dir,
-                        "rendered_frames_individual",
-                        str(render_index + 1),
-                        f"{os.path.basename(image_path)[:-4]}_{render_index + 1}.jpg",
-                    ),
-                    rendered_image.astype(np.uint8),
+            render_all = None
+            if save_rendered_frames or write_rendered_video_direct:
+                render_all = visualize_sample_together(
+                    image_bgr,
+                    mask_output,
+                    context.sam3_3d_body_model.faces,
+                    id_current,
+                    render_mode=render_mode,
+                    scene_bg_color=scene_bg_color,
                 )
+            if save_rendered_frames:
+                cv2.imwrite(
+                    os.path.join(output_dir, "rendered_frames", f"{os.path.basename(image_path)[:-4]}.jpg"),
+                    render_all.astype(np.uint8),
+                )
+            if write_rendered_video_direct:
+                if direct_video_writer is None:
+                    direct_video_writer = _open_video_writer(
+                        out_4d_path,
+                        render_all.shape,
+                        fps=context.runtime.get("video_fps", 25),
+                    )
+                direct_video_writer.write(render_all.astype(np.uint8))
+
+            if save_rendered_frames_individual:
+                rendered_individual = visualize_sample(
+                    image_bgr,
+                    mask_output,
+                    context.sam3_3d_body_model.faces,
+                    id_current,
+                    render_mode=render_mode,
+                    scene_bg_color=scene_bg_color,
+                )
+                for render_index, rendered_image in enumerate(rendered_individual):
+                    track_id = int(id_current[render_index]) if id_current and render_index < len(id_current) else render_index + 1
+                    cv2.imwrite(
+                        os.path.join(
+                            output_dir,
+                            "rendered_frames_individual",
+                            str(track_id),
+                            f"{os.path.basename(image_path)[:-4]}_{track_id}.jpg",
+                        ),
+                        rendered_image.astype(np.uint8),
+                    )
 
             frame_writer = getattr(context, "frame_writer", None)
             if callable(frame_writer):
                 frame_writer(image_path, mask_output, id_current)
 
-            save_mesh_results(
-                outputs=mask_output,
-                faces=context.sam3_3d_body_model.faces,
-                save_dir=os.path.join(output_dir, "mesh_4d_individual"),
-                focal_dir=os.path.join(output_dir, "focal_4d_individual"),
-                image_path=image_path,
-                id_current=id_current,
-            )
+            if save_mesh or save_focal:
+                save_mesh_results(
+                    outputs=mask_output,
+                    faces=context.sam3_3d_body_model.faces,
+                    save_dir=os.path.join(output_dir, "mesh_4d_individual"),
+                    focal_dir=os.path.join(output_dir, "focal_4d_individual"),
+                    image_path=image_path,
+                    id_current=id_current,
+                    save_mesh=save_mesh,
+                    save_focal=save_focal,
+                )
 
-    out_4d_path = os.path.join(output_dir, f"4d_{time.time():.0f}.mp4")
+    cam_int_hits = int(runtime_cache["cam_int_stats"].get("hits", 0))
+    cam_int_misses = int(runtime_cache["cam_int_stats"].get("misses", 0))
+    if cam_int_hits > 0 or cam_int_misses > 0:
+        print(f"cam_int cache: {cam_int_misses} misses, {cam_int_hits} hits")
+
+    frame_writer = getattr(context, "frame_writer", None)
+    finalize = getattr(frame_writer, "finalize", None)
+    if callable(finalize):
+        finalize()
+
+    if direct_video_writer is not None:
+        direct_video_writer.release()
+
+    if not save_rendered_video:
+        return None
+
+    if write_rendered_video_direct:
+        return out_4d_path
+
+    if not save_rendered_frames:
+        print(
+            "Skipping final 4D video export because save_rendered_frames is disabled "
+            "and save_rendered_video_direct is false."
+        )
+        return None
+
+    if out_4d_path is None:
+        return None
+
     jpg_folder_to_mp4(
         os.path.join(output_dir, "rendered_frames"),
         out_4d_path,

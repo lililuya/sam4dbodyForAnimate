@@ -7,12 +7,15 @@ from datetime import datetime, timezone
 from omegaconf import OmegaConf
 
 from scripts.app_4d_pipeline import build_4d_context, run_4d_pipeline_from_context
+from scripts.pose_json_export import write_pose_frame_exports
 from scripts.sam3_cache_contract import load_json, validate_cache_dir
 
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Run offline 4D from an exported SAM3 cache")
-    parser.add_argument("--cache_dir", required=True)
+    cache_input_group = parser.add_mutually_exclusive_group(required=True)
+    cache_input_group.add_argument("--cache_dir")
+    cache_input_group.add_argument("--cache_root")
     parser.add_argument("--output_root", default=None)
     parser.add_argument("--config", default=None)
     parser.add_argument("--overwrite", action="store_true")
@@ -25,15 +28,49 @@ def build_runtime_app(config_path):
     return OfflineApp(config_path=config_path)
 
 
-def build_cache_runtime(meta):
+def build_cache_runtime(meta, runtime_defaults=None):
     runtime_profile = meta.get("runtime_profile", {})
+    runtime_defaults = dict(runtime_defaults or {})
     return {
         "out_obj_ids": list(meta.get("obj_ids", [])),
-        "batch_size": int(runtime_profile.get("batch_size", 1)),
-        "detection_resolution": list(runtime_profile.get("detection_resolution", [256, 512])),
-        "completion_resolution": list(runtime_profile.get("completion_resolution", [512, 1024])),
-        "smpl_export": bool(runtime_profile.get("smpl_export", False)),
-        "video_fps": float(meta.get("fps", runtime_profile.get("fps", 0.0))),
+        "batch_size": int(runtime_profile.get("batch_size", runtime_defaults.get("batch_size", 1))),
+        "detection_resolution": list(
+            runtime_profile.get(
+                "detection_resolution",
+                runtime_defaults.get("detection_resolution", [192, 384]),
+            )
+        ),
+        "completion_resolution": list(
+            runtime_profile.get(
+                "completion_resolution",
+                runtime_defaults.get("completion_resolution", [256, 512]),
+            )
+        ),
+        "completion_batch_size": int(
+            runtime_profile.get(
+                "completion_batch_size",
+                runtime_defaults.get("completion_batch_size", 1),
+            )
+        ),
+        "completion_decode_chunk_size": int(
+            runtime_profile.get(
+                "completion_decode_chunk_size",
+                runtime_defaults.get("completion_decode_chunk_size", 8),
+            )
+        ),
+        "max_occ_len": int(
+            runtime_profile.get(
+                "max_occ_len",
+                runtime_defaults.get("max_occ_len", 8),
+            )
+        ),
+        "smpl_export": bool(runtime_profile.get("smpl_export", runtime_defaults.get("smpl_export", False))),
+        "video_fps": float(
+            meta.get(
+                "fps",
+                runtime_profile.get("fps", runtime_defaults.get("video_fps", 0.0)),
+            )
+        ),
     }
 
 
@@ -75,6 +112,21 @@ def discover_cache_dirs(root_dir, require_meta=True):
     return cache_dirs
 
 
+def build_pose_frame_writer(output_dir):
+    def frame_writer(image_path, mask_output, id_current):
+        if not mask_output or not id_current:
+            return {"openpose": [], "smpl": []}
+        frame_stem = os.path.splitext(os.path.basename(image_path))[0]
+        return write_pose_frame_exports(
+            output_dir=output_dir,
+            frame_stem=frame_stem,
+            person_outputs=mask_output,
+            track_ids=id_current,
+        )
+
+    return frame_writer
+
+
 def run_cache_sample(*, cache_dir, output_root=None, overwrite=False, config_path=None):
     cache_dir = os.path.abspath(cache_dir)
     ok, errors = validate_cache_dir(cache_dir)
@@ -96,13 +148,14 @@ def run_cache_sample(*, cache_dir, output_root=None, overwrite=False, config_pat
         context = build_4d_context(
             input_dir=cache_dir,
             output_dir=sample_output_dir,
-            runtime=build_cache_runtime(meta),
+            runtime=build_cache_runtime(meta, runtime_defaults=getattr(runtime_app, "RUNTIME", {})),
             sam3_3d_body_model=runtime_app.sam3_3d_body_model,
             pipeline_mask=getattr(runtime_app, "pipeline_mask", None),
             pipeline_rgb=getattr(runtime_app, "pipeline_rgb", None),
             depth_model=getattr(runtime_app, "depth_model", None),
             predictor=getattr(runtime_app, "predictor", None),
             generator=getattr(runtime_app, "generator", None),
+            frame_writer=build_pose_frame_writer(sample_output_dir),
         )
         out_path = run_4d_pipeline_from_context(context)
         write_run_summary(
@@ -159,6 +212,15 @@ def run_cache_batch(root_dir, *, output_root=None, overwrite=False, config_path=
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    if args.cache_root is not None:
+        run_cache_batch(
+            args.cache_root,
+            output_root=args.output_root,
+            overwrite=args.overwrite,
+            config_path=args.config,
+        )
+        return
+
     run_cache_sample(
         cache_dir=args.cache_dir,
         output_root=args.output_root,

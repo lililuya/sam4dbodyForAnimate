@@ -102,6 +102,9 @@ def build_runtime_export_state(runtime):
             "batch_size": int(runtime.get("batch_size", 1)),
             "detection_resolution": list(runtime.get("detection_resolution", [])),
             "completion_resolution": list(runtime.get("completion_resolution", [])),
+            "completion_batch_size": int(runtime.get("completion_batch_size", 1)),
+            "completion_decode_chunk_size": int(runtime.get("completion_decode_chunk_size", 1)),
+            "max_occ_len": int(runtime.get("max_occ_len", 0)),
             "smpl_export": bool(runtime.get("smpl_export", False)),
             "fps": float(runtime.get("video_fps", 0.0)),
         },
@@ -199,3 +202,17 @@ def export_sam3_cache(
         shutil.rmtree(staging_dir, ignore_errors=True)
         raise
     return cache_dir
+
+
+def export_session_cache(*, runtime, video_path, output_dir, output_root, config_path):
+    ensure_sam3_export_ready(runtime=runtime, video_path=video_path, output_dir=output_dir)
+    cache_root = os.path.join(output_root, "sam3_cache")
+    sample_id = os.path.basename(os.path.normpath(output_dir))
+    return export_sam3_cache(
+        working_dir=output_dir,
+        cache_root=cache_root,
+        sample_id=sample_id,
+        source_video=video_path,
+        runtime=runtime,
+        config_path=config_path,
+    )

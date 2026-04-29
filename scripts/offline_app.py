@@ -29,6 +29,10 @@ from tqdm import tqdm
 from omegaconf import OmegaConf
 
 from scripts.app_4d_pipeline import build_4d_context, run_4d_pipeline_from_context
+from scripts.completion_safety import resolve_completion_batch_size, resolve_decode_chunk_size
+from scripts.offline_tracking_compat import unpack_propagate_output
+from scripts.pose_json_export import build_pose_frame_writer
+from scripts.wan_sample_export import CompositeFrameWriter, WanSampleExporter
 from utils import draw_point_marker, mask_painter, images_to_mp4, DAVIS_PALETTE, jpg_folder_to_mp4, is_super_long_or_wide, keep_largest_component, is_skinny_mask, bbox_from_mask, gpu_profile, resize_mask_with_unique_label
 from scripts.offline_completion_indexing import build_completion_window_from_ious
 
@@ -87,7 +91,7 @@ def read_frame_at(path: str, idx: int):
     return Image.fromarray(frame)
 
 
-def build_sam3_3d_body_config(cfg):
+def build_sam3_3d_body_config(cfg, *, load_default_detector: bool = True):
     mhr_path = cfg.sam_3d_body['mhr_path']
     fov_path = cfg.sam_3d_body['fov_path']
     detector_path = cfg.sam_3d_body['detector_path']
@@ -99,8 +103,10 @@ def build_sam3_3d_body_config(cfg):
     human_detector, human_segmentor, fov_estimator = None, None, None
     from models.sam_3d_body.tools.build_fov_estimator import FOVEstimator
     fov_estimator = FOVEstimator(name='moge2', device=device, path=fov_path)
-    from models.sam_3d_body.tools.build_detector import HumanDetector
-    human_detector = HumanDetector(name="vitdet", device=device, path=detector_path)
+    if bool(load_default_detector):
+        from models.sam_3d_body.tools.build_detector import HumanDetector
+
+        human_detector = HumanDetector(name="vitdet", device=device, path=detector_path)
 
     estimator = SAM3DBodyEstimator(
         sam_3d_body_model=model,
@@ -118,7 +124,12 @@ def build_diffusion_vas_config(cfg):
     model_path_rgb = cfg.completion['model_path_rgb']
     depth_encoder = cfg.completion['depth_encoder']
     model_path_depth = cfg.completion['model_path_depth']
-    max_occ_len = min(cfg.completion['max_occ_len'], cfg.sam_3d_body['batch_size'])
+    completion_batch_size = resolve_completion_batch_size(cfg.completion.get('batch_size', 1))
+    decode_chunk_size = resolve_decode_chunk_size(
+        cfg.completion.get('decode_chunk_size', 2),
+        num_frames=max(1, cfg.completion.get('max_occ_len', 8)),
+    )
+    max_occ_len = max(1, int(cfg.completion.get('max_occ_len', 8)))
 
     generator = torch.manual_seed(23)
 
@@ -126,28 +137,94 @@ def build_diffusion_vas_config(cfg):
     pipeline_rgb = init_rgb_model(model_path_rgb)
     depth_model = init_depth_model(model_path_depth, depth_encoder)
 
-    return pipeline_mask, pipeline_rgb, depth_model, max_occ_len, generator
+    return (
+        pipeline_mask,
+        pipeline_rgb,
+        depth_model,
+        max_occ_len,
+        generator,
+        completion_batch_size,
+        decode_chunk_size,
+    )
+
+
+def _runtime_bool(cfg, path, default):
+    try:
+        value = OmegaConf.select(cfg, path, default=default)
+    except Exception:
+        value = default
+    return bool(default if value is None else value)
+
+
+def _runtime_list(cfg, path, default=None):
+    default = list(default or [])
+    try:
+        value = OmegaConf.select(cfg, path, default=default)
+    except Exception:
+        value = default
+    if value is None:
+        return list(default)
+    if isinstance(value, str):
+        return [value]
+    return list(value)
 
 
 class OfflineApp:
-    def __init__(self, config_path: str = os.path.join(ROOT, "configs", "body4d.yaml")):
+    def __init__(
+        self,
+        config_path: str = os.path.join(ROOT, "configs", "body4d.yaml"),
+        *,
+        load_default_detector: bool = True,
+    ):
         """Initialize CONFIG, SAM3_MODEL, and global RUNTIME dict."""
         self.CONFIG = OmegaConf.load(config_path)
         self.sam3_model, self.predictor = build_sam3_from_config(self.CONFIG)
-        self.sam3_3d_body_model = build_sam3_3d_body_config(self.CONFIG)
+        self.sam3_3d_body_model = build_sam3_3d_body_config(
+            self.CONFIG,
+            load_default_detector=load_default_detector,
+        )
 
         if self.CONFIG.completion.get('enable', False):
-            self.pipeline_mask, self.pipeline_rgb, self.depth_model, self.max_occ_len, self.generator = build_diffusion_vas_config(self.CONFIG)
+            (
+                self.pipeline_mask,
+                self.pipeline_rgb,
+                self.depth_model,
+                self.max_occ_len,
+                self.generator,
+                self.completion_batch_size,
+                self.completion_decode_chunk_size,
+            ) = build_diffusion_vas_config(self.CONFIG)
         else:
             self.pipeline_mask, self.pipeline_rgb, self.depth_model, self.max_occ_len, self.generator = None, None, None, None, None
+            self.completion_batch_size, self.completion_decode_chunk_size = 1, 1
         
         self.RUNTIME = {}  # clear any old state
         self.OUTPUT_DIR = os.path.join(self.CONFIG.runtime['output_dir'], gen_id())
         os.makedirs(self.OUTPUT_DIR, exist_ok=True)
         self.RUNTIME['batch_size'] = self.CONFIG.sam_3d_body.get('batch_size', 1)
-        self.RUNTIME['detection_resolution'] = self.CONFIG.completion.get('detection_resolution', [256, 512])
-        self.RUNTIME['completion_resolution'] = self.CONFIG.completion.get('completion_resolution', [512, 1024])
+        self.RUNTIME['detection_resolution'] = self.CONFIG.completion.get('detection_resolution', [192, 384])
+        self.RUNTIME['completion_resolution'] = self.CONFIG.completion.get('completion_resolution', [256, 512])
+        self.RUNTIME['completion_batch_size'] = self.completion_batch_size
+        self.RUNTIME['completion_decode_chunk_size'] = self.completion_decode_chunk_size
+        self.RUNTIME['max_occ_len'] = int(self.max_occ_len) if self.max_occ_len is not None else int(self.CONFIG.completion.get('max_occ_len', 0) or 0)
         self.RUNTIME['smpl_export'] = self.CONFIG.runtime.get('smpl_export', False)
+        self.RUNTIME['pose_exports'] = _runtime_list(self.CONFIG, "runtime.pose_exports", [])
+        self.RUNTIME['save_rendered_frames'] = _runtime_bool(self.CONFIG, "runtime.save_rendered_frames", True)
+        self.RUNTIME['save_rendered_frames_individual'] = _runtime_bool(
+            self.CONFIG,
+            "runtime.save_rendered_frames_individual",
+            True,
+        )
+        self.RUNTIME['save_mesh_4d_individual'] = _runtime_bool(
+            self.CONFIG,
+            "runtime.save_mesh_4d_individual",
+            True,
+        )
+        self.RUNTIME['save_focal_4d_individual'] = _runtime_bool(
+            self.CONFIG,
+            "runtime.save_focal_4d_individual",
+            True,
+        )
         self.RUNTIME['bboxes'] = None
 
     def on_mask_generation(self, video_path: str=None, start_frame_idx: int = 0, max_frame_num_to_track: int = 1800):
@@ -159,13 +236,14 @@ class OfflineApp:
 
         # run propagation throughout the video and collect the results in a dict
         video_segments = {}  # video_segments contains the per-frame segmentation results
-        for frame_idx, obj_ids, low_res_masks, video_res_masks, obj_scores, iou_scores in self.predictor.propagate_in_video(
+        for propagate_output in self.predictor.propagate_in_video(
             self.RUNTIME['inference_state'],
             start_frame_idx=0,
             max_frame_num_to_track=max_frame_num_to_track,
             reverse=False,
             propagate_preflight=True,
         ):
+            frame_idx, obj_ids, low_res_masks, video_res_masks = unpack_propagate_output(propagate_output)
             video_segments[frame_idx] = {
                 out_obj_id: (video_res_masks[i] > 0.0).cpu().numpy()
                 for i, out_obj_id in enumerate(self.RUNTIME['out_obj_ids'])
@@ -213,6 +291,30 @@ class OfflineApp:
         return out_video_path
 
     def on_4d_generation(self, video_path: str=None):
+        export_formats = list(self.RUNTIME.get("pose_exports", []))
+        if not export_formats and bool(self.RUNTIME.get("smpl_export", False)):
+            export_formats = ["openpose", "smpl"]
+
+        pose_writer = build_pose_frame_writer(output_dir=self.OUTPUT_DIR, export_formats=export_formats)
+        wan_cfg = dict(self.RUNTIME.get("wan_export", {}) or {})
+        wan_writer = None
+        if bool(wan_cfg.get("enable", False)):
+            wan_writer = WanSampleExporter(
+                sample_id=os.path.basename(os.path.abspath(self.OUTPUT_DIR)),
+                output_dir=self.OUTPUT_DIR,
+                images_dir=os.path.join(self.OUTPUT_DIR, "images"),
+                masks_dir=os.path.join(self.OUTPUT_DIR, "masks"),
+                source_video_path=video_path,
+                config=wan_cfg,
+                sample_uuid=wan_cfg.get("sample_uuid"),
+                clip_id=wan_cfg.get("clip_id"),
+                source_reference=wan_cfg.get("source_path"),
+                mesh_faces=getattr(self.sam3_3d_body_model, "faces", None),
+            )
+        frame_writer = None
+        if pose_writer is not None or wan_writer is not None:
+            frame_writer = CompositeFrameWriter([pose_writer, wan_writer])
+
         context = build_4d_context(
             input_dir=self.OUTPUT_DIR,
             output_dir=self.OUTPUT_DIR,
@@ -223,6 +325,7 @@ class OfflineApp:
             depth_model=self.depth_model,
             predictor=self.predictor,
             generator=self.generator,
+            frame_writer=frame_writer,
         )
         return run_4d_pipeline_from_context(context)
 

@@ -300,6 +300,119 @@ class Renderer:
 
         return output_img.astype(np.float32)
 
+    def _build_normal_colored_trimesh(
+        self,
+        vertices: np.ndarray,
+        *,
+        side_view: bool = False,
+        top_view: bool = False,
+        rot_angle: float = 90,
+    ) -> trimesh.Trimesh:
+        mesh = trimesh.Trimesh(
+            vertices=vertices.copy(),
+            faces=self.faces.copy(),
+            process=False,
+        )
+
+        if side_view:
+            rot = trimesh.transformations.rotation_matrix(
+                np.radians(rot_angle), [0, 1, 0]
+            )
+            mesh.apply_transform(rot)
+        elif top_view:
+            rot = trimesh.transformations.rotation_matrix(
+                np.radians(rot_angle), [1, 0, 0]
+            )
+            mesh.apply_transform(rot)
+
+        rot = trimesh.transformations.rotation_matrix(np.radians(180), [1, 0, 0])
+        mesh.apply_transform(rot)
+
+        normals = np.asarray(mesh.vertex_normals, dtype=np.float32)
+        normal_norm = np.linalg.norm(normals, axis=1, keepdims=True)
+        normals = normals / np.clip(normal_norm, 1e-6, None)
+        colors_rgb = np.clip((normals + 1.0) * 0.5, 0.0, 1.0)
+        colors_bgr = colors_rgb[:, ::-1]
+        colors_rgba = np.concatenate(
+            [colors_bgr, np.ones((colors_bgr.shape[0], 1), dtype=np.float32)],
+            axis=1,
+        )
+        mesh.visual.vertex_colors = (colors_rgba * 255.0).astype(np.uint8)
+        return mesh
+
+    def render_normals(
+        self,
+        vertices: np.array,
+        cam_t: np.array,
+        image: np.ndarray,
+        full_frame: bool = False,
+        imgname: Optional[str] = None,
+        side_view: bool = False,
+        top_view: bool = False,
+        rot_angle: float = 90,
+        scene_bg_color=(0, 0, 0),
+        return_rgba: bool = False,
+        camera_center=None,
+    ) -> np.array:
+        if full_frame:
+            image = cv2.imread(imgname).astype(np.float32)
+        image = image / 255.0
+        h, w = image.shape[:2]
+
+        renderer = pyrender.OffscreenRenderer(
+            viewport_height=h,
+            viewport_width=w,
+        )
+
+        camera_translation = cam_t.copy()
+        camera_translation[0] *= -1.0
+
+        mesh = self._build_normal_colored_trimesh(
+            vertices,
+            side_view=side_view,
+            top_view=top_view,
+            rot_angle=rot_angle,
+        )
+        mesh = pyrender.Mesh.from_trimesh(mesh, smooth=True)
+
+        scene = pyrender.Scene(
+            bg_color=[*scene_bg_color, 0.0],
+            ambient_light=(1.0, 1.0, 1.0),
+        )
+        scene.add(mesh, "mesh")
+
+        camera_pose = np.eye(4)
+        camera_pose[:3, 3] = camera_translation
+
+        if camera_center is None:
+            camera_center = [image.shape[1] / 2.0, image.shape[0] / 2.0]
+
+        camera = pyrender.IntrinsicsCamera(
+            fx=self.focal_length,
+            fy=self.focal_length,
+            cx=camera_center[0],
+            cy=camera_center[1],
+            zfar=1e12,
+        )
+        scene.add(camera, pose=camera_pose)
+
+        color, _rend_depth = renderer.render(
+            scene, flags=pyrender.RenderFlags.RGBA
+        )
+        color = color.astype(np.float32) / 255.0
+        renderer.delete()
+
+        if return_rgba:
+            return color
+
+        valid_mask = (color[:, :, -1])[:, :, np.newaxis]
+        background = np.zeros_like(color[:, :, :3])
+        background[:, :, 0] = float(scene_bg_color[0])
+        background[:, :, 1] = float(scene_bg_color[1])
+        background[:, :, 2] = float(scene_bg_color[2])
+        output_img = color[:, :, :3] * valid_mask + background * (1 - valid_mask)
+        return output_img.astype(np.float32)
+
 
     def vertices_to_trimesh(
         self,
