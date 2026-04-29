@@ -31,6 +31,9 @@ PANEL_ORDER = [
     "blank",
 ]
 FPS_TOLERANCE = 1e-3
+DEFAULT_OUTPUT_CRF = 20
+DEFAULT_OUTPUT_PRESET = "slow"
+DEFAULT_OUTPUT_PIXEL_FORMAT = "yuv420p"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,6 +41,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", type=str, required=True, help="Path to one exported target directory")
     parser.add_argument("--output", type=str, default=None, help="Optional output mp4 path")
     parser.add_argument("--overlay-alpha", type=float, default=0.5, help="Overlay blend alpha for 4d over target")
+    parser.add_argument(
+        "--crf",
+        type=int,
+        default=DEFAULT_OUTPUT_CRF,
+        help="libx264 CRF quality level for the stitched mp4 output (lower is higher quality, larger file)",
+    )
     return parser
 
 
@@ -190,7 +199,7 @@ def compose_grid_frame(named_tiles: dict[str, np.ndarray]) -> np.ndarray:
     return np.concatenate(rows, axis=0)
 
 
-def encode_frames_to_mp4(frames_dir: str, fps: float, output_path: str) -> None:
+def encode_frames_to_mp4(frames_dir: str, fps: float, output_path: str, crf: int = DEFAULT_OUTPUT_CRF) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     input_pattern = os.path.join(os.path.abspath(frames_dir), "frame_%08d.png")
     command = [
@@ -205,9 +214,13 @@ def encode_frames_to_mp4(frames_dir: str, fps: float, output_path: str) -> None:
         "-c:v",
         "libx264",
         "-preset",
-        "veryslow",
+        DEFAULT_OUTPUT_PRESET,
+        "-pix_fmt",
+        DEFAULT_OUTPUT_PIXEL_FORMAT,
+        "-movflags",
+        "+faststart",
         "-crf",
-        "0",
+        str(int(crf)),
         os.path.abspath(output_path),
     ]
     subprocess.run(command, check=True)
@@ -249,7 +262,12 @@ def _normalize_panel_frame(
     return annotate_frame(padded, panel_name, frame_index)
 
 
-def build_comparison_video(sample_dir: str, output_path: str, overlay_alpha: float = 0.5) -> str:
+def build_comparison_video(
+    sample_dir: str,
+    output_path: str,
+    overlay_alpha: float = 0.5,
+    crf: int = DEFAULT_OUTPUT_CRF,
+) -> str:
     resolved = resolve_input_videos(sample_dir)
     panel_infos: dict[str, dict] = {
         "target": load_video_info(str(resolved["target"])),
@@ -331,7 +349,7 @@ def build_comparison_video(sample_dir: str, output_path: str, overlay_alpha: flo
                 if not cv2.imwrite(frame_path, cv2.cvtColor(grid_frame, cv2.COLOR_RGB2BGR)):
                     raise RuntimeError(f"failed to write temporary comparison frame: {frame_path}")
 
-            encode_frames_to_mp4(temp_dir, fps=float(target_info["fps"]), output_path=output_path)
+            encode_frames_to_mp4(temp_dir, fps=float(target_info["fps"]), output_path=output_path, crf=int(crf))
     finally:
         for capture in captures.values():
             if capture is not None:
@@ -349,6 +367,7 @@ def main(argv: list[str] | None = None) -> str:
         sample_dir=sample_dir,
         output_path=output_path,
         overlay_alpha=float(args.overlay_alpha),
+        crf=int(args.crf),
     )
 
 

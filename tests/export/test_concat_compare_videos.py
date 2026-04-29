@@ -191,7 +191,7 @@ class CompareVideoHelpersTests(unittest.TestCase):
         self.assertEqual(written_frame.shape[:2], (512 * 3, 832 * 3))
         mock_encode.assert_called_once()
 
-    def test_encode_frames_to_mp4_invokes_ffmpeg_with_libx264(self):
+    def test_encode_frames_to_mp4_uses_quality_controlled_h264_defaults(self):
         from verify_output.concat_compare_videos import encode_frames_to_mp4
 
         with patch("verify_output.concat_compare_videos.subprocess.run") as mock_run:
@@ -204,6 +204,25 @@ class CompareVideoHelpersTests(unittest.TestCase):
         command = mock_run.call_args.args[0]
         self.assertIn("ffmpeg", command[0].lower())
         self.assertIn("libx264", command)
+        self.assertIn("yuv420p", command)
+        self.assertIn("+faststart", command)
+        self.assertIn("20", command)
+        self.assertNotIn("0", command)
+
+    def test_encode_frames_to_mp4_accepts_custom_crf(self):
+        from verify_output.concat_compare_videos import encode_frames_to_mp4
+
+        with patch("verify_output.concat_compare_videos.subprocess.run") as mock_run:
+            encode_frames_to_mp4(
+                frames_dir="frames_dir",
+                fps=25.0,
+                output_path="out.mp4",
+                crf=16,
+            )
+
+        command = mock_run.call_args.args[0]
+        crf_index = command.index("-crf")
+        self.assertEqual(command[crf_index + 1], "16")
 
     def test_main_writes_compare_video_to_verify_output(self):
         from verify_output import concat_compare_videos
@@ -236,6 +255,20 @@ class CompareVideoHelpersTests(unittest.TestCase):
 
         output_path = mock_build.call_args.kwargs["output_path"]
         self.assertEqual(output_path, os.path.abspath(output_stem) + ".mp4")
+
+    def test_main_forwards_custom_crf(self):
+        from verify_output import concat_compare_videos
+
+        with make_workspace_tempdir() as tmpdir:
+            sample_dir = os.path.join(tmpdir, "sample_target1")
+            os.makedirs(sample_dir, exist_ok=True)
+            for name in ("target.mp4", "4d.mp4"):
+                open(os.path.join(sample_dir, name), "wb").close()
+
+            with patch.object(concat_compare_videos, "build_comparison_video") as mock_build:
+                concat_compare_videos.main(["--input", sample_dir, "--crf", "16"])
+
+        self.assertEqual(mock_build.call_args.kwargs["crf"], 16)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ Run:
 ```bash
 python verify_output/concat_compare_videos.py --input path/to/sample_target1
 python verify_output/concat_compare_videos.py --input path/to/sample_target1 --output path/to/result
+python verify_output/concat_compare_videos.py --input path/to/sample_target1 --crf 16
 ```
 
 This writes:
@@ -34,3 +35,9 @@ Optional context panels:
 - the largest width/height among available panels defines the tile size
 - smaller panels are center-padded on a black canvas
 - no panel is resized, so source detail is preserved
+
+## Output Encoding
+
+- default export uses `libx264` with `--crf 20`
+- lower `--crf` means higher quality and larger files, for example `--crf 16`
+- higher `--crf` means smaller files, for example `--crf 22`
