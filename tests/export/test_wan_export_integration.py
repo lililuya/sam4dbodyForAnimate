@@ -1,12 +1,26 @@
 import os
 import shutil
-import tempfile
 import unittest
+import uuid
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 from omegaconf import OmegaConf
 from PIL import Image
+
+
+@contextmanager
+def make_workspace_tempdir():
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    base_dir = os.path.join(repo_root, ".tmp_export_tests")
+    os.makedirs(base_dir, exist_ok=True)
+    temp_dir = os.path.join(base_dir, f"run_{uuid.uuid4().hex}")
+    os.makedirs(temp_dir, exist_ok=True)
+    try:
+        yield temp_dir
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 class WanExportIntegrationTests(unittest.TestCase):
@@ -61,8 +75,7 @@ class WanExportIntegrationTests(unittest.TestCase):
                 self.finalized += 1
                 return []
 
-        temp_dir = tempfile.mkdtemp(prefix="wan_export_integration_")
-        try:
+        with make_workspace_tempdir() as temp_dir:
             input_dir = os.path.join(temp_dir, "cache")
             output_dir = os.path.join(temp_dir, "outputs_4d", "demo")
             os.makedirs(os.path.join(input_dir, "images"), exist_ok=True)
@@ -119,8 +132,6 @@ class WanExportIntegrationTests(unittest.TestCase):
 
             self.assertEqual(writer.calls, 1)
             self.assertEqual(writer.finalized, 1)
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
