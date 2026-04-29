@@ -25,7 +25,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.append(ROOT)
 
-from scripts.detector_defaults import resolve_detector_runtime_options
+from scripts.detector_defaults import resolve_detector_runtime_options, run_human_detection_compat
 from scripts.offline_reprompt import match_detection_to_track, should_trigger_reprompt
 
 
@@ -163,6 +163,8 @@ def build_runtime_storage_options(cfg) -> Dict[str, object]:
         "save_rendered_frames_individual": bool(cfg_get(cfg, "runtime.save_rendered_frames_individual", True)),
         "save_mesh_4d_individual": bool(cfg_get(cfg, "runtime.save_mesh_4d_individual", True)),
         "save_focal_4d_individual": bool(cfg_get(cfg, "runtime.save_focal_4d_individual", True)),
+        "render_mode": str(cfg_get(cfg, "runtime.render_mode", "normal")),
+        "render_scene_bg_color": list(cfg_get(cfg, "runtime.render_scene_bg_color", [0, 0, 0]) or [0, 0, 0]),
         "pose_exports": list(cfg_get(cfg, "runtime.pose_exports", []) or []),
         "wan_export": to_plain_runtime_dict(cfg_get(cfg, "wan_export", {})),
     }
@@ -354,6 +356,27 @@ def mask_bbox_xyxy(binary_mask: np.ndarray):
     y_min, x_min = coords.min(axis=0)
     y_max, x_max = coords.max(axis=0)
     return [float(x_min), float(y_min), float(x_max), float(y_max)]
+
+
+def bbox_iou_xyxy(a, b) -> float:
+    if a is None or b is None:
+        return 0.0
+
+    ax1, ay1, ax2, ay2 = (float(value) for value in a[:4])
+    bx1, by1, bx2, by2 = (float(value) for value in b[:4])
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter_area
+    if union <= 0.0:
+        return 0.0
+    return float(inter_area / union)
 
 
 def normalize_detection_outputs(outputs) -> Optional[List[dict]]:
@@ -688,7 +711,7 @@ class RefinedOfflineApp:
         self.sample_summary["wan_summary_key"] = summary_identity
         return sample_uuid, metadata_root
 
-    def _load_wan_exported_target_dirs(self, summary_identity: Optional[str], wan_export_root: Optional[str]) -> list[str]:
+    def _load_wan_exported_target_records(self, summary_identity: Optional[str], wan_export_root: Optional[str]) -> list[dict]:
         if not summary_identity or not wan_export_root:
             return []
 
@@ -708,22 +731,175 @@ class RefinedOfflineApp:
         if not isinstance(exported_targets, list):
             return []
 
-        target_dirs: list[str] = []
+        target_records: list[dict] = []
         for target in exported_targets:
             if not isinstance(target, dict):
                 continue
             sample_dir = str(target.get("sample_dir", "")).strip()
             if not sample_dir:
                 continue
-            target_dirs.append(os.path.abspath(sample_dir))
-        return target_dirs
+            normalized = dict(target)
+            normalized["sample_dir"] = os.path.abspath(sample_dir)
+            target_records.append(normalized)
+        return target_records
 
-    def _copy_rendered_4d_to_wan_targets(self, final_4d_path: Optional[str], target_dirs: list[str]) -> None:
-        if not final_4d_path or not os.path.isfile(final_4d_path):
+    def _load_video_info(self, video_path: str) -> Optional[dict]:
+        capture = cv2.VideoCapture(video_path)
+        try:
+            if not capture.isOpened():
+                return None
+            width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+            frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        finally:
+            capture.release()
+        return {
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "frame_count": frame_count,
+        }
+
+    def _find_rendered_frame_path(self, rendered_frames_dir: str, frame_stem: str) -> Optional[str]:
+        for extension in VALID_IMAGE_EXTENSIONS:
+            candidate = os.path.join(rendered_frames_dir, f"{frame_stem}{extension}")
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    def _parse_frame_stem_index(self, frame_stem: str) -> int:
+        normalized = os.path.splitext(os.path.basename(str(frame_stem)))[0]
+        try:
+            return int(normalized)
+        except ValueError as exc:
+            raise ValueError(f"frame_stem is not a numeric frame index: {frame_stem}") from exc
+
+    def _open_video_writer(self, output_path: str, width: int, height: int, fps: float):
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        writer = cv2.VideoWriter(
+            output_path,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            float(fps),
+            (int(width), int(height)),
+        )
+        if hasattr(writer, "isOpened") and not writer.isOpened():
+            raise RuntimeError(f"failed to open video writer: {output_path}")
+        return writer
+
+    def _extract_video_frame_by_index(self, capture, frame_index: int, cache: dict[int, np.ndarray]) -> np.ndarray:
+        if int(frame_index) in cache:
+            return np.array(cache[int(frame_index)], copy=True)
+
+        capture.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+        ok, frame_bgr = capture.read()
+        if not ok or frame_bgr is None:
+            raise RuntimeError(f"failed to read 4D frame at index {frame_index}")
+        cache[int(frame_index)] = np.array(frame_bgr, copy=True)
+        return frame_bgr
+
+    def _write_target_aligned_4d_video(
+        self,
+        *,
+        sample_output_dir: Optional[str],
+        final_4d_path: Optional[str],
+        target_record: dict,
+    ) -> None:
+        target_dir = os.path.abspath(str(target_record.get("sample_dir", "")).strip())
+        if not target_dir:
             return
-        for target_dir in target_dirs:
-            os.makedirs(target_dir, exist_ok=True)
-            shutil.copy2(final_4d_path, os.path.join(target_dir, "4d.mp4"))
+
+        frame_stems = [str(item) for item in list(target_record.get("frame_stems") or []) if str(item).strip()]
+        output_path = os.path.join(target_dir, "4d.mp4")
+        target_video_path = os.path.join(target_dir, "target.mp4")
+
+        if not frame_stems:
+            if final_4d_path and os.path.isfile(final_4d_path):
+                os.makedirs(target_dir, exist_ok=True)
+                shutil.copy2(final_4d_path, output_path)
+            return
+
+        target_info = self._load_video_info(target_video_path)
+        if target_info is None:
+            raise FileNotFoundError(f"missing target video for aligned 4D export: {target_video_path}")
+        target_width = int(target_info["width"] or 0)
+        target_height = int(target_info["height"] or 0)
+        target_fps = float(target_info["fps"] or 0.0)
+        target_frame_count = int(target_info["frame_count"] or 0)
+        if target_width <= 0 or target_height <= 0:
+            raise RuntimeError(f"invalid target video resolution: {target_video_path}")
+        if target_fps <= 0:
+            target_fps = float(target_record.get("fps", 25) or 25)
+        if target_frame_count > 0 and target_frame_count != len(frame_stems):
+            raise RuntimeError(
+                f"target frame count mismatch for {target_dir}: target.mp4 has {target_frame_count} frames "
+                f"but exported target metadata expects {len(frame_stems)}"
+            )
+
+        rendered_frames_dir = None
+        if sample_output_dir:
+            candidate_dir = os.path.join(sample_output_dir, "rendered_frames")
+            if os.path.isdir(candidate_dir):
+                rendered_frames_dir = candidate_dir
+
+        writer = self._open_video_writer(output_path, target_width, target_height, target_fps)
+        frames_written = 0
+        try:
+            if rendered_frames_dir:
+                for frame_stem in frame_stems:
+                    frame_path = self._find_rendered_frame_path(rendered_frames_dir, frame_stem)
+                    if not frame_path:
+                        raise FileNotFoundError(
+                            f"missing rendered 4D frame for target-aligned export: {frame_stem} under {rendered_frames_dir}"
+                        )
+                    frame_bgr = cv2.imread(frame_path, cv2.IMREAD_COLOR)
+                    if frame_bgr is None:
+                        raise RuntimeError(f"failed to read rendered 4D frame: {frame_path}")
+                    if frame_bgr.shape[1] != target_width or frame_bgr.shape[0] != target_height:
+                        frame_bgr = cv2.resize(frame_bgr, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+                    writer.write(frame_bgr)
+                    frames_written += 1
+            else:
+                if not final_4d_path or not os.path.isfile(final_4d_path):
+                    raise FileNotFoundError(
+                        f"unable to build target-aligned 4D video for {target_dir}: missing rendered_frames and final 4D video"
+                    )
+                capture = cv2.VideoCapture(final_4d_path)
+                frame_cache: dict[int, np.ndarray] = {}
+                try:
+                    if not capture.isOpened():
+                        raise RuntimeError(f"failed to open 4D video for target-aligned export: {final_4d_path}")
+                    for frame_stem in frame_stems:
+                        frame_index = self._parse_frame_stem_index(frame_stem)
+                        frame_bgr = self._extract_video_frame_by_index(capture, frame_index, frame_cache)
+                        if frame_bgr.shape[1] != target_width or frame_bgr.shape[0] != target_height:
+                            frame_bgr = cv2.resize(frame_bgr, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+                        writer.write(frame_bgr)
+                        frames_written += 1
+                finally:
+                    capture.release()
+        finally:
+            writer.release()
+
+        if frames_written != len(frame_stems):
+            raise RuntimeError(
+                f"aligned 4D export wrote {frames_written} frames for {target_dir}, expected {len(frame_stems)}"
+            )
+
+    def _copy_rendered_4d_to_wan_targets(
+        self,
+        final_4d_path: Optional[str],
+        target_records: list[dict],
+        sample_output_dir: Optional[str],
+    ) -> None:
+        if not target_records:
+            return
+        for target_record in target_records:
+            self._write_target_aligned_4d_video(
+                sample_output_dir=sample_output_dir,
+                final_4d_path=final_4d_path,
+                target_record=target_record,
+            )
 
     def _cleanup_sample_workdir_after_export(self, sample_output_dir: Optional[str]) -> None:
         if not sample_output_dir or not os.path.isdir(sample_output_dir):
@@ -764,15 +940,19 @@ class RefinedOfflineApp:
         if not bool(wan_cfg.enable):
             return []
 
-        target_dirs = self._load_wan_exported_target_dirs(summary_identity, wan_export_root)
-        if not target_dirs:
+        target_records = self._load_wan_exported_target_records(summary_identity, wan_export_root)
+        if not target_records:
             return []
 
         if bool(wan_cfg.copy_rendered_4d_to_targets):
-            self._copy_rendered_4d_to_wan_targets(final_4d_path, target_dirs)
+            self._copy_rendered_4d_to_wan_targets(
+                final_4d_path,
+                target_records,
+                sample_output_dir=sample_output_dir,
+            )
         if bool(wan_cfg.cleanup_sample_workdir_after_export):
             self._cleanup_sample_workdir_after_export(sample_output_dir)
-        return target_dirs
+        return [str(record["sample_dir"]) for record in target_records]
 
     def _persist_sample_runtime(
         self,
@@ -816,7 +996,10 @@ class RefinedOfflineApp:
     def _ensure_base_app(self):
         if self._base_app is None:
             self._base_module = load_base_offline_module()
-            self._base_app = self._base_module.OfflineApp(config_path=self.config_path)
+            self._base_app = self._base_module.OfflineApp(
+                config_path=self.config_path,
+                load_default_detector=False,
+            )
         output_dir = self.sample_state.get("output_dir") if self.sample_state.get("output_dir_ready") else None
         self._sync_base_app_runtime(self._base_app, output_dir)
         return self._base_app
@@ -894,6 +1077,17 @@ class RefinedOfflineApp:
                 runtime_app.RUNTIME.get("save_focal_4d_individual", True),
             )
         )
+        runtime_app.RUNTIME["render_mode"] = str(
+            cfg_get(self.CONFIG, "runtime.render_mode", runtime_app.RUNTIME.get("render_mode", "normal"))
+        )
+        runtime_app.RUNTIME["render_scene_bg_color"] = list(
+            cfg_get(
+                self.CONFIG,
+                "runtime.render_scene_bg_color",
+                runtime_app.RUNTIME.get("render_scene_bg_color", [0, 0, 0]),
+            )
+            or [0, 0, 0]
+        )
         self._configure_detector(runtime_app)
         self.OUTPUT_DIR = runtime_app.OUTPUT_DIR
         self.RUNTIME = runtime_app.RUNTIME
@@ -950,17 +1144,11 @@ class RefinedOfflineApp:
             if resolved["max_det"] is not None:
                 detector_kwargs["max_det"] = int(resolved["max_det"])
 
-            try:
-                detector_outputs = detector.run_human_detection(
-                    cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR),
-                    **detector_kwargs,
-                )
-            except TypeError:
-                detector_kwargs.pop("return_scores", None)
-                detector_outputs = detector.run_human_detection(
-                    cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR),
-                    **detector_kwargs,
-                )
+            detector_outputs = run_human_detection_compat(
+                detector,
+                cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR),
+                detector_kwargs,
+            )
 
             normalized_outputs = normalize_detection_outputs(detector_outputs)
             if normalized_outputs is not None:
@@ -1198,9 +1386,10 @@ class RefinedOfflineApp:
             int(sample["frame_count"]),
             max(len(track_records), 1),
         )
-        candidate_counts: dict[tuple[float, float, float, float], int] = {}
-        candidate_boxes: dict[tuple[float, float, float, float], list[float]] = {}
+        candidate_clusters: list[dict] = []
         width = height = None
+        ambiguous_frame_count = 0
+        matched_frame_count = 0
 
         for frame_idx in range(search_frames):
             frame_record = next(
@@ -1230,30 +1419,141 @@ class RefinedOfflineApp:
                     continue
                 if not (bbox[0] <= face_center_x <= bbox[2] and bbox[1] <= face_center_y <= bbox[3]):
                     continue
-                upper_body_limit = bbox[1] + (bbox[3] - bbox[1]) * 0.75
+                box_width = max(float(bbox[2] - bbox[0]), 1e-6)
+                box_height = max(float(bbox[3] - bbox[1]), 1e-6)
+                upper_body_ratio = (face_center_y - bbox[1]) / box_height
+                upper_body_limit = bbox[1] + box_height * 0.75
                 if face_center_y > upper_body_limit:
                     continue
-                matching_candidates.append(bbox)
+                body_center_x = (bbox[0] + bbox[2]) / 2.0
+                body_center_y = (bbox[1] + bbox[3]) / 2.0
+                normalized_center_distance = float(
+                    (
+                        ((face_center_x - body_center_x) / box_width) ** 2
+                        + ((face_center_y - body_center_y) / box_height) ** 2
+                    )
+                    ** 0.5
+                )
+                detector_score = float(output.get("score") or 0.0)
+                binding_score = (
+                    3.0 * max(0.0, 1.0 - min(normalized_center_distance, 1.0))
+                    + max(0.0, 1.0 - min(upper_body_ratio / 0.75, 1.0))
+                    + 0.25 * detector_score
+                )
+                matching_candidates.append(
+                    {
+                        "frame_idx": int(frame_idx),
+                        "bbox": bbox,
+                        "detector_score": detector_score,
+                        "normalized_center_distance": normalized_center_distance,
+                        "upper_body_ratio": float(upper_body_ratio),
+                        "binding_score": float(binding_score),
+                    }
+                )
 
-            if len(matching_candidates) != 1:
+            if not matching_candidates:
                 continue
 
-            chosen_bbox = matching_candidates[0]
-            bbox_key = tuple(float(value) for value in chosen_bbox)
-            candidate_counts[bbox_key] = candidate_counts.get(bbox_key, 0) + 1
-            candidate_boxes[bbox_key] = chosen_bbox
+            matched_frame_count += 1
+            matching_candidates.sort(
+                key=lambda candidate: (
+                    -float(candidate["binding_score"]),
+                    float(candidate["normalized_center_distance"]),
+                    float(candidate["upper_body_ratio"]),
+                    -float(candidate["detector_score"]),
+                    tuple(float(value) for value in candidate["bbox"]),
+                )
+            )
+            chosen_candidate = matching_candidates[0]
+            if len(matching_candidates) > 1:
+                runner_up = matching_candidates[1]
+                score_gap = float(chosen_candidate["binding_score"]) - float(runner_up["binding_score"])
+                distance_gap = float(runner_up["normalized_center_distance"]) - float(
+                    chosen_candidate["normalized_center_distance"]
+                )
+                detector_gap = abs(
+                    float(chosen_candidate["detector_score"]) - float(runner_up["detector_score"])
+                )
+                if score_gap <= 0.05 and distance_gap <= 0.03 and detector_gap <= 0.05:
+                    ambiguous_frame_count += 1
+                    continue
+
+            best_cluster = None
+            best_iou = 0.0
+            for cluster in candidate_clusters:
+                cluster_iou = bbox_iou_xyxy(cluster.get("reference_bbox"), chosen_candidate["bbox"])
+                if cluster_iou > best_iou:
+                    best_iou = cluster_iou
+                    best_cluster = cluster
+
+            if best_cluster is None or best_iou < 0.35:
+                best_cluster = {
+                    "votes": 0,
+                    "score_total": 0.0,
+                    "detector_score_total": 0.0,
+                    "reference_bbox": list(chosen_candidate["bbox"]),
+                    "best_bbox": list(chosen_candidate["bbox"]),
+                    "best_binding_score": float(chosen_candidate["binding_score"]),
+                    "frame_candidates": {},
+                    "first_frame_idx": int(frame_idx),
+                }
+                candidate_clusters.append(best_cluster)
+
+            best_cluster["votes"] += 1
+            best_cluster["score_total"] += float(chosen_candidate["binding_score"])
+            best_cluster["detector_score_total"] += float(chosen_candidate["detector_score"])
+            best_cluster["reference_bbox"] = list(chosen_candidate["bbox"])
+            best_cluster["frame_candidates"][int(frame_idx)] = dict(chosen_candidate)
+            best_cluster["first_frame_idx"] = min(
+                int(best_cluster["first_frame_idx"]),
+                int(frame_idx),
+            )
+            if float(chosen_candidate["binding_score"]) > float(best_cluster["best_binding_score"]):
+                best_cluster["best_binding_score"] = float(chosen_candidate["binding_score"])
+                best_cluster["best_bbox"] = list(chosen_candidate["bbox"])
             width = frame_width
             height = frame_height
 
-        if not candidate_counts or width is None or height is None:
+        if not candidate_clusters or width is None or height is None:
+            if matched_frame_count > 0 and ambiguous_frame_count > 0:
+                raise RuntimeError(f"ambiguous face-guided body binding for clip package: {sample['input_video']}")
             raise RuntimeError(f"unable to bind face-guided body target for clip package: {sample['input_video']}")
 
-        ranked = sorted(candidate_counts.items(), key=lambda item: (-int(item[1]), item[0]))
-        if len(ranked) > 1 and int(ranked[0][1]) == int(ranked[1][1]):
+        ranked_clusters = sorted(
+            candidate_clusters,
+            key=lambda cluster: (
+                -int(cluster["votes"]),
+                -float(cluster["score_total"]),
+                -float(cluster["detector_score_total"]),
+                int(cluster["first_frame_idx"]),
+                tuple(float(value) for value in cluster["best_bbox"]),
+            ),
+        )
+        if len(ranked_clusters) > 1:
+            top_cluster = ranked_clusters[0]
+            runner_up_cluster = ranked_clusters[1]
+            same_votes = int(top_cluster["votes"]) == int(runner_up_cluster["votes"])
+            close_score = (
+                abs(float(top_cluster["score_total"]) - float(runner_up_cluster["score_total"])) <= 0.1
+            )
+            close_detector_score = (
+                abs(
+                    float(top_cluster["detector_score_total"])
+                    - float(runner_up_cluster["detector_score_total"])
+                )
+                <= 0.05
+            )
+            if same_votes and close_score and close_detector_score:
+                raise RuntimeError(f"ambiguous face-guided body binding for clip package: {sample['input_video']}")
+
+        selected_cluster = ranked_clusters[0]
+        start_frame_idx = int(selected_cluster["first_frame_idx"])
+        selected_frame_candidate = selected_cluster["frame_candidates"].get(start_frame_idx)
+        if selected_frame_candidate is None:
             raise RuntimeError(f"ambiguous face-guided body binding for clip package: {sample['input_video']}")
 
-        selected_bbox = list(candidate_boxes[ranked[0][0]])
-        return selected_bbox, int(width), int(height)
+        selected_bbox = list(selected_frame_candidate["bbox"])
+        return selected_bbox, int(start_frame_idx), int(width), int(height)
 
     def _initialize_tracker_targets(self, sample: dict, runtime_app, outputs: list[dict], start_frame_idx: int, width: int, height: int) -> dict:
         if sample["input_type"] in {"video", "clip_package"}:
@@ -1306,12 +1606,17 @@ class RefinedOfflineApp:
         nms_thr = resolved_detector["iou_thresh"]
 
         if sample.get("input_type") == "clip_package":
-            selected_bbox, width, height = self._build_face_guided_body_binding(sample, runtime_app, bbox_thr, nms_thr)
+            selected_bbox, start_frame_idx, width, height = self._build_face_guided_body_binding(
+                sample,
+                runtime_app,
+                bbox_thr,
+                nms_thr,
+            )
             return self._initialize_tracker_targets(
                 sample,
                 runtime_app,
                 [{"bbox": selected_bbox}],
-                start_frame_idx=0,
+                start_frame_idx=int(start_frame_idx),
                 width=width,
                 height=height,
             )

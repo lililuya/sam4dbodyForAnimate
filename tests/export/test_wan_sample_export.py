@@ -38,6 +38,28 @@ class _FakeFaceBackend:
         return list(self._detections)
 
 
+DEFAULT_MESH_FACES = np.array([[0, 1, 2]], dtype=np.int32)
+
+
+def _build_person_output(**overrides):
+    person_output = {
+        "pred_keypoints_2d": np.zeros((70, 2), dtype=np.float32),
+        "pred_keypoints_3d": np.zeros((70, 3), dtype=np.float32),
+        "pred_vertices": np.array(
+            [
+                [-0.30, -0.30, 1.00],
+                [0.30, -0.30, 1.00],
+                [-0.30, 0.30, 1.00],
+            ],
+            dtype=np.float32,
+        ),
+        "pred_cam_t": np.zeros((3,), dtype=np.float32),
+        "focal_length": np.float32(24.0),
+    }
+    person_output.update(overrides)
+    return person_output
+
+
 class WanSampleExportTests(unittest.TestCase):
     def test_finalize_reuses_pre_resolved_clip_identity_for_target_directory(self):
         from scripts.wan_sample_export import WanSampleExporter
@@ -81,12 +103,10 @@ class WanSampleExportTests(unittest.TestCase):
                 ),
                 sample_uuid="sampleuuid123",
                 clip_id="sampleuuid123_face01_seg001",
+                mesh_faces=DEFAULT_MESH_FACES,
             )
 
-            person_output = {
-                "pred_keypoints_2d": np.zeros((70, 2), dtype=np.float32),
-                "pred_keypoints_3d": np.zeros((70, 3), dtype=np.float32),
-            }
+            person_output = _build_person_output()
             for index in range(3):
                 image_path = os.path.join(image_dir, f"{index:08d}.jpg")
                 exporter(image_path, [person_output], [1])
@@ -142,12 +162,10 @@ class WanSampleExportTests(unittest.TestCase):
                         )
                     ]
                 ),
+                mesh_faces=DEFAULT_MESH_FACES,
             )
 
-            person_output = {
-                "pred_keypoints_2d": np.zeros((70, 2), dtype=np.float32),
-                "pred_keypoints_3d": np.zeros((70, 3), dtype=np.float32),
-            }
+            person_output = _build_person_output()
             for index in range(3):
                 image_path = os.path.join(image_dir, f"{index:08d}.jpg")
                 exporter(image_path, [person_output], [1])
@@ -210,12 +228,10 @@ class WanSampleExportTests(unittest.TestCase):
                     metadata_output_dir=metadata_root,
                 ),
                 face_backend=_FakeFaceBackend([]),
+                mesh_faces=DEFAULT_MESH_FACES,
             )
 
-            person_output = {
-                "pred_keypoints_2d": np.zeros((70, 2), dtype=np.float32),
-                "pred_keypoints_3d": np.zeros((70, 3), dtype=np.float32),
-            }
+            person_output = _build_person_output()
             for index in range(2):
                 image_path = os.path.join(image_dir, f"{index:08d}.jpg")
                 exporter(image_path, [person_output], [2])
@@ -269,12 +285,10 @@ class WanSampleExportTests(unittest.TestCase):
                     metadata_output_dir=metadata_root,
                 ),
                 face_backend=_FakeFaceBackend([]),
+                mesh_faces=DEFAULT_MESH_FACES,
             )
 
-            person_output = {
-                "pred_keypoints_2d": np.zeros((70, 2), dtype=np.float32),
-                "pred_keypoints_3d": np.zeros((70, 3), dtype=np.float32),
-            }
+            person_output = _build_person_output()
             for index in range(2):
                 image_path = os.path.join(image_dir, f"{index:08d}.jpg")
                 exporter(image_path, [person_output], [2])
@@ -331,12 +345,10 @@ class WanSampleExportTests(unittest.TestCase):
                         )
                     ]
                 ),
+                mesh_faces=DEFAULT_MESH_FACES,
             )
 
-            person_output = {
-                "pred_keypoints_2d": np.zeros((70, 2), dtype=np.float32),
-                "pred_keypoints_3d": np.zeros((70, 3), dtype=np.float32),
-            }
+            person_output = _build_person_output()
             for index in range(3):
                 image_path = os.path.join(image_dir, f"{index:08d}.jpg")
                 exporter(image_path, [person_output], [1])
@@ -399,14 +411,13 @@ class WanSampleExportTests(unittest.TestCase):
                         )
                     ]
                 ),
+                mesh_faces=DEFAULT_MESH_FACES,
             )
 
-            person_output = {
-                "pred_keypoints_2d": np.zeros((70, 2), dtype=np.float32),
-                "pred_keypoints_3d": np.zeros((70, 3), dtype=np.float32),
-                "bbox": np.array([10.0, 8.0, 30.0, 40.0], dtype=np.float32),
-                "mask": np.zeros((64, 48, 1), dtype=np.uint8),
-            }
+            person_output = _build_person_output(
+                bbox=np.array([10.0, 8.0, 30.0, 40.0], dtype=np.float32),
+                mask=np.zeros((64, 48, 1), dtype=np.uint8),
+            )
             for index in range(3):
                 image_path = os.path.join(image_dir, f"{index:08d}.jpg")
                 exporter(image_path, [person_output], [1])
@@ -418,6 +429,74 @@ class WanSampleExportTests(unittest.TestCase):
             sample_dir = sample_dirs[0]
             self.assertTrue(os.path.isfile(os.path.join(sample_dir, "pose_meta_sequence.json")))
             self.assertFalse(os.path.isfile(os.path.join(sample_dir, "smpl_sequence.json")))
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_finalize_skips_target_when_smpl_projection_mask_is_unavailable(self):
+        from scripts.wan_sample_export import WanSampleExporter
+        from scripts.wan_sample_types import WanExportConfig
+
+        temp_dir = tempfile.mkdtemp(prefix="wan_export_projection_skip_")
+        try:
+            image_dir = os.path.join(temp_dir, "images")
+            mask_dir = os.path.join(temp_dir, "masks")
+            export_root = os.path.join(temp_dir, "WanExport")
+            os.makedirs(image_dir, exist_ok=True)
+            os.makedirs(mask_dir, exist_ok=True)
+
+            frame = np.full((48, 48, 3), 180, dtype=np.uint8)
+            indexed_mask = np.zeros((48, 48), dtype=np.uint8)
+            indexed_mask[30:40, 30:40] = 1
+            raw_mask = np.zeros((48, 48), dtype=np.uint8)
+            raw_mask[8:20, 8:20] = 255
+            frame_stem = "00000000"
+            cv2.imwrite(os.path.join(image_dir, f"{frame_stem}.jpg"), frame)
+            save_indexed_mask(indexed_mask, os.path.join(mask_dir, f"{frame_stem}.png"))
+
+            exporter = WanSampleExporter(
+                sample_id="demo_projection_skip",
+                output_dir=temp_dir,
+                images_dir=image_dir,
+                masks_dir=mask_dir,
+                source_video_path="/dataset/source/demo_projection_skip.mp4",
+                config=WanExportConfig(
+                    enable=True,
+                    min_track_frames=1,
+                    min_valid_face_ratio=0.0,
+                    output_dir=export_root,
+                    save_pose_meta_json=False,
+                ),
+                face_backend=_FakeFaceBackend(
+                    [
+                        WanFaceDetection(
+                            bbox=(8, 8, 22, 22),
+                            landmarks=np.zeros((5, 3), dtype=np.float32),
+                            score=0.9,
+                        )
+                    ]
+                ),
+                mesh_faces=DEFAULT_MESH_FACES,
+            )
+
+            person_output = {
+                "pred_keypoints_2d": np.zeros((70, 2), dtype=np.float32),
+                "pred_keypoints_3d": np.zeros((70, 3), dtype=np.float32),
+                "mask": raw_mask,
+            }
+            exporter(os.path.join(image_dir, f"{frame_stem}.jpg"), [person_output], [1])
+
+            with patch("scripts.wan_sample_export.uuid.uuid4", return_value=SimpleNamespace(hex="projectionskipuuid")):
+                sample_dirs = exporter.finalize()
+
+            self.assertEqual(sample_dirs, [])
+            skipped_path = os.path.join(export_root, "projectionskipuuid_skipped.json")
+            self.assertTrue(os.path.isfile(skipped_path))
+            with open(skipped_path, "r", encoding="utf-8") as handle:
+                skipped = json.load(handle)
+            self.assertEqual(len(skipped["skipped_targets"]), 1)
+            self.assertEqual(skipped["skipped_targets"][0]["track_id"], 1)
+            self.assertEqual(skipped["skipped_targets"][0]["reason"], "smpl_projection_mask_unavailable")
+            self.assertEqual(skipped["skipped_targets"][0]["frame_stem"], frame_stem)
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -455,12 +534,10 @@ class WanSampleExportTests(unittest.TestCase):
                     save_pose_meta_json=False,
                 ),
                 face_backend=_FakeFaceBackend([]),
+                mesh_faces=DEFAULT_MESH_FACES,
             )
 
-            person_output = {
-                "pred_keypoints_2d": np.zeros((70, 2), dtype=np.float32),
-                "pred_keypoints_3d": np.zeros((70, 3), dtype=np.float32),
-            }
+            person_output = _build_person_output()
             for index in range(2):
                 image_path = os.path.join(image_dir, f"{index:08d}.jpg")
                 exporter(image_path, [person_output], [1])
@@ -521,14 +598,13 @@ class WanSampleExportTests(unittest.TestCase):
                         )
                     ]
                 ),
+                mesh_faces=DEFAULT_MESH_FACES,
             )
 
-            person_output = {
-                "pred_keypoints_2d": np.zeros((70, 2), dtype=np.float32),
-                "pred_keypoints_3d": np.zeros((70, 3), dtype=np.float32),
-                "bbox": np.array([10.0, 8.0, 30.0, 40.0], dtype=np.float32),
-                "mask": np.zeros((64, 48, 1), dtype=np.uint8),
-            }
+            person_output = _build_person_output(
+                bbox=np.array([10.0, 8.0, 30.0, 40.0], dtype=np.float32),
+                mask=np.zeros((64, 48, 1), dtype=np.uint8),
+            )
             for index in range(3):
                 image_path = os.path.join(image_dir, f"{index:08d}.jpg")
                 exporter(image_path, [person_output], [1])
@@ -562,11 +638,12 @@ class WanSampleExportTests(unittest.TestCase):
             self.assertEqual(len(smpl_sequence["records"]), 3)
             self.assertIsInstance(smpl_sequence["records"][0]["person_output"]["pred_keypoints_2d"], list)
             self.assertIsInstance(smpl_sequence["records"][0]["person_output"]["bbox"], list)
-            self.assertNotIn("mask", smpl_sequence["records"][0]["person_output"])
+            self.assertIsInstance(smpl_sequence["records"][0]["person_output"]["mask"], list)
+            self.assertEqual(smpl_sequence["records"][0]["person_output"]["mask_source"], "smpl_projection")
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def test_finalize_writes_smpl_sequence_without_indent_and_rounds_floats_to_six_decimals(self):
+    def test_finalize_writes_smpl_sequence_without_indent_and_preserves_full_float_precision(self):
         from scripts.wan_sample_export import WanSampleExporter
         from scripts.wan_sample_types import WanExportConfig
 
@@ -610,13 +687,17 @@ class WanSampleExportTests(unittest.TestCase):
                         )
                     ]
                 ),
+                mesh_faces=DEFAULT_MESH_FACES,
             )
 
-            person_output = {
-                "pred_keypoints_2d": np.array([[0.123456789, 1.987654321]], dtype=np.float32),
-                "pred_keypoints_3d": np.array([[0.2565191686153412, -1.5157936811447144, -0.092339888215065]], dtype=np.float32),
-                "bbox": np.array([10.123456789, 8.987654321, 30.111111111, 40.999999999], dtype=np.float32),
-            }
+            person_output = _build_person_output(
+                pred_keypoints_2d=np.array([[0.123456789, 1.987654321]], dtype=np.float64),
+                pred_keypoints_3d=np.array(
+                    [[0.2565191686153412, -1.5157936811447144, -0.092339888215065]],
+                    dtype=np.float64,
+                ),
+                bbox=np.array([10.123456789, 8.987654321, 30.111111111, 40.999999999], dtype=np.float64),
+            )
             exporter(os.path.join(image_dir, f"{frame_stem}.jpg"), [person_output], [1])
 
             with patch("scripts.wan_sample_export.uuid.uuid4", return_value=SimpleNamespace(hex="rounduuid123456")):
@@ -632,13 +713,14 @@ class WanSampleExportTests(unittest.TestCase):
             self.assertNotIn("\n  ", raw_text)
             self.assertIn('"frame_count": 1', raw_text)
             person_output_payload = smpl_sequence["records"][0]["person_output"]
-            self.assertEqual(person_output_payload["pred_keypoints_2d"][0][0], 0.123457)
-            self.assertEqual(person_output_payload["pred_keypoints_2d"][0][1], 1.987654)
-            self.assertEqual(person_output_payload["pred_keypoints_3d"][0][0], 0.256519)
-            self.assertEqual(person_output_payload["pred_keypoints_3d"][0][1], -1.515794)
-            self.assertEqual(person_output_payload["pred_keypoints_3d"][0][2], -0.09234)
-            self.assertEqual(person_output_payload["bbox"][0], 10.123457)
-            self.assertEqual(person_output_payload["bbox"][1], 8.987655)
+            self.assertNotEqual(person_output_payload["pred_keypoints_2d"][0][0], 0.123457)
+            self.assertAlmostEqual(person_output_payload["pred_keypoints_2d"][0][0], 0.123456789, places=15)
+            self.assertAlmostEqual(person_output_payload["pred_keypoints_2d"][0][1], 1.987654321, places=15)
+            self.assertAlmostEqual(person_output_payload["pred_keypoints_3d"][0][0], 0.2565191686153412, places=15)
+            self.assertAlmostEqual(person_output_payload["pred_keypoints_3d"][0][1], -1.5157936811447144, places=15)
+            self.assertAlmostEqual(person_output_payload["pred_keypoints_3d"][0][2], -0.092339888215065, places=15)
+            self.assertAlmostEqual(person_output_payload["bbox"][0], 10.123456789, places=15)
+            self.assertAlmostEqual(person_output_payload["bbox"][1], 8.987654321, places=15)
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -677,12 +759,10 @@ class WanSampleExportTests(unittest.TestCase):
                         )
                     ]
                 ),
+                mesh_faces=DEFAULT_MESH_FACES,
             )
 
-            person_output = {
-                "pred_keypoints_2d": np.zeros((70, 2), dtype=np.float32),
-                "pred_keypoints_3d": np.zeros((70, 3), dtype=np.float32),
-            }
+            person_output = _build_person_output()
             for index in range(2):
                 image_path = os.path.join(image_dir, f"{index:08d}.jpg")
                 exporter(image_path, [person_output], [1])
@@ -701,7 +781,7 @@ class WanSampleExportTests(unittest.TestCase):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def test_finalize_writes_src_mask_detail_from_original_target_mask(self):
+    def test_finalize_uses_smpl_projection_mask_for_src_mask_detail_and_background_cutout(self):
         from scripts.wan_sample_export import WanSampleExporter
         from scripts.wan_sample_types import WanExportConfig
 
@@ -714,7 +794,9 @@ class WanSampleExportTests(unittest.TestCase):
 
             frame = np.full((48, 48, 3), 160, dtype=np.uint8)
             indexed_mask = np.zeros((48, 48), dtype=np.uint8)
-            indexed_mask[24, 24] = 1
+            indexed_mask[36:40, 36:40] = 1
+            raw_mask = np.zeros((48, 48), dtype=np.uint8)
+            raw_mask[8:16, 8:16] = 255
             frame_stem = "00000000"
             cv2.imwrite(os.path.join(image_dir, f"{frame_stem}.jpg"), frame)
             save_indexed_mask(indexed_mask, os.path.join(mask_dir, f"{frame_stem}.png"))
@@ -729,6 +811,8 @@ class WanSampleExportTests(unittest.TestCase):
                     enable=True,
                     min_track_frames=1,
                     min_valid_face_ratio=0.0,
+                    resolution_area=(48, 48),
+                    face_resolution=(32, 32),
                     mask_kernel_size=3,
                     mask_iterations=1,
                     mask_w_len=99,
@@ -737,18 +821,27 @@ class WanSampleExportTests(unittest.TestCase):
                 face_backend=_FakeFaceBackend(
                     [
                         WanFaceDetection(
-                            bbox=(16, 12, 32, 32),
+                            bbox=(18, 18, 30, 30),
                             landmarks=np.zeros((5, 3), dtype=np.float32),
                             score=0.9,
                         )
                     ]
                 ),
+                mesh_faces=DEFAULT_MESH_FACES,
             )
 
-            person_output = {
-                "pred_keypoints_2d": np.zeros((70, 2), dtype=np.float32),
-                "pred_keypoints_3d": np.zeros((70, 3), dtype=np.float32),
-            }
+            person_output = _build_person_output(
+                mask=raw_mask,
+                pred_vertices=np.array(
+                    [
+                        [-0.15, -0.15, 1.00],
+                        [0.45, -0.15, 1.00],
+                        [-0.15, 0.45, 1.00],
+                    ],
+                    dtype=np.float32,
+                ),
+                focal_length=np.float32(16.0),
+            )
             exporter(os.path.join(image_dir, f"{frame_stem}.jpg"), [person_output], [1])
 
             sample_dirs = exporter.finalize()
@@ -772,9 +865,24 @@ class WanSampleExportTests(unittest.TestCase):
             finally:
                 detail_capture.release()
 
+            bg_capture = cv2.VideoCapture(os.path.join(sample_dir, "src_bg.mp4"))
+            try:
+                ok_bg, bg_frame_bgr = bg_capture.read()
+            finally:
+                bg_capture.release()
+
             self.assertTrue(ok_mask)
             self.assertTrue(ok_detail)
-            self.assertGreater(int(mask_frame_bgr.sum()), int(detail_frame_bgr.sum()))
+            self.assertTrue(ok_bg)
+            self.assertLess(int(mask_frame_bgr[10:14, 10:14].mean()), 50)
+            self.assertLess(int(mask_frame_bgr[36:40, 36:40].mean()), 50)
+            self.assertGreater(int(mask_frame_bgr[22:26, 22:26].mean()), 200)
+            self.assertLess(int(detail_frame_bgr[10:14, 10:14].mean()), 50)
+            self.assertLess(int(detail_frame_bgr[36:40, 36:40].mean()), 50)
+            self.assertGreater(int(detail_frame_bgr[22:26, 22:26].mean()), 200)
+            self.assertGreater(int(bg_frame_bgr[10:14, 10:14].mean()), 120)
+            self.assertGreater(int(bg_frame_bgr[36:40, 36:40].mean()), 120)
+            self.assertLess(int(bg_frame_bgr[22:26, 22:26].mean()), 10)
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 

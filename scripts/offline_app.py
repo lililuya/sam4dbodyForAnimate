@@ -91,7 +91,7 @@ def read_frame_at(path: str, idx: int):
     return Image.fromarray(frame)
 
 
-def build_sam3_3d_body_config(cfg):
+def build_sam3_3d_body_config(cfg, *, load_default_detector: bool = True):
     mhr_path = cfg.sam_3d_body['mhr_path']
     fov_path = cfg.sam_3d_body['fov_path']
     detector_path = cfg.sam_3d_body['detector_path']
@@ -103,8 +103,10 @@ def build_sam3_3d_body_config(cfg):
     human_detector, human_segmentor, fov_estimator = None, None, None
     from models.sam_3d_body.tools.build_fov_estimator import FOVEstimator
     fov_estimator = FOVEstimator(name='moge2', device=device, path=fov_path)
-    from models.sam_3d_body.tools.build_detector import HumanDetector
-    human_detector = HumanDetector(name="vitdet", device=device, path=detector_path)
+    if bool(load_default_detector):
+        from models.sam_3d_body.tools.build_detector import HumanDetector
+
+        human_detector = HumanDetector(name="vitdet", device=device, path=detector_path)
 
     estimator = SAM3DBodyEstimator(
         sam_3d_body_model=model,
@@ -168,11 +170,19 @@ def _runtime_list(cfg, path, default=None):
 
 
 class OfflineApp:
-    def __init__(self, config_path: str = os.path.join(ROOT, "configs", "body4d.yaml")):
+    def __init__(
+        self,
+        config_path: str = os.path.join(ROOT, "configs", "body4d.yaml"),
+        *,
+        load_default_detector: bool = True,
+    ):
         """Initialize CONFIG, SAM3_MODEL, and global RUNTIME dict."""
         self.CONFIG = OmegaConf.load(config_path)
         self.sam3_model, self.predictor = build_sam3_from_config(self.CONFIG)
-        self.sam3_3d_body_model = build_sam3_3d_body_config(self.CONFIG)
+        self.sam3_3d_body_model = build_sam3_3d_body_config(
+            self.CONFIG,
+            load_default_detector=load_default_detector,
+        )
 
         if self.CONFIG.completion.get('enable', False):
             (
@@ -299,6 +309,7 @@ class OfflineApp:
                 sample_uuid=wan_cfg.get("sample_uuid"),
                 clip_id=wan_cfg.get("clip_id"),
                 source_reference=wan_cfg.get("source_path"),
+                mesh_faces=getattr(self.sam3_3d_body_model, "faces", None),
             )
         frame_writer = None
         if pose_writer is not None or wan_writer is not None:

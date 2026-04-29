@@ -10,7 +10,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.append(ROOT)
 
-from scripts.detector_defaults import resolve_detector_runtime_options
+from scripts.detector_defaults import resolve_detector_runtime_options, run_human_detection_compat
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
@@ -21,6 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Debug human detection on a single image or video by drawing detector boxes."
     )
     parser.add_argument("--input_path", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, default="")
     parser.add_argument("--output_path", type=str, default="")
     parser.add_argument("--detector_backend", type=str, default="yolo", choices=["yolo", "yolo11", "vitdet"])
     parser.add_argument("--detector_path", type=str, default="")
@@ -43,13 +44,45 @@ def infer_media_type(input_path: str) -> str:
     raise ValueError(f"unsupported input file: {input_path}")
 
 
-def build_output_path(input_path: str, explicit_output_path: str = "") -> str:
+def _format_output_value(value) -> str:
+    if value is None:
+        return "none"
+    if isinstance(value, float):
+        return format(float(value), "g")
+    return str(value)
+
+
+def resolve_detection_runtime_options(args) -> Dict[str, object]:
+    return resolve_detector_runtime_options(
+        args.detector_backend,
+        bbox_thresh=args.bbox_thresh,
+        iou_thresh=args.iou_thresh,
+        max_det=args.max_det,
+    )
+
+
+def build_output_path(
+    input_path: str,
+    explicit_output_path: str = "",
+    *,
+    output_dir: str = "",
+    detector_backend: str = "yolo",
+    bbox_thresh=None,
+    iou_thresh=None,
+    max_det=None,
+) -> str:
     if explicit_output_path:
         return explicit_output_path
 
-    input_dir = os.path.dirname(input_path)
     stem, extension = os.path.splitext(os.path.basename(input_path))
-    return os.path.join(input_dir, f"{stem}_detected{extension}")
+    filename = (
+        f"{stem}_{str(detector_backend).lower()}_"
+        f"bbox{_format_output_value(bbox_thresh)}_"
+        f"iou{_format_output_value(iou_thresh)}_"
+        f"maxdet{_format_output_value(max_det)}{extension}"
+    )
+    target_dir = str(output_dir).strip() or os.path.dirname(input_path)
+    return os.path.join(target_dir, filename)
 
 
 def ensure_parent_dir(path: str) -> None:
@@ -120,29 +153,18 @@ def create_detector(args):
     return HumanDetector(name=args.detector_backend, device=args.device, **detector_kwargs)
 
 
-def detect_people(detector, frame_bgr: np.ndarray, args) -> List[Dict[str, Optional[float]]]:
-    resolved = resolve_detector_runtime_options(
-        args.detector_backend,
-        bbox_thresh=args.bbox_thresh,
-        iou_thresh=args.iou_thresh,
-        max_det=args.max_det,
-    )
+def detect_people(detector, frame_bgr: np.ndarray, resolved_options: Dict[str, object]) -> List[Dict[str, Optional[float]]]:
     detector_kwargs = {
         "det_cat_id": 0,
-        "bbox_thr": resolved["bbox_thresh"],
-        "nms_thr": resolved["iou_thresh"],
+        "bbox_thr": resolved_options["bbox_thresh"],
+        "nms_thr": resolved_options["iou_thresh"],
         "default_to_full_image": False,
         "return_scores": True,
     }
-    if resolved["max_det"] is not None:
-        detector_kwargs["max_det"] = int(resolved["max_det"])
+    if resolved_options["max_det"] is not None:
+        detector_kwargs["max_det"] = int(resolved_options["max_det"])
 
-    try:
-        outputs = detector.run_human_detection(frame_bgr, **detector_kwargs)
-    except TypeError:
-        detector_kwargs.pop("return_scores", None)
-        outputs = detector.run_human_detection(frame_bgr, **detector_kwargs)
-
+    outputs = run_human_detection_compat(detector, frame_bgr, detector_kwargs)
     return normalize_detection_outputs(outputs)
 
 
@@ -175,12 +197,21 @@ def annotate_frame(frame_bgr: np.ndarray, detections: List[Dict[str, Optional[fl
 
 def run_on_image(args, detector) -> Dict[str, object]:
     input_path = str(args.input_path)
-    output_path = build_output_path(input_path, args.output_path)
+    resolved_options = resolve_detection_runtime_options(args)
+    output_path = build_output_path(
+        input_path,
+        args.output_path,
+        output_dir=args.output_dir,
+        detector_backend=args.detector_backend,
+        bbox_thresh=resolved_options["bbox_thresh"],
+        iou_thresh=resolved_options["iou_thresh"],
+        max_det=resolved_options["max_det"],
+    )
     image = cv2.imread(input_path)
     if image is None:
         raise FileNotFoundError(f"failed to read image: {input_path}")
 
-    detections = detect_people(detector, image, args)
+    detections = detect_people(detector, image, resolved_options)
     annotated = annotate_frame(
         image,
         detections,
@@ -210,7 +241,16 @@ def _build_video_writer(output_path: str, width: int, height: int, fps: float):
 
 def run_on_video(args, detector) -> Dict[str, object]:
     input_path = str(args.input_path)
-    output_path = build_output_path(input_path, args.output_path)
+    resolved_options = resolve_detection_runtime_options(args)
+    output_path = build_output_path(
+        input_path,
+        args.output_path,
+        output_dir=args.output_dir,
+        detector_backend=args.detector_backend,
+        bbox_thresh=resolved_options["bbox_thresh"],
+        iou_thresh=resolved_options["iou_thresh"],
+        max_det=resolved_options["max_det"],
+    )
 
     capture = cv2.VideoCapture(input_path)
     if not capture.isOpened():
@@ -232,7 +272,7 @@ def run_on_video(args, detector) -> Dict[str, object]:
             ok, frame = capture.read()
             if not ok:
                 break
-            detections = detect_people(detector, frame, args)
+            detections = detect_people(detector, frame, resolved_options)
             annotated = annotate_frame(
                 frame,
                 detections,

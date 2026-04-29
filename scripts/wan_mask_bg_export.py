@@ -10,14 +10,25 @@ def build_target_binary_mask(indexed_mask: np.ndarray, track_id: int) -> np.ndar
     return (indexed_mask == int(track_id)).astype(np.uint8)
 
 
+def _coerce_binary_mask(mask: np.ndarray) -> np.ndarray:
+    array = np.asarray(mask)
+    if array.ndim != 2:
+        raise ValueError(f"target mask must be 2D after preprocessing, got shape={array.shape}")
+    return (array > 0).astype(np.uint8)
+
+
 def build_bg_and_mask_frame(
     *,
     frame_rgb: np.ndarray,
     indexed_mask: np.ndarray,
     track_id: int,
+    target_mask_override: np.ndarray | None = None,
     config,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    target_mask = build_target_binary_mask(indexed_mask, track_id)
+    if target_mask_override is None:
+        target_mask = build_target_binary_mask(indexed_mask, track_id)
+    else:
+        target_mask = _coerce_binary_mask(target_mask_override)
     aug_mask = dilate_target_mask(
         target_mask,
         kernel_size=int(config.mask_kernel_size),

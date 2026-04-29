@@ -117,6 +117,35 @@ def _open_video_writer(output_path: str, frame_shape, fps: float):
     return _BrowserSafeVideoWriter(output_path, frame_shape, fps)
 
 
+def _normalize_render_mode(render_mode) -> str:
+    normalized = str(render_mode or "normal").strip().lower()
+    if normalized in {"normal", "norm", "normals"}:
+        return "normal"
+    if normalized in {"mesh", "mesh_color", "color", "default"}:
+        return "mesh"
+    raise ValueError(f"unsupported render_mode: {render_mode}")
+
+
+def _normalize_scene_bg_color(scene_bg_color) -> tuple[float, float, float]:
+    if scene_bg_color is None or scene_bg_color == "":
+        return (0.0, 0.0, 0.0)
+    if isinstance(scene_bg_color, str):
+        normalized = scene_bg_color.strip().lower()
+        if normalized == "black":
+            return (0.0, 0.0, 0.0)
+        if normalized == "white":
+            return (1.0, 1.0, 1.0)
+        raise ValueError(f"unsupported scene background color: {scene_bg_color}")
+
+    values = tuple(float(value) for value in scene_bg_color)
+    if len(values) != 3:
+        raise ValueError("scene background color must contain exactly three values")
+    if max(values) > 1.0:
+        array = np.clip(np.asarray(values, dtype=np.float32) / 255.0, 0.0, 1.0)
+        return float(array[0]), float(array[1]), float(array[2])
+    return tuple(float(np.clip(value, 0.0, 1.0)) for value in values)
+
+
 def _load_runtime_utils():
     from utils import DAVIS_PALETTE
     from utils.mask_utils import (
@@ -246,6 +275,8 @@ def run_4d_pipeline_from_context(context):
     save_rendered_frames_individual = bool(context.runtime.get("save_rendered_frames_individual", True))
     save_mesh = bool(context.runtime.get("save_mesh_4d_individual", True))
     save_focal = bool(context.runtime.get("save_focal_4d_individual", True))
+    render_mode = _normalize_render_mode(context.runtime.get("render_mode", "normal"))
+    scene_bg_color = _normalize_scene_bg_color(context.runtime.get("render_scene_bg_color", (0, 0, 0)))
     write_rendered_video_direct = save_rendered_video and save_rendered_video_direct and not save_rendered_frames
     out_4d_path = os.path.join(output_dir, f"4d_{time.time():.0f}.mp4") if save_rendered_video else None
     direct_video_writer = None
@@ -560,6 +591,8 @@ def run_4d_pipeline_from_context(context):
                     mask_output,
                     context.sam3_3d_body_model.faces,
                     id_current,
+                    render_mode=render_mode,
+                    scene_bg_color=scene_bg_color,
                 )
             if save_rendered_frames:
                 cv2.imwrite(
@@ -581,6 +614,8 @@ def run_4d_pipeline_from_context(context):
                     mask_output,
                     context.sam3_3d_body_model.faces,
                     id_current,
+                    render_mode=render_mode,
+                    scene_bg_color=scene_bg_color,
                 )
                 for render_index, rendered_image in enumerate(rendered_individual):
                     track_id = int(id_current[render_index]) if id_current and render_index < len(id_current) else render_index + 1

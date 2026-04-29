@@ -28,6 +28,77 @@ def make_workspace_tempdir():
 
 
 class App4DPipelineTests(unittest.TestCase):
+    def test_normalize_scene_bg_color_accepts_runtime_list_values(self):
+        from scripts.app_4d_pipeline import _normalize_scene_bg_color
+
+        self.assertEqual(_normalize_scene_bg_color([0, 0, 0]), (0.0, 0.0, 0.0))
+        normalized = _normalize_scene_bg_color([255, 128, 0])
+        self.assertEqual(normalized[0], 1.0)
+        self.assertAlmostEqual(normalized[1], 128.0 / 255.0, places=6)
+        self.assertEqual(normalized[2], 0.0)
+
+    def test_run_4d_pipeline_defaults_to_normal_render_mode_with_black_background(self):
+        from scripts.app_4d_pipeline import build_4d_context, run_4d_pipeline_from_context
+
+        with make_workspace_tempdir() as tmpdir:
+            input_dir = os.path.join(tmpdir, "cache")
+            output_dir = os.path.join(tmpdir, "outputs_4d", "demo")
+            os.makedirs(os.path.join(input_dir, "images"), exist_ok=True)
+            os.makedirs(os.path.join(input_dir, "masks"), exist_ok=True)
+            Image.fromarray(np.zeros((4, 4, 3), dtype=np.uint8)).save(
+                os.path.join(input_dir, "images", "00000000.jpg")
+            )
+            Image.fromarray(np.ones((4, 4), dtype=np.uint8)).save(
+                os.path.join(input_dir, "masks", "00000000.png")
+            )
+
+            runtime = {
+                "out_obj_ids": [3],
+                "batch_size": 1,
+                "detection_resolution": [256, 512],
+                "completion_resolution": [512, 1024],
+                "smpl_export": False,
+                "video_fps": 24.0,
+            }
+            context = build_4d_context(
+                input_dir=input_dir,
+                output_dir=output_dir,
+                runtime=runtime,
+                sam3_3d_body_model=MagicMock(faces=np.array([[0, 1, 2]], dtype=np.int32)),
+                pipeline_mask=None,
+                pipeline_rgb=None,
+                depth_model=None,
+                predictor=MagicMock(),
+                generator=None,
+            )
+
+            with patch(
+                "scripts.app_4d_pipeline.process_image_with_mask",
+                return_value=([[{"bbox": np.zeros((4,), dtype=np.float32)}]], [[3]], []),
+            ), patch(
+                "scripts.app_4d_pipeline.visualize_sample_together",
+                return_value=np.zeros((4, 4, 3), dtype=np.uint8),
+            ) as mock_together, patch(
+                "scripts.app_4d_pipeline.visualize_sample",
+                return_value=[np.zeros((4, 4, 3), dtype=np.uint8)],
+            ) as mock_individual, patch(
+                "scripts.app_4d_pipeline.save_mesh_results",
+            ), patch(
+                "scripts.app_4d_pipeline.jpg_folder_to_mp4",
+            ), patch(
+                "scripts.app_4d_pipeline.cv2.imread",
+                return_value=np.zeros((4, 4, 3), dtype=np.uint8),
+            ), patch(
+                "scripts.app_4d_pipeline.cv2.imwrite",
+                return_value=True,
+            ):
+                run_4d_pipeline_from_context(context)
+
+            self.assertEqual(mock_together.call_args.kwargs["render_mode"], "normal")
+            self.assertEqual(mock_together.call_args.kwargs["scene_bg_color"], (0.0, 0.0, 0.0))
+            self.assertEqual(mock_individual.call_args.kwargs["render_mode"], "normal")
+            self.assertEqual(mock_individual.call_args.kwargs["scene_bg_color"], (0.0, 0.0, 0.0))
+
     def test_run_4d_pipeline_uses_explicit_input_and_output_dirs(self):
         from scripts.app_4d_pipeline import build_4d_context, run_4d_pipeline_from_context
 

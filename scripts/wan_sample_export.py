@@ -20,6 +20,7 @@ from scripts.wan_sample_types import WanExportConfig
 
 SOURCE_UUID_MAP_FILENAME = "source_uuid_map.json"
 ISSUE_LEDGER_FILENAME = "sample_issue_ledger.json"
+SMPL_MASK_SOURCE = "smpl_projection"
 
 
 class CompositeFrameWriter:
@@ -109,6 +110,134 @@ def _merge_dicts(base: dict, updates: dict) -> dict:
             continue
         merged[key] = value
     return merged
+
+
+def _coerce_mesh_faces(mesh_faces) -> np.ndarray | None:
+    if mesh_faces is None:
+        return None
+    faces = np.asarray(mesh_faces, dtype=np.int32)
+    if faces.size == 0:
+        return None
+    if faces.ndim != 2 or faces.shape[1] < 3:
+        return None
+    return faces[:, :3].copy()
+
+
+def _coerce_focal_length(focal_length) -> float | None:
+    if focal_length is None:
+        return None
+    values = np.asarray(focal_length, dtype=np.float32).reshape(-1)
+    if values.size <= 0 or not np.isfinite(values[0]):
+        return None
+    return float(values[0])
+
+
+def _build_smpl_projection_mask(
+    *,
+    person_output: dict,
+    mesh_faces: np.ndarray | None,
+    source_frame_shape: tuple[int, int],
+    target_frame_shape: tuple[int, int],
+) -> np.ndarray | None:
+    if not isinstance(person_output, dict):
+        return None
+
+    faces = _coerce_mesh_faces(mesh_faces)
+    if faces is None:
+        return None
+
+    try:
+        pred_vertices = np.asarray(person_output.get("pred_vertices"), dtype=np.float32).reshape(-1, 3)
+    except (TypeError, ValueError):
+        return None
+    if pred_vertices.size <= 0 or pred_vertices.shape[1] != 3:
+        return None
+
+    try:
+        pred_cam_t = np.asarray(person_output.get("pred_cam_t"), dtype=np.float32).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+    if pred_cam_t.size < 3:
+        return None
+
+    focal_length = _coerce_focal_length(person_output.get("focal_length"))
+    if focal_length is None or focal_length <= 0.0:
+        return None
+
+    source_height, source_width = int(source_frame_shape[0]), int(source_frame_shape[1])
+    target_height, target_width = int(target_frame_shape[0]), int(target_frame_shape[1])
+    if source_height <= 0 or source_width <= 0 or target_height <= 0 or target_width <= 0:
+        return None
+
+    scale_x = float(target_width) / float(source_width)
+    scale_y = float(target_height) / float(source_height)
+
+    vertices_camera = pred_vertices + pred_cam_t[:3][None, :]
+    valid_vertices = np.isfinite(vertices_camera).all(axis=1) & (vertices_camera[:, 2] > 1e-6)
+    if int(valid_vertices.sum()) < 3:
+        return None
+
+    projected_x = focal_length * (vertices_camera[:, 0] / vertices_camera[:, 2]) + (float(source_width) / 2.0)
+    projected_y = focal_length * (vertices_camera[:, 1] / vertices_camera[:, 2]) + (float(source_height) / 2.0)
+    projected_points = np.stack([projected_x * scale_x, projected_y * scale_y], axis=1).astype(np.float32)
+
+    mask = np.zeros((target_height, target_width), dtype=np.uint8)
+    max_x = target_width - 1
+    max_y = target_height - 1
+    for face in faces:
+        if np.any(face < 0) or np.any(face >= len(projected_points)):
+            continue
+        if not valid_vertices[face].all():
+            continue
+
+        triangle = projected_points[face]
+        if not np.isfinite(triangle).all():
+            continue
+        if (
+            float(triangle[:, 0].max()) < 0.0
+            or float(triangle[:, 0].min()) > float(max_x)
+            or float(triangle[:, 1].max()) < 0.0
+            or float(triangle[:, 1].min()) > float(max_y)
+        ):
+            continue
+
+        polygon = np.round(triangle).astype(np.int32)
+        polygon[:, 0] = np.clip(polygon[:, 0], 0, max_x)
+        polygon[:, 1] = np.clip(polygon[:, 1], 0, max_y)
+        if len({tuple(point) for point in polygon.tolist()}) < 3:
+            continue
+        cv2.fillConvexPoly(mask, polygon, 1, lineType=cv2.LINE_8)
+
+    return None if int(mask.sum()) <= 0 else mask
+
+
+def _build_export_aligned_person_output(
+    person_output: dict,
+    projected_mask: np.ndarray,
+    *,
+    scale_x: float,
+    scale_y: float,
+) -> dict:
+    if not isinstance(person_output, dict):
+        return person_output
+    payload = dict(person_output)
+    if "pred_keypoints_2d" in payload:
+        keypoints_2d = np.asarray(payload["pred_keypoints_2d"]).copy()
+        if keypoints_2d.ndim == 2 and keypoints_2d.shape[1] >= 2:
+            keypoints_2d[:, 0] *= float(scale_x)
+            keypoints_2d[:, 1] *= float(scale_y)
+            payload["pred_keypoints_2d"] = keypoints_2d
+    if "bbox" in payload:
+        bbox = np.asarray(payload["bbox"]).copy()
+        if bbox.shape[-1] >= 4:
+            bbox[..., 0] *= float(scale_x)
+            bbox[..., 2] *= float(scale_x)
+            bbox[..., 1] *= float(scale_y)
+            bbox[..., 3] *= float(scale_y)
+            payload["bbox"] = bbox
+    payload["mask"] = ((np.asarray(projected_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255)
+    payload["mask_source"] = SMPL_MASK_SOURCE
+    return payload
 
 
 def resolve_wan_source_path(source_video_path: str | None, images_dir: str | None) -> str:
@@ -224,9 +353,43 @@ def _resize_indexed_mask(indexed_mask: np.ndarray, target_shape: tuple[int, int]
     )
 
 
+def _resize_binary_mask(binary_mask: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+    target_height, target_width = int(target_shape[0]), int(target_shape[1])
+    resized = cv2.resize(
+        (np.asarray(binary_mask, dtype=np.uint8) > 0).astype(np.uint8),
+        (target_width, target_height),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    return (resized > 0).astype(np.uint8)
+
+
 def _load_indexed_mask(mask_path: str) -> np.ndarray:
     with Image.open(mask_path) as mask_image:
         return np.asarray(mask_image.convert("P"), dtype=np.uint8)
+
+
+def _extract_person_binary_mask(person_output_mask, target_shape: tuple[int, int]) -> np.ndarray | None:
+    if person_output_mask is None:
+        return None
+
+    mask = np.asarray(person_output_mask)
+    if mask.size == 0:
+        return None
+
+    mask = np.squeeze(mask)
+    if mask.ndim == 3:
+        if mask.shape[-1] <= 4 and mask.shape[0] > 4 and mask.shape[1] > 4:
+            mask = mask.max(axis=-1)
+        else:
+            mask = np.squeeze(mask[0])
+
+    if mask.ndim != 2:
+        return None
+
+    binary_mask = (np.asarray(mask, dtype=np.uint8) > 0).astype(np.uint8)
+    if binary_mask.shape != tuple(int(value) for value in target_shape):
+        binary_mask = _resize_binary_mask(binary_mask, target_shape)
+    return binary_mask
 
 
 def _scale_person_output(person_output: dict, scale_x: float, scale_y: float) -> dict:
@@ -281,6 +444,7 @@ class WanSampleExporter:
         source_video_path: str | None,
         config,
         face_backend=None,
+        mesh_faces=None,
         sample_uuid: str | None = None,
         clip_id: str | None = None,
         source_reference: str | None = None,
@@ -306,6 +470,7 @@ class WanSampleExporter:
         self.sample_uuid = None if sample_uuid in {None, ""} else str(sample_uuid)
         self.clip_id = None if clip_id in {None, ""} else str(clip_id)
         self.face_backend = face_backend or InsightFaceBackend()
+        self.mesh_faces = _coerce_mesh_faces(mesh_faces)
         self._records: list[dict] = []
         self.finalized_targets: list[dict] = []
 
@@ -399,6 +564,7 @@ class WanSampleExporter:
             face_sequence = []
             frame_payloads = []
             previous_bbox = None
+            projection_failure: dict | None = None
             for record in track_records:
                 frame_bgr = cv2.imread(record["image_path"], cv2.IMREAD_COLOR)
                 indexed_mask = _load_indexed_mask(record["mask_path"])
@@ -410,12 +576,27 @@ class WanSampleExporter:
                 resized_mask = _resize_indexed_mask(indexed_mask, resized_rgb.shape[:2])
                 scale_x = float(resized_rgb.shape[1]) / float(max(frame_rgb.shape[1], 1))
                 scale_y = float(resized_rgb.shape[0]) / float(max(frame_rgb.shape[0], 1))
-                scaled_person_output = _scale_person_output(record["person_outputs"][track_id], scale_x, scale_y)
+                raw_person_output = record["person_outputs"][track_id]
+                scaled_person_output = _scale_person_output(raw_person_output, scale_x, scale_y)
+                projected_target_mask = _build_smpl_projection_mask(
+                    person_output=raw_person_output,
+                    mesh_faces=self.mesh_faces,
+                    source_frame_shape=frame_rgb.shape[:2],
+                    target_frame_shape=resized_rgb.shape[:2],
+                )
+                if projected_target_mask is None:
+                    projection_failure = {
+                        "track_id": int(track_id),
+                        "reason": "smpl_projection_mask_unavailable",
+                        "frame_stem": str(record["frame_stem"]),
+                    }
+                    break
 
                 mask_rgb, bg_rgb, target_mask = build_bg_and_mask_frame(
                     frame_rgb=resized_rgb,
                     indexed_mask=resized_mask,
                     track_id=track_id,
+                    target_mask_override=projected_target_mask,
                     config=self.config,
                 )
                 probe_pose_meta = build_wan_pose_meta(
@@ -443,9 +624,18 @@ class WanSampleExporter:
                         "bg_rgb": bg_rgb,
                         "target_mask": target_mask,
                         "person_output": scaled_person_output,
-                        "raw_person_output": record["person_outputs"][track_id],
+                        "smpl_sequence_person_output": _build_export_aligned_person_output(
+                            raw_person_output,
+                            target_mask,
+                            scale_x=scale_x,
+                            scale_y=scale_y,
+                        ),
                     }
                 )
+
+            if projection_failure is not None:
+                skipped_targets.append(projection_failure)
+                continue
 
             if len(frame_payloads) < int(self.config.min_track_frames):
                 skipped_targets.append(
@@ -568,12 +758,11 @@ class WanSampleExporter:
                         "records": [
                             {
                                 "frame_stem": payload["frame_stem"],
-                                "person_output": _round_json_floats(
-                                    _to_json_safe(
-                                        _sanitize_smpl_sequence_person_output(payload["raw_person_output"])
-                                    ),
-                                    decimals=6,
-                                ),
+                                "frame_size": [
+                                    int(payload["frame_rgb"].shape[1]),
+                                    int(payload["frame_rgb"].shape[0]),
+                                ],
+                                "person_output": _to_json_safe(payload["smpl_sequence_person_output"]),
                             }
                             for payload in frame_payloads
                         ],
@@ -603,6 +792,7 @@ class WanSampleExporter:
                         "face_resolution": list(self.config.face_resolution),
                         "frame_count": len(target_frames),
                         "valid_face_ratio": valid_face_ratio,
+                        "mask_source": SMPL_MASK_SOURCE,
                     },
                     handle,
                     indent=2,
@@ -614,6 +804,13 @@ class WanSampleExporter:
                     "sample_dir": sample_dir,
                     "frame_count": len(target_frames),
                     "valid_face_ratio": valid_face_ratio,
+                    "frame_stems": [str(payload["frame_stem"]) for payload in frame_payloads],
+                    "frame_size": [
+                        int(target_frames[0].shape[1]) if target_frames else 0,
+                        int(target_frames[0].shape[0]) if target_frames else 0,
+                    ],
+                    "fps": int(self.config.fps),
+                    "mask_source": SMPL_MASK_SOURCE,
                 }
             )
             self.finalized_targets.append(dict(written_targets[-1]))

@@ -37,3 +37,23 @@ def resolve_detector_runtime_options(
         "iou_thresh": float(defaults["iou_thresh"] if iou_thresh is None else iou_thresh),
         "max_det": defaults["max_det"] if max_det is None else int(max_det),
     }
+
+
+def run_human_detection_compat(detector, image, detector_kwargs: dict):
+    kwargs = dict(detector_kwargs or {})
+
+    while True:
+        try:
+            return detector.run_human_detection(image, **kwargs)
+        except TypeError as exc:
+            message = str(exc)
+            removed = False
+            for optional_key in ("max_det", "return_scores"):
+                token = f"unexpected keyword argument '{optional_key}'"
+                if optional_key in kwargs and token in message:
+                    kwargs.pop(optional_key, None)
+                    removed = True
+                    break
+            if removed:
+                continue
+            raise

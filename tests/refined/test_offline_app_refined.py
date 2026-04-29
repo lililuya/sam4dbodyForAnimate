@@ -693,6 +693,110 @@ class RefinedCliTests(unittest.TestCase):
         self.assertEqual(targets["boxes_xyxy"], [[0.0, 0.0, 4.0, 6.0]])
         predictor.add_new_points_or_box.assert_called_once()
 
+    def test_build_face_guided_body_binding_clusters_jittered_matches(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        config = OmegaConf.create(
+            {
+                "runtime": {"output_dir": "./outputs_refined"},
+                "detector": {"bbox_thresh": 0.35, "iou_thresh": 0.5},
+                "batch": {"initial_search_frames": 12},
+                "debug": {"save_metrics": False},
+            }
+        )
+        app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+        sample = {
+            "input_video": "clip.mp4",
+            "input_type": "clip_package",
+            "frame_count": 3,
+            "clip_track_records": [
+                {"frame_index_in_clip": 0, "bbox_xyxy": [1, 1, 3, 3], "score": 0.99},
+                {"frame_index_in_clip": 1, "bbox_xyxy": [1, 1, 3, 3], "score": 0.99},
+                {"frame_index_in_clip": 2, "bbox_xyxy": [1, 1, 3, 3], "score": 0.99},
+            ],
+        }
+        app._load_source_frame = unittest.mock.MagicMock(
+            side_effect=[np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(3)]
+        )
+        app._detect_frame_candidates = unittest.mock.MagicMock(
+            side_effect=[
+                [
+                    {"bbox": [0.0, 0.0, 4.0, 6.0], "score": 0.92},
+                    {"bbox": [0.0, 0.0, 8.0, 8.0], "score": 0.80},
+                ],
+                [
+                    {"bbox": [0.2, 0.0, 4.2, 6.0], "score": 0.90},
+                    {"bbox": [0.0, 0.0, 8.0, 8.0], "score": 0.80},
+                ],
+                [
+                    {"bbox": [-0.1, 0.0, 3.9, 6.0], "score": 0.91},
+                    {"bbox": [0.0, 0.0, 8.0, 8.0], "score": 0.80},
+                ],
+            ]
+        )
+
+        selected_bbox, start_frame_idx, width, height = app._build_face_guided_body_binding(
+            sample,
+            runtime_app=unittest.mock.MagicMock(),
+            bbox_thr=0.35,
+            nms_thr=0.5,
+        )
+
+        self.assertEqual(selected_bbox, [0.0, 0.0, 4.0, 6.0])
+        self.assertEqual(start_frame_idx, 0)
+        self.assertEqual(width, 8)
+        self.assertEqual(height, 8)
+
+    def test_build_face_guided_body_binding_keeps_true_ties_ambiguous(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        config = OmegaConf.create(
+            {
+                "runtime": {"output_dir": "./outputs_refined"},
+                "detector": {"bbox_thresh": 0.35, "iou_thresh": 0.5},
+                "batch": {"initial_search_frames": 12},
+                "debug": {"save_metrics": False},
+            }
+        )
+        app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+        sample = {
+            "input_video": "clip.mp4",
+            "input_type": "clip_package",
+            "frame_count": 3,
+            "clip_track_records": [
+                {"frame_index_in_clip": 0, "bbox_xyxy": [4, 1, 6, 3], "score": 0.99},
+                {"frame_index_in_clip": 1, "bbox_xyxy": [4, 1, 6, 3], "score": 0.99},
+                {"frame_index_in_clip": 2, "bbox_xyxy": [4, 1, 6, 3], "score": 0.99},
+            ],
+        }
+        app._load_source_frame = unittest.mock.MagicMock(
+            side_effect=[np.zeros((8, 10, 3), dtype=np.uint8) for _ in range(3)]
+        )
+        app._detect_frame_candidates = unittest.mock.MagicMock(
+            side_effect=[
+                [
+                    {"bbox": [0.0, 0.0, 6.0, 8.0], "score": 0.90},
+                    {"bbox": [4.0, 0.0, 10.0, 8.0], "score": 0.90},
+                ],
+                [
+                    {"bbox": [0.0, 0.0, 6.0, 8.0], "score": 0.90},
+                    {"bbox": [4.0, 0.0, 10.0, 8.0], "score": 0.90},
+                ],
+                [
+                    {"bbox": [0.0, 0.0, 6.0, 8.0], "score": 0.90},
+                    {"bbox": [4.0, 0.0, 10.0, 8.0], "score": 0.90},
+                ],
+            ]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "ambiguous face-guided body binding"):
+            app._build_face_guided_body_binding(
+                sample,
+                runtime_app=unittest.mock.MagicMock(),
+                bbox_thr=0.35,
+                nms_thr=0.5,
+            )
+
     def test_detect_initial_targets_limits_to_max_targets_by_score(self):
         from scripts.offline_app_refined import RefinedOfflineApp
 
@@ -839,6 +943,76 @@ class RefinedCliTests(unittest.TestCase):
         self.assertEqual(kwargs["name"], "vitdet")
         self.assertEqual(kwargs["device"], "cuda")
         self.assertNotIn("weights_path", kwargs)
+
+    def test_ensure_base_app_skips_default_detector_preload_in_refined_mode(self):
+        import scripts.offline_app_refined as offline_app_refined
+
+        config = OmegaConf.create(
+            {
+                "runtime": {"output_dir": "./outputs_refined"},
+                "detector": {"backend": "yolo"},
+                "debug": {"save_metrics": False},
+            }
+        )
+        app = offline_app_refined.RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+        fake_base_app = unittest.mock.MagicMock()
+        fake_base_module = SimpleNamespace(OfflineApp=unittest.mock.MagicMock(return_value=fake_base_app))
+
+        with patch.object(
+            offline_app_refined,
+            "load_base_offline_module",
+            return_value=fake_base_module,
+        ), patch.object(app, "_sync_base_app_runtime") as mock_sync:
+            ensured = app._ensure_base_app()
+
+        fake_base_module.OfflineApp.assert_called_once_with(
+            config_path="configs/body4d_refined.yaml",
+            load_default_detector=False,
+        )
+        mock_sync.assert_called_once_with(fake_base_app, None)
+        self.assertIs(ensured, fake_base_app)
+
+    def test_detect_frame_candidates_retries_vitdet_without_unsupported_max_det(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+
+        config = OmegaConf.create(
+            {
+                "detector": {
+                    "backend": "vitdet",
+                    "bbox_thresh": 0.05,
+                    "iou_thresh": 0.5,
+                    "max_det": 5,
+                },
+                "debug": {"save_metrics": False},
+            }
+        )
+        app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+        detector = unittest.mock.MagicMock()
+
+        def _run(_image, **kwargs):
+            if "max_det" in kwargs:
+                raise TypeError("run_detectron2_vitdet() got an unexpected keyword argument 'max_det'")
+            return [{"bbox": [1.0, 2.0, 5.0, 6.0], "score": 0.92}]
+
+        detector.run_human_detection.side_effect = _run
+        runtime_app = unittest.mock.MagicMock()
+        runtime_app.sam3_3d_body_model = unittest.mock.MagicMock()
+        runtime_app.sam3_3d_body_model.detector = detector
+        runtime_app.sam3_3d_body_model.process_one_image = unittest.mock.MagicMock(return_value=[])
+
+        outputs = app._detect_frame_candidates(
+            runtime_app,
+            np.zeros((8, 8, 3), dtype=np.uint8),
+            bbox_thr=0.05,
+            nms_thr=0.5,
+        )
+
+        self.assertEqual(outputs, [{"bbox": [1.0, 2.0, 5.0, 6.0], "score": 0.92}])
+        self.assertEqual(detector.run_human_detection.call_count, 2)
+        first_kwargs = detector.run_human_detection.call_args_list[0].kwargs
+        second_kwargs = detector.run_human_detection.call_args_list[1].kwargs
+        self.assertIn("max_det", first_kwargs)
+        self.assertNotIn("max_det", second_kwargs)
 
     def test_save_indexed_mask_preserves_labels_and_palette(self):
         from scripts.offline_app_refined import save_indexed_mask
@@ -1662,6 +1836,143 @@ class RefinedCliTests(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(sample_output_dir, "wan_export")))
             self.assertFalse(os.path.exists(os.path.join(sample_output_dir, "4d_123456.mp4")))
             self.assertTrue(os.path.isfile(os.path.join(export_root, "runtimeuuid123456_target1", "4d.mp4")))
+
+    def test_run_sample_packages_target_aligned_4d_with_matching_size_and_frame_count(self):
+        from scripts.offline_app_refined import RefinedOfflineApp
+        from scripts.wan_sample_export import update_wan_sample_summary
+
+        with make_workspace_tempdir() as tmpdir:
+            export_root = os.path.join(tmpdir, "WanExport")
+            sample_output_dir = os.path.join(tmpdir, "sample_out")
+            config = OmegaConf.create(
+                {
+                    "runtime": {"output_dir": "./outputs_refined"},
+                    "tracking": {"chunk_size": 180},
+                    "wan_export": {
+                        "enable": True,
+                        "output_dir": export_root,
+                        "copy_rendered_4d_to_targets": True,
+                        "cleanup_sample_workdir_after_export": False,
+                    },
+                    "reprompt": {
+                        "enable": True,
+                        "empty_mask_patience": 3,
+                        "area_drop_ratio": 0.35,
+                        "edge_touch_ratio": 0.4,
+                        "iou_low_threshold": 0.55,
+                    },
+                    "debug": {"save_metrics": True},
+                }
+            )
+            app = RefinedOfflineApp("configs/body4d_refined.yaml", config=config)
+            sample = {
+                "frames": [],
+                "frame_count": 3,
+                "output_dir": sample_output_dir,
+                "input_video": os.path.join(tmpdir, "sample.mp4"),
+                "input_type": "video",
+            }
+
+            app.prepare_input = unittest.mock.MagicMock(return_value=sample)
+            app.detect_initial_targets = unittest.mock.MagicMock(return_value={"obj_ids": [1]})
+            app.iter_chunks = unittest.mock.MagicMock(return_value=[])
+            app.track_chunk = unittest.mock.MagicMock()
+            app.refine_chunk_masks = unittest.mock.MagicMock()
+            app.maybe_reprompt_chunk = unittest.mock.MagicMock()
+            app.write_chunk_outputs = unittest.mock.MagicMock()
+
+            def _write_video(path, frames, fps):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                height, width = frames[0].shape[:2]
+                writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (int(width), int(height)))
+                try:
+                    for frame in frames:
+                        writer.write(frame)
+                finally:
+                    writer.release()
+
+            def build_final_outputs():
+                rendered_frames_dir = os.path.join(sample_output_dir, "rendered_frames")
+                os.makedirs(rendered_frames_dir, exist_ok=True)
+                frame_values = [30, 120, 220]
+                for index, value in enumerate(frame_values):
+                    frame = np.full((20, 30, 3), value, dtype=np.uint8)
+                    cv2.imwrite(os.path.join(rendered_frames_dir, f"{index:08d}.jpg"), frame)
+
+                final_4d_path = os.path.join(sample_output_dir, "4d_123456.mp4")
+                _write_video(
+                    final_4d_path,
+                    [np.full((20, 30, 3), value, dtype=np.uint8) for value in frame_values],
+                    fps=25,
+                )
+
+                target_dir = os.path.join(export_root, "runtimeuuid123456_target1")
+                os.makedirs(target_dir, exist_ok=True)
+                target_video_path = os.path.join(target_dir, "target.mp4")
+                _write_video(
+                    target_video_path,
+                    [
+                        np.full((12, 18, 3), 1, dtype=np.uint8),
+                        np.full((12, 18, 3), 2, dtype=np.uint8),
+                    ],
+                    fps=25,
+                )
+                update_wan_sample_summary(
+                    export_root,
+                    "runtimeuuid123456",
+                    {
+                        "exported_targets": [
+                            {
+                                "track_id": 1,
+                                "sample_dir": target_dir,
+                                "frame_count": 2,
+                                "frame_stems": ["00000000", "00000002"],
+                            }
+                        ],
+                        "exported_target_count": 1,
+                    },
+                )
+                return final_4d_path
+
+            app.run_refined_4d_generation = unittest.mock.MagicMock(side_effect=build_final_outputs)
+
+            with patch.object(
+                app,
+                "_probe_sample_face_presence",
+                return_value={
+                    "checked_frame_count": 3,
+                    "face_detected_frame_count": 3,
+                    "no_face_frame_count": 0,
+                    "no_face_ratio": 0.0,
+                    "face_presence_stride": 5,
+                    "max_no_face_ratio": 0.80,
+                    "skip_sample_without_face": True,
+                },
+                create=True,
+            ), patch("scripts.wan_sample_export.uuid.uuid4", return_value=SimpleNamespace(hex="runtimeuuid123456")):
+                app.run_sample("sample.mp4", "./custom_out", skip_existing=False, runtime_profile=None)
+
+            target_4d_path = os.path.join(export_root, "runtimeuuid123456_target1", "4d.mp4")
+            self.assertTrue(os.path.isfile(target_4d_path))
+
+            target_capture = cv2.VideoCapture(os.path.join(export_root, "runtimeuuid123456_target1", "target.mp4"))
+            try:
+                target_width = int(target_capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                target_height = int(target_capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                target_frame_count = int(target_capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            finally:
+                target_capture.release()
+
+            output_capture = cv2.VideoCapture(target_4d_path)
+            try:
+                output_width = int(output_capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                output_height = int(output_capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                output_frame_count = int(output_capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            finally:
+                output_capture.release()
+
+            self.assertEqual((output_width, output_height), (target_width, target_height))
+            self.assertEqual(output_frame_count, target_frame_count)
 
     def test_run_sample_skips_cleanup_when_no_wan_targets_exported(self):
         from scripts.offline_app_refined import RefinedOfflineApp

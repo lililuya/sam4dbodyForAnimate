@@ -58,6 +58,36 @@ class WanMaskBgExportTests(unittest.TestCase):
         self.assertTrue((bg_rgb[3, 3] == np.array([0, 0, 0])).all())
         self.assertTrue((bg_rgb[0, 0] == np.array([100, 100, 100])).all())
 
+    def test_build_bg_and_mask_frame_prefers_override_mask_over_indexed_track_mask(self):
+        from scripts.wan_mask_bg_export import build_bg_and_mask_frame
+        from scripts.wan_sample_types import WanExportConfig
+
+        frame = np.full((8, 8, 3), 100, dtype=np.uint8)
+        indexed_mask = np.zeros((8, 8), dtype=np.uint8)
+        indexed_mask[6:8, 6:8] = 1
+        override_mask = np.zeros((8, 8), dtype=np.uint8)
+        override_mask[1:4, 1:4] = 1
+
+        mask_rgb, bg_rgb, target_mask = build_bg_and_mask_frame(
+            frame_rgb=frame,
+            indexed_mask=indexed_mask,
+            track_id=1,
+            target_mask_override=override_mask,
+            config=WanExportConfig(
+                enable=True,
+                mask_kernel_size=1,
+                mask_iterations=1,
+                mask_w_len=99,
+                mask_h_len=99,
+            ),
+        )
+
+        self.assertEqual(int(target_mask.sum()), 9)
+        self.assertTrue((mask_rgb[2, 2] == np.array([255, 255, 255])).all())
+        self.assertTrue((mask_rgb[6, 6] == np.array([0, 0, 0])).all())
+        self.assertTrue((bg_rgb[2, 2] == np.array([0, 0, 0])).all())
+        self.assertTrue((bg_rgb[6, 6] == np.array([100, 100, 100])).all())
+
     def test_score_reference_frame_rewards_face_and_mask_coverage(self):
         from scripts.wan_mask_bg_export import score_reference_frame
 

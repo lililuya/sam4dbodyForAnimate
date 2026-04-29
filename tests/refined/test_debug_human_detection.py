@@ -1,5 +1,6 @@
 import unittest
 from unittest import mock
+import os
 
 import numpy as np
 
@@ -14,6 +15,8 @@ class HumanDetectionDebugScriptTests(unittest.TestCase):
                 "sample.mp4",
                 "--detector_backend",
                 "vitdet",
+                "--output_dir",
+                "debug_out",
                 "--output_path",
                 "out.mp4",
                 "--bbox_thresh",
@@ -25,6 +28,7 @@ class HumanDetectionDebugScriptTests(unittest.TestCase):
 
         self.assertEqual(args.input_path, "sample.mp4")
         self.assertEqual(args.detector_backend, "vitdet")
+        self.assertEqual(args.output_dir, "debug_out")
         self.assertEqual(args.output_path, "out.mp4")
         self.assertEqual(args.bbox_thresh, 0.6)
         self.assertEqual(args.max_det, 3)
@@ -38,11 +42,30 @@ class HumanDetectionDebugScriptTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported input file"):
             infer_media_type("notes.txt")
 
-    def test_build_output_path_uses_detected_suffix_by_default(self):
+    def test_build_output_path_uses_parameterized_name_by_default(self):
         from scripts.debug_human_detection import build_output_path
 
-        self.assertTrue(build_output_path("demo/frame.png").endswith("frame_detected.png"))
-        self.assertTrue(build_output_path("demo/clip.mp4").endswith("clip_detected.mp4"))
+        self.assertEqual(
+            build_output_path(
+                "demo/frame.png",
+                detector_backend="yolo",
+                bbox_thresh=0.15,
+                iou_thresh=0.7,
+                max_det=20,
+            ),
+            os.path.join("demo", "frame_yolo_bbox0.15_iou0.7_maxdet20.png"),
+        )
+        self.assertEqual(
+            build_output_path(
+                "demo/clip.mp4",
+                output_dir="exports",
+                detector_backend="vitdet",
+                bbox_thresh=0.05,
+                iou_thresh=0.5,
+                max_det=None,
+            ),
+            os.path.join("exports", "clip_vitdet_bbox0.05_iou0.5_maxdetnone.mp4"),
+        )
         self.assertEqual(build_output_path("demo/frame.png", explicit_output_path="custom.jpg"), "custom.jpg")
 
     def test_annotate_frame_draws_detection_boxes(self):
@@ -60,7 +83,9 @@ class HumanDetectionDebugScriptTests(unittest.TestCase):
     def test_run_on_image_writes_annotated_image(self):
         import scripts.debug_human_detection as debug_human_detection
 
-        args = debug_human_detection.build_parser().parse_args(["--input_path", "person.png"])
+        args = debug_human_detection.build_parser().parse_args(
+            ["--input_path", "person.png", "--output_dir", "debug_out"]
+        )
         detector = mock.MagicMock()
         detector.run_human_detection.return_value = [{"bbox": [1.0, 2.0, 10.0, 12.0], "score": 0.95}]
 
@@ -70,7 +95,11 @@ class HumanDetectionDebugScriptTests(unittest.TestCase):
                     result = debug_human_detection.run_detection(args)
 
         self.assertEqual(result["media_type"], "image")
-        self.assertTrue(result["output_path"].endswith("person_detected.png"))
+        self.assertTrue(
+            result["output_path"].endswith(
+                os.path.join("debug_out", "person_yolo_bbox0.25_iou0.7_maxdet300.png")
+            )
+        )
         imwrite_mock.assert_called_once()
         detector.run_human_detection.assert_called_once()
 
