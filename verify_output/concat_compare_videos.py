@@ -67,6 +67,21 @@ def build_default_output_path(sample_dir: str) -> str:
     return os.path.join(SCRIPT_DIR, f"{sample_name}_compare.mp4")
 
 
+def resolve_output_path(sample_dir: str, output_path: str | None) -> str:
+    if not output_path:
+        return build_default_output_path(sample_dir)
+
+    resolved_output_path = os.path.abspath(output_path)
+    if os.path.isdir(resolved_output_path):
+        sample_name = os.path.basename(os.path.abspath(sample_dir).rstrip("\\/"))
+        return os.path.join(resolved_output_path, f"{sample_name}_compare.mp4")
+
+    _, extension = os.path.splitext(resolved_output_path)
+    if not extension:
+        return f"{resolved_output_path}.mp4"
+    return resolved_output_path
+
+
 def load_video_info(video_path: str) -> dict:
     capture = cv2.VideoCapture(video_path)
     try:
@@ -104,12 +119,15 @@ def validate_required_videos(target_info: dict, rendered_info: dict) -> None:
         )
 
 
-def validate_panel_size(panel_name: str, panel_info: dict, target_width: int, target_height: int) -> None:
-    if int(panel_info["width"]) > int(target_width) or int(panel_info["height"]) > int(target_height):
-        raise RuntimeError(
-            f"{panel_name} resolution {panel_info['width']}x{panel_info['height']} exceeds target tile size "
-            f"{target_width}x{target_height}"
-        )
+def resolve_tile_size(panel_infos: dict[str, dict]) -> tuple[int, int]:
+    max_width = 0
+    max_height = 0
+    for panel_info in panel_infos.values():
+        max_width = max(max_width, int(panel_info["width"]))
+        max_height = max(max_height, int(panel_info["height"]))
+    if max_width <= 0 or max_height <= 0:
+        raise RuntimeError("unable to resolve a valid tile size from panel videos")
+    return max_width, max_height
 
 
 def ensure_color_frame(frame: np.ndarray) -> np.ndarray:
@@ -233,18 +251,21 @@ def _normalize_panel_frame(
 
 def build_comparison_video(sample_dir: str, output_path: str, overlay_alpha: float = 0.5) -> str:
     resolved = resolve_input_videos(sample_dir)
-    target_info = load_video_info(str(resolved["target"]))
-    rendered_info = load_video_info(str(resolved["4d"]))
+    panel_infos: dict[str, dict] = {
+        "target": load_video_info(str(resolved["target"])),
+        "4d": load_video_info(str(resolved["4d"])),
+    }
+    target_info = panel_infos["target"]
+    rendered_info = panel_infos["4d"]
     validate_required_videos(target_info, rendered_info)
 
-    target_width = int(target_info["width"])
-    target_height = int(target_info["height"])
-    for panel_name in ("4d", *OPTIONAL_PANEL_NAMES):
+    for panel_name in OPTIONAL_PANEL_NAMES:
         panel_path = resolved.get(panel_name)
         if not panel_path:
             continue
-        panel_info = load_video_info(str(panel_path))
-        validate_panel_size(panel_name, panel_info, target_width=target_width, target_height=target_height)
+        panel_infos[panel_name] = load_video_info(str(panel_path))
+
+    target_width, target_height = resolve_tile_size(panel_infos)
 
     captures = {}
     try:
@@ -323,7 +344,7 @@ def main(argv: list[str] | None = None) -> str:
     args = parser.parse_args(argv)
     sample_dir = os.path.abspath(args.input)
     resolve_input_videos(sample_dir)
-    output_path = os.path.abspath(args.output) if args.output else build_default_output_path(sample_dir)
+    output_path = resolve_output_path(sample_dir, args.output)
     return build_comparison_video(
         sample_dir=sample_dir,
         output_path=output_path,

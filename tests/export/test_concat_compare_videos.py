@@ -3,7 +3,7 @@ import shutil
 import unittest
 import uuid
 from contextlib import contextmanager
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -45,7 +45,7 @@ class CompareVideoHelpersTests(unittest.TestCase):
         self.assertEqual(overlay.shape, (2, 2, 3))
         self.assertTrue((overlay == 100).all())
 
-    def test_compose_grid_frame_uses_target_resolution_tiles(self):
+    def test_compose_grid_frame_uses_uniform_tiles(self):
         from verify_output.concat_compare_videos import compose_grid_frame
 
         target = np.full((4, 6, 3), 10, dtype=np.uint8)
@@ -109,16 +109,87 @@ class CompareVideoHelpersTests(unittest.TestCase):
                 rendered_info={"width": 8, "height": 8, "fps": 25.0, "frame_count": 9},
             )
 
-    def test_validate_panel_size_rejects_oversized_panel(self):
-        from verify_output.concat_compare_videos import validate_panel_size
+    def test_build_comparison_video_expands_tile_for_larger_optional_panel(self):
+        from verify_output import concat_compare_videos
 
-        with self.assertRaisesRegex(RuntimeError, "exceeds target tile size"):
-            validate_panel_size(
-                panel_name="src_face",
-                panel_info={"width": 16, "height": 8},
-                target_width=8,
-                target_height=8,
-            )
+        with make_workspace_tempdir() as tmpdir:
+            sample_dir = os.path.join(tmpdir, "sample_target1")
+            os.makedirs(sample_dir, exist_ok=True)
+            output_path = os.path.join(tmpdir, "compare.mp4")
+
+            resolved = {
+                "target": os.path.join(sample_dir, "target.mp4"),
+                "4d": os.path.join(sample_dir, "4d.mp4"),
+                "src_face": os.path.join(sample_dir, "src_face.mp4"),
+                "src_pose": None,
+                "src_bg": None,
+                "src_mask": None,
+                "src_mask_detail": None,
+            }
+
+            capture_by_path = {
+                resolved["target"]: MagicMock(),
+                resolved["4d"]: MagicMock(),
+                resolved["src_face"]: MagicMock(),
+            }
+            frame_by_path = {
+                resolved["target"]: np.full((464, 832, 3), 10, dtype=np.uint8),
+                resolved["4d"]: np.full((464, 832, 3), 20, dtype=np.uint8),
+                resolved["src_face"]: np.full((512, 512, 3), 30, dtype=np.uint8),
+            }
+
+            def fake_load_video_info(video_path):
+                if video_path == resolved["target"]:
+                    return {"path": video_path, "width": 832, "height": 464, "fps": 25.0, "frame_count": 1}
+                if video_path == resolved["4d"]:
+                    return {"path": video_path, "width": 832, "height": 464, "fps": 25.0, "frame_count": 1}
+                if video_path == resolved["src_face"]:
+                    return {"path": video_path, "width": 512, "height": 512, "fps": 25.0, "frame_count": 1}
+                raise AssertionError(f"unexpected video path: {video_path}")
+
+            def fake_open_video_capture(video_path):
+                if video_path is None:
+                    return None
+                return capture_by_path[video_path]
+
+            def fake_read_next_frame(capture, *, video_path, required):
+                del required
+                if capture is None:
+                    return None
+                return np.array(frame_by_path[video_path], copy=True)
+
+            with patch.object(concat_compare_videos, "resolve_input_videos", return_value=resolved), patch.object(
+                concat_compare_videos,
+                "load_video_info",
+                side_effect=fake_load_video_info,
+            ), patch.object(
+                concat_compare_videos,
+                "_open_video_capture",
+                side_effect=fake_open_video_capture,
+            ), patch.object(
+                concat_compare_videos,
+                "_read_next_frame",
+                side_effect=fake_read_next_frame,
+            ), patch.object(
+                concat_compare_videos,
+                "encode_frames_to_mp4",
+            ) as mock_encode, patch(
+                "verify_output.concat_compare_videos.tempfile.TemporaryDirectory",
+                side_effect=lambda *args, **kwargs: make_workspace_tempdir(),
+            ), patch(
+                "verify_output.concat_compare_videos.cv2.imwrite",
+                return_value=True,
+            ) as mock_imwrite:
+                actual_output_path = concat_compare_videos.build_comparison_video(
+                    sample_dir=sample_dir,
+                    output_path=output_path,
+                    overlay_alpha=0.5,
+                )
+
+        self.assertEqual(actual_output_path, os.path.abspath(output_path))
+        written_frame = mock_imwrite.call_args.args[1]
+        self.assertEqual(written_frame.shape[:2], (512 * 3, 832 * 3))
+        mock_encode.assert_called_once()
 
     def test_encode_frames_to_mp4_invokes_ffmpeg_with_libx264(self):
         from verify_output.concat_compare_videos import encode_frames_to_mp4
@@ -149,6 +220,22 @@ class CompareVideoHelpersTests(unittest.TestCase):
         output_path = mock_build.call_args.kwargs["output_path"]
         self.assertTrue(output_path.endswith("_compare.mp4"))
         self.assertIn("verify_output", output_path)
+
+    def test_main_appends_mp4_extension_for_extensionless_output_path(self):
+        from verify_output import concat_compare_videos
+
+        with make_workspace_tempdir() as tmpdir:
+            sample_dir = os.path.join(tmpdir, "sample_target1")
+            os.makedirs(sample_dir, exist_ok=True)
+            for name in ("target.mp4", "4d.mp4"):
+                open(os.path.join(sample_dir, name), "wb").close()
+            output_stem = os.path.join(tmpdir, "result")
+
+            with patch.object(concat_compare_videos, "build_comparison_video") as mock_build:
+                concat_compare_videos.main(["--input", sample_dir, "--output", output_stem])
+
+        output_path = mock_build.call_args.kwargs["output_path"]
+        self.assertEqual(output_path, os.path.abspath(output_stem) + ".mp4")
 
 
 if __name__ == "__main__":

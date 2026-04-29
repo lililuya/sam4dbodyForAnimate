@@ -6,11 +6,13 @@ Run:
 
 ```bash
 python verify_output/concat_compare_videos.py --input path/to/sample_target1
+python verify_output/concat_compare_videos.py --input path/to/sample_target1 --output path/to/result
 ```
 
 This writes:
 
 - `verify_output/<sample_dir_name>_compare.mp4`
+- or the explicit `--output` path, with `.mp4` appended automatically if you omit the suffix
 
 ## Expected Inputs
 
@@ -29,6 +31,6 @@ Optional context panels:
 
 ## Resolution Policy
 
-- `target.mp4` defines the tile size
+- the largest width/height among available panels defines the tile size
 - smaller panels are center-padded on a black canvas
-- panels larger than `target.mp4` cause the script to fail fast
+- no panel is resized, so source detail is preserved
